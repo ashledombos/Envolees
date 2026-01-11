@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import click
+import pandas as pd
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
@@ -15,8 +16,9 @@ from rich.table import Table
 from envolees import __version__
 from envolees.backtest import BacktestEngine, BacktestResult
 from envolees.config import Config, get_penalties, get_tickers
-from envolees.data import download_1h, resample_to_4h
-from envolees.output import export_batch_summary, export_result, format_summary_line
+from envolees.data import download_1h, resample_to_4h, cache_stats, clear_cache
+from envolees.output import export_batch_summary, export_result, format_summary_line, export_scoring
+from envolees.split import apply_split, SplitInfo
 from envolees.strategy import DonchianBreakoutStrategy
 
 console = Console()
@@ -26,19 +28,35 @@ def run_single_backtest(
     ticker: str,
     penalty: float,
     cfg: Config,
-) -> BacktestResult | None:
+    verbose: bool = False,
+) -> tuple[BacktestResult | None, SplitInfo | None]:
     """Exécute un backtest pour un ticker et une pénalité."""
     try:
-        df_1h = download_1h(ticker, cfg)
+        # Téléchargement (avec cache)
+        df_1h = download_1h(
+            ticker,
+            cfg,
+            use_cache=cfg.cache_enabled,
+            cache_max_age_hours=cfg.cache_max_age_hours,
+            verbose=verbose,
+        )
         df_4h = resample_to_4h(df_1h)
+
+        # Split temporel si configuré
+        df_4h, split_info = apply_split(df_4h, cfg)
+        
+        if split_info and verbose:
+            console.print(f"[dim]   {split_info}[/dim]")
 
         strategy = DonchianBreakoutStrategy(cfg)
         engine = BacktestEngine(cfg, strategy, ticker, penalty)
 
-        return engine.run(df_4h)
+        result = engine.run(df_4h)
+        return result, split_info
+        
     except Exception as e:
         console.print(f"[red]✗[/red] {ticker} PEN {penalty:.2f}: {e}")
-        return None
+        return None, None
 
 
 @click.group()
@@ -68,24 +86,85 @@ def main() -> None:
     default=None,
     help="Daily equity mode (default: from .env or 'worst').",
 )
+@click.option(
+    "--split",
+    type=click.Choice(["is", "oos", "none"]),
+    default=None,
+    help="Split mode: is=in-sample, oos=out-of-sample, none=all data.",
+)
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    help="Disable data cache (force re-download).",
+)
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    help="Verbose output.",
+)
 def run(
     tickers: str | None,
     penalties: str | None,
     output: str | None,
     mode: str | None,
+    split: str | None,
+    no_cache: bool,
+    verbose: bool,
 ) -> None:
     """Run backtest on tickers with specified penalties."""
     cfg = Config.from_env()
 
     # Override depuis CLI
+    overrides = {}
     if output:
-        cfg = Config(
-            **{**cfg.__dict__, "output_dir": output}
-        )
+        overrides["output_dir"] = output
     if mode:
-        cfg = Config(
-            **{**cfg.__dict__, "daily_equity_mode": mode}
-        )
+        overrides["daily_equity_mode"] = mode
+    if split:
+        if split == "none":
+            overrides["split_mode"] = ""
+        else:
+            overrides["split_mode"] = "time"
+            overrides["split_target"] = split
+    if no_cache:
+        overrides["cache_enabled"] = False
+    
+    if overrides:
+        # Recréer la config avec les overrides
+        cfg_dict = {
+            "start_balance": cfg.start_balance,
+            "risk_per_trade": cfg.risk_per_trade,
+            "ema_period": cfg.ema_period,
+            "atr_period": cfg.atr_period,
+            "donchian_n": cfg.donchian_n,
+            "buffer_atr": cfg.buffer_atr,
+            "sl_atr": cfg.sl_atr,
+            "tp_r": cfg.tp_r,
+            "vol_quantile": cfg.vol_quantile,
+            "vol_window_bars": cfg.vol_window_bars,
+            "no_trade_start": cfg.no_trade_start,
+            "no_trade_end": cfg.no_trade_end,
+            "order_valid_bars": cfg.order_valid_bars,
+            "conservative_same_bar": cfg.conservative_same_bar,
+            "daily_dd_ftmo": cfg.daily_dd_ftmo,
+            "daily_dd_gft": cfg.daily_dd_gft,
+            "max_loss": cfg.max_loss,
+            "stop_after_n_losses": cfg.stop_after_n_losses,
+            "daily_kill_switch": cfg.daily_kill_switch,
+            "daily_equity_mode": cfg.daily_equity_mode,
+            "split_mode": cfg.split_mode,
+            "split_ratio": cfg.split_ratio,
+            "split_target": cfg.split_target,
+            "yf_period": cfg.yf_period,
+            "yf_interval": cfg.yf_interval,
+            "cache_enabled": cfg.cache_enabled,
+            "cache_dir": cfg.cache_dir,
+            "cache_max_age_hours": cfg.cache_max_age_hours,
+            "output_dir": cfg.output_dir,
+            "weights": cfg.weights,
+        }
+        cfg_dict.update(overrides)
+        cfg = Config(**cfg_dict)
 
     # Tickers
     ticker_list = (
@@ -101,9 +180,18 @@ def run(
         else get_penalties()
     )
 
+    # Header
     console.print(f"\n[bold cyan]🚀 Envolées v{__version__}[/bold cyan]")
     console.print(f"   Tickers: {len(ticker_list)} │ Penalties: {len(penalty_list)}")
-    console.print(f"   Mode: {cfg.daily_equity_mode} │ Output: {cfg.output_dir}\n")
+    console.print(f"   Mode: {cfg.daily_equity_mode} │ Output: {cfg.output_dir}")
+    
+    if cfg.split_mode:
+        console.print(f"   Split: {cfg.split_mode} {cfg.split_ratio:.0%} → {cfg.split_target or 'is'}")
+    
+    if not cfg.cache_enabled:
+        console.print("   [yellow]Cache: disabled[/yellow]")
+    
+    console.print()
 
     results: list[BacktestResult] = []
     errors: list[tuple[str, float, str]] = []
@@ -121,7 +209,7 @@ def run(
             for penalty in penalty_list:
                 progress.update(task, description=f"{ticker} PEN {penalty:.2f}")
 
-                result = run_single_backtest(ticker, penalty, cfg)
+                result, split_info = run_single_backtest(ticker, penalty, cfg, verbose)
 
                 if result is not None:
                     results.append(result)
@@ -135,6 +223,9 @@ def run(
     # Export summary
     if results:
         summary_df = export_batch_summary(results, cfg.output_dir)
+        
+        # Export scores et shortlist
+        scores_df, shortlist_df = export_scoring(summary_df, cfg.output_dir)
 
         # Affichage synthèse par pénalité
         console.print("\n[bold]Synthèse par pénalité:[/bold]")
@@ -165,6 +256,18 @@ def run(
             )
 
         console.print(table)
+        
+        # Afficher la shortlist si non vide
+        if len(shortlist_df) > 0:
+            console.print(f"\n[bold green]Shortlist prod ({len(shortlist_df)} tickers):[/bold green]")
+            for _, row in shortlist_df.iterrows():
+                console.print(
+                    f"  [green]•[/green] {row['ticker']:>12} │ "
+                    f"Score {row.get('score', 0):.3f} │ "
+                    f"ExpR {row['expectancy_r']:+.3f} │ "
+                    f"PF {row['profit_factor']:.2f} │ "
+                    f"DD {row['max_daily_dd_pct']*100:.2f}%"
+                )
 
     # Erreurs
     if errors:
@@ -172,22 +275,30 @@ def run(
         for t, p, e in errors:
             console.print(f"  - {t} PEN {p:.2f}: {e}")
 
-    console.print(f"\n[dim]Résultats: {cfg.output_dir}/results.csv[/dim]")
+    console.print(f"\n[dim]Résultats: {cfg.output_dir}/[/dim]")
+    console.print(f"[dim]  • results.csv   (détails)[/dim]")
+    console.print(f"[dim]  • scores.csv    (scores par ticker)[/dim]")
+    console.print(f"[dim]  • shortlist.csv (candidats prod)[/dim]")
 
 
 @main.command()
 @click.argument("ticker")
 @click.option("--penalty", "-p", default=0.10, help="Execution penalty (ATR multiple).")
 @click.option("--output", "-o", default=None, help="Output directory.")
-def single(ticker: str, penalty: float, output: str | None) -> None:
+@click.option("--no-cache", is_flag=True, help="Disable data cache.")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output.")
+def single(ticker: str, penalty: float, output: str | None, no_cache: bool, verbose: bool) -> None:
     """Run backtest on a single ticker."""
     cfg = Config.from_env()
+    
     if output:
-        cfg = Config(**{**cfg.__dict__, "output_dir": output})
+        cfg = Config(**{**_cfg_to_dict(cfg), "output_dir": output})
+    if no_cache:
+        cfg = Config(**{**_cfg_to_dict(cfg), "cache_enabled": False})
 
     console.print(f"\n[cyan]Running {ticker} with penalty {penalty:.2f}...[/cyan]")
 
-    result = run_single_backtest(ticker, penalty, cfg)
+    result, split_info = run_single_backtest(ticker, penalty, cfg, verbose)
 
     if result is None:
         console.print("[red]Backtest failed.[/red]")
@@ -195,6 +306,9 @@ def single(ticker: str, penalty: float, output: str | None) -> None:
 
     export_result(result, cfg.output_dir)
     console.print(f"\n[green]✓[/green] {format_summary_line(result)}")
+    
+    if split_info:
+        console.print(f"[dim]   {split_info}[/dim]")
 
     # Détail
     s = result.summary
@@ -235,9 +349,79 @@ def config() -> None:
     table.add_row("Daily Equity Mode", cfg.daily_equity_mode)
     table.add_row("Daily Kill Switch", f"{cfg.daily_kill_switch:.0%}")
     table.add_row("Stop After N Losses", str(cfg.stop_after_n_losses))
+    table.add_row("", "")
+    table.add_row("Split Mode", cfg.split_mode or "(none)")
+    if cfg.split_mode:
+        table.add_row("Split Ratio", f"{cfg.split_ratio:.0%}")
+        table.add_row("Split Target", cfg.split_target or "is")
+    table.add_row("", "")
+    table.add_row("Cache Enabled", "Yes" if cfg.cache_enabled else "No")
+    table.add_row("Cache Max Age", f"{cfg.cache_max_age_hours}h")
     table.add_row("Output Dir", cfg.output_dir)
+    
+    if cfg.weights:
+        table.add_row("", "")
+        table.add_row("Weights", ", ".join(f"{k}={v}" for k, v in cfg.weights.items()))
 
     console.print(table)
+
+
+@main.command()
+def cache() -> None:
+    """Show cache statistics."""
+    stats = cache_stats()
+    
+    console.print("\n[bold cyan]Cache Statistics:[/bold cyan]\n")
+    console.print(f"  Directory: {stats['cache_dir']}")
+    console.print(f"  Files: {stats['n_files']}")
+    console.print(f"  Size: {stats['total_size_mb']} MB")
+    
+    if stats['tickers']:
+        console.print(f"  Tickers: {', '.join(stats['tickers'])}")
+
+
+@main.command("cache-clear")
+@click.confirmation_option(prompt="Are you sure you want to clear the cache?")
+def cache_clear() -> None:
+    """Clear the data cache."""
+    n = clear_cache()
+    console.print(f"[green]✓[/green] Cleared {n} files from cache.")
+
+
+def _cfg_to_dict(cfg: Config) -> dict:
+    """Convertit une Config en dict pour recréation."""
+    return {
+        "start_balance": cfg.start_balance,
+        "risk_per_trade": cfg.risk_per_trade,
+        "ema_period": cfg.ema_period,
+        "atr_period": cfg.atr_period,
+        "donchian_n": cfg.donchian_n,
+        "buffer_atr": cfg.buffer_atr,
+        "sl_atr": cfg.sl_atr,
+        "tp_r": cfg.tp_r,
+        "vol_quantile": cfg.vol_quantile,
+        "vol_window_bars": cfg.vol_window_bars,
+        "no_trade_start": cfg.no_trade_start,
+        "no_trade_end": cfg.no_trade_end,
+        "order_valid_bars": cfg.order_valid_bars,
+        "conservative_same_bar": cfg.conservative_same_bar,
+        "daily_dd_ftmo": cfg.daily_dd_ftmo,
+        "daily_dd_gft": cfg.daily_dd_gft,
+        "max_loss": cfg.max_loss,
+        "stop_after_n_losses": cfg.stop_after_n_losses,
+        "daily_kill_switch": cfg.daily_kill_switch,
+        "daily_equity_mode": cfg.daily_equity_mode,
+        "split_mode": cfg.split_mode,
+        "split_ratio": cfg.split_ratio,
+        "split_target": cfg.split_target,
+        "yf_period": cfg.yf_period,
+        "yf_interval": cfg.yf_interval,
+        "cache_enabled": cfg.cache_enabled,
+        "cache_dir": cfg.cache_dir,
+        "cache_max_age_hours": cfg.cache_max_age_hours,
+        "output_dir": cfg.output_dir,
+        "weights": cfg.weights,
+    }
 
 
 if __name__ == "__main__":

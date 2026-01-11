@@ -18,6 +18,8 @@ load_dotenv(_PROJECT_ROOT / ".env")
 
 
 DailyEquityMode = Literal["close", "worst"]
+SplitMode = Literal["", "none", "time"]
+SplitTarget = Literal["", "is", "oos"]
 
 
 def _parse_time(s: str) -> time:
@@ -37,6 +39,19 @@ def _parse_list(s: str) -> list[str]:
 
 def _parse_float_list(s: str) -> list[float]:
     return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _parse_weights(prefix: str = "WEIGHT_") -> dict[str, float]:
+    """Parse les variables WEIGHT_* depuis l'environnement."""
+    weights = {}
+    for key, value in os.environ.items():
+        if key.startswith(prefix):
+            ticker_alias = key[len(prefix):]
+            try:
+                weights[ticker_alias] = float(value)
+            except ValueError:
+                pass
+    return weights
 
 
 @dataclass(frozen=True)
@@ -81,12 +96,25 @@ class Config:
     # Estimation daily DD
     daily_equity_mode: DailyEquityMode = "worst"
 
+    # Split temporel (IS/OOS)
+    split_mode: SplitMode = ""
+    split_ratio: float = 0.70
+    split_target: SplitTarget = ""
+
     # Yahoo Finance
     yf_period: str = "730d"
     yf_interval: str = "1h"
 
+    # Cache
+    cache_enabled: bool = True
+    cache_dir: str = ""
+    cache_max_age_hours: float = 24.0
+
     # Output
     output_dir: str = "out"
+
+    # Pondérations par ticker (optionnel)
+    weights: dict[str, float] = field(default_factory=dict)
 
     @classmethod
     def from_env(cls) -> Config:
@@ -111,10 +139,17 @@ class Config:
             max_loss=float(os.getenv("MAX_LOSS", "0.10")),
             stop_after_n_losses=int(os.getenv("STOP_AFTER_N_LOSSES", "2")),
             daily_kill_switch=float(os.getenv("DAILY_KILL_SWITCH", "0.04")),
-            daily_equity_mode=os.getenv("DAILY_EQUITY_MODE", "worst"),  # type: ignore[arg-type]
+            daily_equity_mode=os.getenv("DAILY_EQUITY_MODE", os.getenv("MODE", "worst")),  # type: ignore[arg-type]
+            split_mode=os.getenv("SPLIT_MODE", "").strip().lower(),  # type: ignore[arg-type]
+            split_ratio=float(os.getenv("SPLIT_RATIO", "0.70")),
+            split_target=os.getenv("SPLIT_TARGET", "").strip().lower(),  # type: ignore[arg-type]
             yf_period=os.getenv("YF_PERIOD", "730d"),
             yf_interval=os.getenv("YF_INTERVAL", "1h"),
+            cache_enabled=_parse_bool(os.getenv("CACHE_ENABLED", "true")),
+            cache_dir=os.getenv("CACHE_DIR", ""),
+            cache_max_age_hours=float(os.getenv("CACHE_MAX_AGE_HOURS", "24")),
             output_dir=os.getenv("OUTPUT_DIR", "out"),
+            weights=_parse_weights(),
         )
 
 
@@ -142,7 +177,39 @@ def get_tickers() -> list[str]:
 
 def get_penalties() -> list[float]:
     """Récupère la liste des pénalités depuis .env."""
-    raw = os.getenv("EXEC_PENALTIES", "")
+    # Supporter les deux noms : PENALTIES et EXEC_PENALTIES
+    raw = os.getenv("PENALTIES", os.getenv("EXEC_PENALTIES", ""))
     if not raw:
         return [0.05, 0.10, 0.15, 0.20, 0.25]
     return _parse_float_list(raw)
+
+
+def get_ticker_weight(ticker: str, cfg: Config) -> float:
+    """
+    Récupère le poids d'un ticker.
+    
+    Args:
+        ticker: Ticker ou alias
+        cfg: Configuration avec les poids
+    
+    Returns:
+        Poids (défaut: 1.0)
+    """
+    if not cfg.weights:
+        return 1.0
+    
+    # Essayer plusieurs variantes du nom
+    variants = [
+        ticker,
+        ticker.upper(),
+        ticker.replace("=X", "").replace("-USD", "").replace("=F", ""),
+        ticker.replace("^", ""),
+    ]
+    
+    for v in variants:
+        if v in cfg.weights:
+            return cfg.weights[v]
+        if v.upper() in cfg.weights:
+            return cfg.weights[v.upper()]
+    
+    return 1.0

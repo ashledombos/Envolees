@@ -8,18 +8,21 @@
 - **Simulation Prop Firm** : Daily DD (FTMO/GFT), kill-switch, limite de pertes
 - **Modèle de coûts** : Pénalité d'exécution en multiples d'ATR
 - **Multi-assets** : FX, Crypto, Indices, Commodities
-- **Export complet** : CSV trades, equity curve, stats journalières, JSON summary
+- **Split temporel IS/OOS** : Validation croisée in-sample / out-of-sample
+- **Cache local** : Évite de retélécharger les données Yahoo
+- **Alias tickers** : Utilise `GOLD` au lieu de `GC=F`, `BTC` au lieu de `BTC-USD`
+- **Scoring automatique** : Score agrégé par ticker + génération shortlist
+- **Export complet** : CSV trades, equity curve, stats journalières, scores, shortlist
 
 ## Installation
 
 ```bash
 # Clone
-git clone <repo> && cd envolees
+git clone git@github.com:ashledombos/envolees.git && cd envolees
 
 # Environnement virtuel (recommandé)
 python -m venv .venv
 source .venv/bin/activate  # Linux/Mac
-# .venv\Scripts\activate   # Windows
 
 # Installation
 pip install -e .
@@ -34,84 +37,112 @@ pip install -e ".[dev]"
 # Copier le template
 cp .env.example .env
 
-# Éditer selon vos besoins
-nano .env
+# Ou utiliser une config spécialisée
+cp .env.challenge.example .env   # Pour challenge prop firm
+cp .env.funded.example .env      # Pour compte funded
 ```
+
+### Fichiers de configuration
+
+| Fichier | Usage |
+|---------|-------|
+| `.env.example` | Template de base |
+| `.env.full.example` | Validation complète avec split IS/OOS |
+| `.env.best.example` | Production candidate (panier validé) |
+| `.env.challenge.example` | Challenge prop firm (risque modéré) |
+| `.env.funded.example` | Compte funded (ultra-conservateur) |
 
 ### Variables principales
 
 | Variable | Description | Défaut |
 |----------|-------------|--------|
-| `TICKERS` | Liste des tickers | FX + Crypto + Indices |
-| `EXEC_PENALTIES` | Pénalités ATR | 0.05, 0.10, 0.15, 0.20, 0.25 |
+| `TICKERS` | Liste des tickers | Portfolio multi-asset |
+| `PENALTIES` | Pénalités ATR | 0.05 à 0.25 |
 | `RISK_PER_TRADE` | Risque par trade | 0.25% |
-| `DAILY_KILL_SWITCH` | Seuil DD journalier | 4% (GFT) |
-| `DAILY_EQUITY_MODE` | Mode DD: `close` ou `worst` | worst |
+| `MODE` | Daily DD mode | worst |
+| `SPLIT_MODE` | Split temporel | (désactivé) |
+| `SPLIT_TARGET` | is ou oos | is |
 
 ## Usage
 
 ### CLI
 
 ```bash
-# Backtest complet (tous tickers × toutes pénalités)
+# Backtest complet
 python main.py run
 
-# Tickers spécifiques
-python main.py run -t BTC-USD,ETH-USD,EURUSD=X
+# Tickers spécifiques (supporte les alias)
+python main.py run -t BTC,ETH,GOLD,SP500
 
-# Pénalités spécifiques
-python main.py run -p 0.10,0.15
+# Split out-of-sample
+python main.py run --split oos -o out_oos
 
 # Un seul ticker
 python main.py single BTC-USD --penalty 0.10
 
-# Afficher la configuration
+# Gestion du cache
+python main.py cache          # Stats cache
+python main.py cache-clear    # Vider le cache
+
+# Configuration
 python main.py config
 ```
 
-### Programmatique
+### Workflow validation IS/OOS
 
-```python
-from envolees import Config
-from envolees.backtest import BacktestEngine
-from envolees.data import download_1h, resample_to_4h
-from envolees.strategy import DonchianBreakoutStrategy
+```bash
+# 1. In-sample (70% des données)
+SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
 
-# Config
-cfg = Config.from_env()
+# 2. Out-of-sample (30% des données)
+SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
 
-# Data
-df_1h = download_1h("BTC-USD", cfg)
-df_4h = resample_to_4h(df_1h)
-
-# Backtest
-strategy = DonchianBreakoutStrategy(cfg)
-engine = BacktestEngine(cfg, strategy, "BTC-USD", exec_penalty_atr=0.10)
-result = engine.run(df_4h)
-
-# Résultats
-print(f"Trades: {result.summary['n_trades']}")
-print(f"Win Rate: {result.summary['win_rate']:.1%}")
-print(f"Profit Factor: {result.summary['profit_factor']:.2f}")
+# 3. Comparer les résultats
+head out_is/results.csv
+head out_oos/results.csv
 ```
+
+### Alias de tickers
+
+Plus besoin de retenir les symboles Yahoo :
+
+| Alias | Yahoo Symbol |
+|-------|-------------|
+| `GOLD` | `GC=F` |
+| `SILVER` | `SI=F` |
+| `WTI`, `CRUDE` | `CL=F` |
+| `BRENT` | `BZ=F` |
+| `BTC` | `BTC-USD` |
+| `ETH` | `ETH-USD` |
+| `SP500`, `SPX` | `^GSPC` |
+| `NASDAQ`, `NDX` | `^NDX` |
+| `DAX` | `^GDAXI` |
+| `EURUSD` | `EURUSD=X` |
 
 ## Output
 
 ```
 out/
-├── results.csv              # Synthèse tous backtests
+├── results.csv              # Détails tous backtests
+├── scores.csv               # Score agrégé par ticker
+├── shortlist.csv            # Candidats production
 ├── BTC-USD/
 │   ├── PEN_0.05/
 │   │   ├── trades.csv
 │   │   ├── equity_curve.csv
 │   │   ├── daily_stats.csv
 │   │   └── summary.json
-│   ├── PEN_0.10/
-│   │   └── ...
 │   └── ...
-└── EURUSD_X/
-    └── ...
+└── ...
 ```
+
+### Shortlist automatique
+
+Le fichier `shortlist.csv` contient les tickers qui passent les critères :
+- Expectancy > 0.10 à PEN 0.25
+- Profit Factor > 1.2
+- Max Daily DD < 4.5%
+- Minimum 30 trades
 
 ## Stratégie
 
@@ -120,7 +151,7 @@ out/
 1. **Filtre tendance** : Close > EMA200 (long) ou Close < EMA200 (short)
 2. **Signal** : Breakout Donchian(20) + buffer 0.10×ATR
 3. **Filtre volatilité** : ATR relatif < quantile 90%
-4. **Fenêtre** : Pas de nouveaux signaux 22:30 - 06:30 Paris
+4. **Fenêtre** : Pas de signaux 22:30 - 06:30 Paris
 
 ### Exécution
 
@@ -155,4 +186,4 @@ mypy envolees/
 
 ## License
 
-GPL
+MIT
