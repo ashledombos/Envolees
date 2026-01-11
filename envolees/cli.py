@@ -270,7 +270,11 @@ def run(
         
         # Afficher la shortlist si non vide
         if len(shortlist_df) > 0:
-            console.print(f"\n[bold green]Shortlist prod ({len(shortlist_df)} tickers):[/bold green]")
+            # Indiquer clairement que c'est IS (pas la shortlist finale)
+            split_label = cfg.split_target.upper() if cfg.split_target else "IS"
+            console.print(f"\n[bold green]Shortlist {split_label} ({len(shortlist_df)} tickers):[/bold green]")
+            if cfg.split_target == "is":
+                console.print(f"[dim]  ⚠ Cette shortlist est basée sur IS. Utiliser 'compare' pour la validation OOS.[/dim]")
             for _, row in shortlist_df.iterrows():
                 console.print(
                     f"  [green]•[/green] {row['ticker']:>12} │ "
@@ -289,7 +293,7 @@ def run(
     console.print(f"\n[dim]Résultats: {cfg.output_dir}/[/dim]")
     console.print(f"[dim]  • results.csv   (détails)[/dim]")
     console.print(f"[dim]  • scores.csv    (scores par ticker)[/dim]")
-    console.print(f"[dim]  • shortlist.csv (candidats prod)[/dim]")
+    console.print(f"[dim]  • shortlist.csv (candidats {split_label if 'split_label' in dir() else 'IS'})[/dim]")
 
 
 @main.command()
@@ -719,6 +723,74 @@ def heartbeat() -> None:
             console.print(f"[green]✓[/green] {channel}: sent")
         else:
             console.print(f"[red]✗[/red] {channel}: failed")
+
+
+@main.command()
+@click.option(
+    "--skip-cache",
+    is_flag=True,
+    help="Skip cache warm/verify steps.",
+)
+@click.option(
+    "--alert/--no-alert",
+    default=True,
+    help="Send alert after compare (default: yes).",
+)
+@click.pass_context
+def pipeline(ctx, skip_cache: bool, alert: bool) -> None:
+    """Run the complete validation pipeline.
+    
+    Steps: cache-warm → cache-verify → IS run → OOS run → compare
+    
+    This is equivalent to the systemd validation service.
+    """
+    import subprocess
+    from pathlib import Path
+    
+    console.print("\n[bold cyan]🚀 Envolées - Pipeline complet[/bold cyan]\n")
+    
+    steps = []
+    
+    if not skip_cache:
+        steps.append(("Cache warm", ["python", "main.py", "cache-warm"]))
+        steps.append(("Cache verify", ["python", "main.py", "cache-verify", "--fail-on-gaps"]))
+    
+    steps.append(("Backtest IS", ["python", "main.py", "run"], {"SPLIT_TARGET": "is", "OUTPUT_DIR": "out_is"}))
+    steps.append(("Backtest OOS", ["python", "main.py", "run"], {"SPLIT_TARGET": "oos", "OUTPUT_DIR": "out_oos"}))
+    
+    compare_cmd = ["python", "main.py", "compare", "out_is", "out_oos"]
+    if alert:
+        compare_cmd.append("--alert")
+    steps.append(("Compare IS/OOS", compare_cmd))
+    
+    failed = False
+    for i, step in enumerate(steps, 1):
+        name = step[0]
+        cmd = step[1]
+        env_extra = step[2] if len(step) > 2 else {}
+        
+        console.print(f"\n[bold]Step {i}/{len(steps)}: {name}[/bold]")
+        console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
+        
+        # Préparer l'environnement
+        import os
+        env = os.environ.copy()
+        env.update(env_extra)
+        
+        # Exécuter
+        result = subprocess.run(cmd, env=env)
+        
+        if result.returncode != 0:
+            console.print(f"\n[red]✗ Step '{name}' failed with code {result.returncode}[/red]")
+            failed = True
+            break
+    
+    if not failed:
+        console.print(f"\n[bold green]✓ Pipeline terminé avec succès[/bold green]")
+        console.print(f"[dim]Shortlist finale: out_compare/shortlist_tradable.csv[/dim]")
+    else:
+        console.print(f"\n[bold red]✗ Pipeline interrompu[/bold red]")
+        sys.exit(1)
 
 
 @main.command()
