@@ -155,4 +155,4 @@ mypy envolees/
 
 ## License
 
-MIT
+GPL
