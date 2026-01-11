@@ -445,14 +445,18 @@ def cache_warm(tickers: str | None) -> None:
 @click.option(
     "--fail-on-gaps",
     is_flag=True,
-    help="Exit with error if gaps are detected.",
+    help="Exit with error if unexpected gaps are detected.",
 )
-def cache_verify(tickers: str | None, fail_on_gaps: bool) -> None:
-    """Verify cache integrity and detect data gaps."""
-    from envolees.data import download_1h, resample_to_4h
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    help="Show detailed gap analysis.",
+)
+def cache_verify(tickers: str | None, fail_on_gaps: bool, verbose: bool) -> None:
+    """Verify cache integrity and detect data gaps (calendar-aware)."""
     from envolees.data.cache import get_cache_path, is_cache_valid, get_metadata_path
-    from datetime import datetime, timedelta
-    import json
+    from envolees.data.calendar import analyze_gaps, check_staleness, classify_ticker
+    import pandas as pd
     
     cfg = Config.from_env()
     ticker_list = (
@@ -461,13 +465,13 @@ def cache_verify(tickers: str | None, fail_on_gaps: bool) -> None:
         else get_tickers()
     )
     
-    console.print(f"\n[cyan]Verifying cache for {len(ticker_list)} tickers...[/cyan]\n")
+    console.print(f"\n[cyan]Verifying cache for {len(ticker_list)} tickers (calendar-aware)...[/cyan]\n")
     
     issues = []
+    ok_count = 0
     
     for ticker in ticker_list:
         cache_path = get_cache_path(ticker, cfg.yf_period, cfg.yf_interval, cfg)
-        meta_path = get_metadata_path(cache_path)
         
         # Vérifier existence
         if not cache_path.exists():
@@ -475,49 +479,59 @@ def cache_verify(tickers: str | None, fail_on_gaps: bool) -> None:
             issues.append((ticker, "not_cached"))
             continue
         
-        # Vérifier validité
+        # Vérifier validité TTL
         if not is_cache_valid(cache_path, cfg.cache_max_age_hours):
             console.print(f"[yellow]⚠[/yellow] {ticker}: cache expired")
             issues.append((ticker, "expired"))
             continue
         
-        # Charger et vérifier les données
+        # Charger et analyser
         try:
-            import pandas as pd
             df = pd.read_parquet(cache_path)
             
-            # Vérifier les trous
-            if len(df) > 1:
-                expected_gap = pd.Timedelta(hours=1)  # 1H data
-                actual_gaps = df.index.to_series().diff().dropna()
-                large_gaps = actual_gaps[actual_gaps > expected_gap * 6]  # >6h = suspect
-                
-                if len(large_gaps) > 0:
-                    max_gap = large_gaps.max()
-                    gap_hours = max_gap.total_seconds() / 3600
-                    console.print(
-                        f"[yellow]⚠[/yellow] {ticker}: {len(large_gaps)} gap(s), "
-                        f"max {gap_hours:.0f}h"
-                    )
-                    issues.append((ticker, f"gaps:{len(large_gaps)}"))
-                else:
-                    # Vérifier fraîcheur
-                    last_bar = df.index.max()
-                    age = datetime.now(last_bar.tzinfo) - last_bar
-                    age_hours = age.total_seconds() / 3600
-                    
-                    if age_hours > 24:
-                        console.print(
-                            f"[yellow]⚠[/yellow] {ticker}: last bar {age_hours:.0f}h ago"
-                        )
-                        issues.append((ticker, f"stale:{age_hours:.0f}h"))
-                    else:
-                        console.print(
-                            f"[green]✓[/green] {ticker}: {len(df)} bars, "
-                            f"last {age_hours:.1f}h ago"
-                        )
+            # Classe d'actif
+            asset_class = classify_ticker(ticker)
+            
+            # Analyser les gaps (avec calendrier)
+            gap_analysis = analyze_gaps(df, ticker, expected_interval_hours=1.0)
+            
+            # Vérifier la fraîcheur
+            staleness = check_staleness(df, ticker)
+            
+            # Affichage
+            status_parts = [f"{len(df)} bars", f"{asset_class.value}"]
+            
+            if staleness["status"] != "ok":
+                status_parts.append(f"last {staleness['staleness_hours']:.0f}h ago")
+            
+            # Décision
+            has_issue = False
+            
+            if gap_analysis["unexpected_gaps"] > 0:
+                has_issue = True
+                status_parts.append(f"{gap_analysis['unexpected_gaps']} unexpected gaps")
+                issues.append((ticker, f"gaps:{gap_analysis['unexpected_gaps']}"))
+            
+            if staleness["status"] == "stale":
+                has_issue = True
+                status_parts.append("stale")
+                issues.append((ticker, f"stale:{staleness['staleness_hours']:.0f}h"))
+            
+            # Afficher
+            if has_issue:
+                console.print(f"[yellow]⚠[/yellow] {ticker}: {' │ '.join(status_parts)}")
+            else:
+                console.print(f"[green]✓[/green] {ticker}: {' │ '.join(status_parts)}")
+                ok_count += 1
+            
+            # Détails si verbose
+            if verbose and gap_analysis["gaps_detail"]:
+                for gap in gap_analysis["gaps_detail"][:3]:
+                    console.print(f"    [dim]Gap: {gap['start']} → {gap['end']} ({gap['hours']}h)[/dim]")
             
         except Exception as e:
+            console.print(f"[red]✗[/red] {ticker}: read error - {e}")
+            issues.append((ticker, "read_error"))
             console.print(f"[red]✗[/red] {ticker}: read error - {e}")
             issues.append((ticker, "read_error"))
     
@@ -684,6 +698,123 @@ def compare(
                 
         except Exception as e:
             console.print(f"[yellow]⚠[/yellow] Alerte échouée: {e}")
+
+
+@main.command()
+def heartbeat() -> None:
+    """Send a heartbeat (alive signal)."""
+    from envolees.alerts import send_heartbeat
+    from envolees.profiles import get_profile
+    
+    profile = get_profile()
+    console.print(f"\n[cyan]Sending heartbeat for profile: {profile.name}[/cyan]")
+    
+    results = send_heartbeat()
+    
+    if not results:
+        console.print("[yellow]No alert channels configured[/yellow]")
+        console.print("[dim]Set NTFY_TOPIC or TELEGRAM_BOT_TOKEN in .env.secret[/dim]")
+        return
+    
+    for channel, success in results.items():
+        if success:
+            console.print(f"[green]✓[/green] {channel}: sent")
+        else:
+            console.print(f"[red]✗[/red] {channel}: failed")
+
+
+@main.command()
+@click.option(
+    "--output", "-o",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+def status(output: str) -> None:
+    """Show current trading status (and optionally send to Telegram)."""
+    from envolees.profiles import get_profile, get_profile_summary
+    from envolees.data.cache import cache_stats
+    from pathlib import Path
+    import json as json_module
+    
+    profile = get_profile()
+    summary = get_profile_summary(profile)
+    cache = cache_stats()
+    
+    # Lire la shortlist si elle existe
+    shortlist_path = Path("out_compare/shortlist_tradable.csv")
+    shortlist = []
+    if shortlist_path.exists():
+        import pandas as pd
+        try:
+            df = pd.read_csv(shortlist_path)
+            shortlist = [(row["ticker"], row.get("oos_score", 0)) for _, row in df.head(5).iterrows()]
+        except Exception:
+            pass
+    
+    if output == "json":
+        data = {
+            "profile": summary,
+            "cache": cache,
+            "shortlist": [{"ticker": t, "score": s} for t, s in shortlist],
+        }
+        console.print(json_module.dumps(data, indent=2, default=str))
+    else:
+        console.print(f"\n[bold cyan]📊 Envolées Status[/bold cyan]\n")
+        
+        # Profil
+        console.print(f"[bold]Profil:[/bold] {summary['name']} ({profile.description})")
+        console.print(f"  Risque/trade: {summary['risk_per_trade']*100:.2f}%")
+        console.print(f"  Budget/jour: {summary['daily_risk_budget']*100:.2f}%")
+        console.print(f"  Max trades: {summary['max_concurrent_trades']}")
+        console.print(f"  Stop après: {summary['stop_after_n_losses']} pertes")
+        console.print()
+        
+        # Cache
+        console.print(f"[bold]Cache:[/bold]")
+        console.print(f"  Fichiers: {cache['n_files']}")
+        console.print(f"  Taille: {cache['total_size_mb']} MB")
+        console.print()
+        
+        # Shortlist
+        if shortlist:
+            console.print(f"[bold]Shortlist ({len(shortlist)} tickers):[/bold]")
+            for ticker, score in shortlist:
+                console.print(f"  • {ticker}: score {score:.3f}")
+        else:
+            console.print("[dim]Shortlist: (pas de fichier shortlist_tradable.csv)[/dim]")
+
+
+@main.command()
+@click.argument("message")
+@click.option(
+    "--priority", "-p",
+    type=int,
+    default=4,
+    help="Alert priority (1-5, default: 4).",
+)
+def alert(message: str, priority: int) -> None:
+    """Send a manual alert."""
+    from envolees.alerts import AlertSender
+    
+    console.print(f"\n[cyan]Sending alert (priority {priority})...[/cyan]")
+    
+    sender = AlertSender()
+    results = sender.send_alert(
+        title="Alert manuelle",
+        message=message,
+        priority=priority,
+    )
+    
+    if not results:
+        console.print("[yellow]No alert channels configured[/yellow]")
+        return
+    
+    for channel, success in results.items():
+        if success:
+            console.print(f"[green]✓[/green] {channel}: sent")
+        else:
+            console.print(f"[red]✗[/red] {channel}: failed")
 
 
 def _cfg_to_dict(cfg: Config) -> dict:

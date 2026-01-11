@@ -48,12 +48,23 @@ coverage.xml
 
 # Environments
 .env
+.env.secret
+.env.local
+.secrets
+.secrets*
 .venv
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Keys and tokens (safety)
+*.key
+*.pem
+*.p12
+tokens.json
+credentials.json
 
 # IDEs
 .idea/

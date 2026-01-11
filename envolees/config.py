@@ -1,5 +1,5 @@
 """
-Configuration du backtest — chargement .env et dataclasses.
+Configuration du backtest — chargement .env, secrets et profils.
 """
 
 from __future__ import annotations
@@ -16,10 +16,18 @@ from dotenv import load_dotenv
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
 
+# Charger les secrets (après .env, pour override)
+try:
+    from envolees.secrets import load_secrets
+    load_secrets(_PROJECT_ROOT, strict=False)
+except Exception:
+    pass  # Secrets optionnels
+
 
 DailyEquityMode = Literal["close", "worst"]
 SplitMode = Literal["", "none", "time"]
 SplitTarget = Literal["", "is", "oos"]
+ProfileMode = Literal["default", "challenge", "funded", "conservative", "aggressive"]
 
 
 def _parse_time(s: str) -> time:
@@ -39,6 +47,23 @@ def _parse_list(s: str) -> list[str]:
 
 def _parse_float_list(s: str) -> list[float]:
     return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _get_profile_value(profile_name: str, key: str, env_key: str, default: float) -> float:
+    """Récupère une valeur avec fallback sur le profil."""
+    env_val = os.getenv(env_key, "")
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass
+    
+    try:
+        from envolees.profiles import get_profile
+        profile = get_profile(profile_name)
+        return getattr(profile, key, default)
+    except Exception:
+        return default
 
 
 def _parse_weights(prefix: str = "WEIGHT_") -> dict[str, float]:
@@ -68,6 +93,9 @@ def _parse_weights(prefix: str = "WEIGHT_") -> dict[str, float]:
 @dataclass(frozen=True)
 class Config:
     """Configuration complète du backtest."""
+
+    # Profil actif
+    profile: ProfileMode = "default"
 
     # Capital / risque
     start_balance: float = 100_000.0
@@ -127,17 +155,34 @@ class Config:
     # Pondérations par ticker (optionnel)
     weights: dict[str, float] = field(default_factory=dict)
     
-    # Paramètres avancés de risque (pour usage futur)
-    risk_mode: str = ""  # "", "challenge", "funded"
+    # Paramètres avancés de risque
+    risk_mode: str = ""  # Alias pour profile (rétro-compatibilité)
     max_concurrent_trades: int = 0  # 0 = illimité
     daily_risk_budget: float = 0.0  # 0 = pas de limite
+    
+    # Shortlist
+    shortlist_min_score: float = 0.0
+    shortlist_max_tickers: int = 10
+    min_trades_oos: int = 15
+    dd_cap: float = 0.012
 
     @classmethod
     def from_env(cls) -> Config:
-        """Charge la config depuis les variables d'environnement."""
+        """
+        Charge la config depuis les variables d'environnement.
+        
+        Ordre de priorité :
+        1. Variables d'environnement explicites
+        2. Valeurs par défaut du profil (PROFILE ou RISK_MODE)
+        3. Valeurs par défaut globales
+        """
+        # Déterminer le profil actif
+        profile_name = os.getenv("PROFILE", os.getenv("RISK_MODE", "default")).strip().lower()
+        
         return cls(
+            profile=profile_name,  # type: ignore[arg-type]
             start_balance=float(os.getenv("START_BALANCE", "100000")),
-            risk_per_trade=float(os.getenv("RISK_PER_TRADE", "0.0025")),
+            risk_per_trade=_get_profile_value(profile_name, "risk_per_trade", "RISK_PER_TRADE", 0.0025),
             ema_period=int(os.getenv("EMA_PERIOD", "200")),
             atr_period=int(os.getenv("ATR_PERIOD", "14")),
             donchian_n=int(os.getenv("DONCHIAN_N", "20")),
@@ -153,7 +198,7 @@ class Config:
             daily_dd_ftmo=float(os.getenv("DAILY_DD_FTMO", "0.05")),
             daily_dd_gft=float(os.getenv("DAILY_DD_GFT", "0.04")),
             max_loss=float(os.getenv("MAX_LOSS", "0.10")),
-            stop_after_n_losses=int(os.getenv("STOP_AFTER_N_LOSSES", "2")),
+            stop_after_n_losses=int(_get_profile_value(profile_name, "stop_after_n_losses", "STOP_AFTER_N_LOSSES", 2)),
             daily_kill_switch=float(os.getenv("DAILY_KILL_SWITCH", "0.04")),
             daily_equity_mode=os.getenv("DAILY_EQUITY_MODE", os.getenv("MODE", "worst")),  # type: ignore[arg-type]
             split_mode=os.getenv("SPLIT_MODE", "").strip().lower(),  # type: ignore[arg-type]
@@ -163,12 +208,16 @@ class Config:
             yf_interval=os.getenv("YF_INTERVAL", "1h"),
             cache_enabled=_parse_bool(os.getenv("CACHE_ENABLED", "true")),
             cache_dir=os.getenv("CACHE_DIR", ""),
-            cache_max_age_hours=float(os.getenv("CACHE_MAX_AGE_HOURS", "24")),
+            cache_max_age_hours=_get_profile_value(profile_name, "cache_max_age_hours", "CACHE_MAX_AGE_HOURS", 24.0),
             output_dir=os.getenv("OUTPUT_DIR", "out"),
             weights=_parse_weights(),
-            risk_mode=os.getenv("RISK_MODE", "").strip().lower(),
-            max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "0")),
-            daily_risk_budget=float(os.getenv("DAILY_RISK_BUDGET", "0")),
+            risk_mode=profile_name,
+            max_concurrent_trades=int(_get_profile_value(profile_name, "max_concurrent_trades", "MAX_CONCURRENT_TRADES", 0)),
+            daily_risk_budget=_get_profile_value(profile_name, "daily_risk_budget", "DAILY_RISK_BUDGET", 0.0),
+            shortlist_min_score=_get_profile_value(profile_name, "shortlist_min_score", "SHORTLIST_MIN_SCORE", 0.0),
+            shortlist_max_tickers=int(_get_profile_value(profile_name, "shortlist_max_tickers", "SHORTLIST_MAX_TICKERS", 10)),
+            min_trades_oos=int(_get_profile_value(profile_name, "min_trades_oos", "MIN_TRADES_OOS", 15)),
+            dd_cap=_get_profile_value(profile_name, "dd_cap", "DD_CAP", 0.012),
         )
 
 

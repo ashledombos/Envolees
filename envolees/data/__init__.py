@@ -9,6 +9,18 @@ from envolees.data.cache import (
     load_from_cache,
     save_to_cache,
 )
+from envolees.data.calendar import (
+    AssetClass,
+    GapAnalysis,
+    MarketHours,
+    StalenessCheck,
+    analyze_gaps,
+    check_staleness,
+    classify_ticker,
+    get_market_hours,
+    get_max_staleness_hours,
+    is_gap_expected,
+)
 from envolees.data.resample import resample_to_4h, resample_to_timeframe
 from envolees.data.yahoo import download_1h, download_1h_no_cache
 
@@ -26,4 +38,14 @@ __all__ = [
     "is_cache_valid",
     "load_from_cache",
     "save_to_cache",
+    "AssetClass",
+    "GapAnalysis",
+    "MarketHours",
+    "StalenessCheck",
+    "analyze_gaps",
+    "check_staleness",
+    "classify_ticker",
+    "get_market_hours",
+    "get_max_staleness_hours",
+    "is_gap_expected",
 ]
