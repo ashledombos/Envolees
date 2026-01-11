@@ -501,21 +501,21 @@ def cache_verify(tickers: str | None, fail_on_gaps: bool, verbose: bool) -> None
             # Affichage
             status_parts = [f"{len(df)} bars", f"{asset_class.value}"]
             
-            if staleness["status"] != "ok":
-                status_parts.append(f"last {staleness['staleness_hours']:.0f}h ago")
+            if staleness.is_stale:
+                status_parts.append(f"last {staleness.age_hours:.0f}h ago")
             
             # Décision
             has_issue = False
             
-            if gap_analysis["unexpected_gaps"] > 0:
+            if gap_analysis.unexpected_gaps > 0:
                 has_issue = True
-                status_parts.append(f"{gap_analysis['unexpected_gaps']} unexpected gaps")
-                issues.append((ticker, f"gaps:{gap_analysis['unexpected_gaps']}"))
+                status_parts.append(f"{gap_analysis.unexpected_gaps} unexpected gaps")
+                issues.append((ticker, f"gaps:{gap_analysis.unexpected_gaps}"))
             
-            if staleness["status"] == "stale":
+            if staleness.is_stale:
                 has_issue = True
                 status_parts.append("stale")
-                issues.append((ticker, f"stale:{staleness['staleness_hours']:.0f}h"))
+                issues.append((ticker, f"stale:{staleness.age_hours:.0f}h"))
             
             # Afficher
             if has_issue:
@@ -525,18 +525,16 @@ def cache_verify(tickers: str | None, fail_on_gaps: bool, verbose: bool) -> None
                 ok_count += 1
             
             # Détails si verbose
-            if verbose and gap_analysis["gaps_detail"]:
-                for gap in gap_analysis["gaps_detail"][:3]:
-                    console.print(f"    [dim]Gap: {gap['start']} → {gap['end']} ({gap['hours']}h)[/dim]")
+            if verbose and gap_analysis.issues:
+                for issue in gap_analysis.issues[:3]:
+                    console.print(f"    [dim]{issue}[/dim]")
             
         except Exception as e:
             console.print(f"[red]✗[/red] {ticker}: read error - {e}")
             issues.append((ticker, "read_error"))
-            console.print(f"[red]✗[/red] {ticker}: read error - {e}")
-            issues.append((ticker, "read_error"))
     
     # Résumé
-    console.print(f"\n[bold]Résultat:[/bold] {len(ticker_list) - len(issues)}/{len(ticker_list)} OK")
+    console.print(f"\n[bold]Résultat:[/bold] {ok_count}/{len(ticker_list)} OK")
     
     if issues:
         console.print(f"[yellow]⚠ {len(issues)} problème(s) détecté(s)[/yellow]")
@@ -788,22 +786,22 @@ def status(output: str) -> None:
 @main.command()
 @click.argument("message")
 @click.option(
-    "--priority", "-p",
-    type=int,
-    default=4,
-    help="Alert priority (1-5, default: 4).",
+    "--level", "-l",
+    type=click.Choice(["info", "warning", "critical"]),
+    default="warning",
+    help="Alert level (default: warning).",
 )
-def alert(message: str, priority: int) -> None:
+def alert(message: str, level: str) -> None:
     """Send a manual alert."""
     from envolees.alerts import AlertSender
     
-    console.print(f"\n[cyan]Sending alert (priority {priority})...[/cyan]")
+    console.print(f"\n[cyan]Sending alert (level: {level})...[/cyan]")
     
     sender = AlertSender()
     results = sender.send_alert(
-        title="Alert manuelle",
+        title="Alerte manuelle",
         message=message,
-        priority=priority,
+        level=level,
     )
     
     if not results:
