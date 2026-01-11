@@ -185,8 +185,12 @@ def run(
     console.print(f"   Tickers: {len(ticker_list)} │ Penalties: {len(penalty_list)}")
     console.print(f"   Mode: {cfg.daily_equity_mode} │ Output: {cfg.output_dir}")
     
-    if cfg.split_mode:
-        console.print(f"   Split: {cfg.split_mode} {cfg.split_ratio:.0%} → {cfg.split_target or 'is'}")
+    # Afficher le split de manière très visible
+    if cfg.split_mode == "time" or cfg.split_target in ("is", "oos"):
+        target = cfg.split_target or "is"
+        console.print(f"   [bold yellow]Split: {cfg.split_ratio:.0%} → {target.upper()}[/bold yellow]")
+    elif cfg.split_target:
+        console.print(f"   [bold yellow]Split: {cfg.split_target.upper()}[/bold yellow]")
     
     if not cfg.cache_enabled:
         console.print("   [yellow]Cache: disabled[/yellow]")
@@ -195,6 +199,7 @@ def run(
 
     results: list[BacktestResult] = []
     errors: list[tuple[str, float, str]] = []
+    first_split_logged = False
 
     total = len(ticker_list) * len(penalty_list)
 
@@ -214,6 +219,12 @@ def run(
                 if result is not None:
                     results.append(result)
                     export_result(result, cfg.output_dir)
+                    
+                    # Log split info une fois (pour le premier ticker/penalty)
+                    if split_info and not first_split_logged:
+                        console.print(f"[dim]   {split_info}[/dim]")
+                        first_split_logged = True
+                    
                     console.print(f"[green]✓[/green] {format_summary_line(result)}")
                 else:
                     errors.append((ticker, penalty, "Download or backtest failed"))
@@ -421,6 +432,9 @@ def _cfg_to_dict(cfg: Config) -> dict:
         "cache_max_age_hours": cfg.cache_max_age_hours,
         "output_dir": cfg.output_dir,
         "weights": cfg.weights,
+        "risk_mode": cfg.risk_mode,
+        "max_concurrent_trades": cfg.max_concurrent_trades,
+        "daily_risk_budget": cfg.daily_risk_budget,
     }
 
 

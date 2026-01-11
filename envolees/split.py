@@ -117,13 +117,17 @@ def apply_split(
         Tuple (DataFrame splitté ou original, SplitInfo ou None)
     """
     mode = getattr(cfg, "split_mode", "").strip().lower()
+    target = getattr(cfg, "split_target", "").strip().lower()
+    
+    # Si split_target est défini mais pas split_mode, inférer "time"
+    if target in ("is", "oos") and mode in ("", "none"):
+        mode = "time"
     
     if mode in ("", "none"):
         return df, None
     
     if mode == "time":
         ratio = getattr(cfg, "split_ratio", 0.7)
-        target = getattr(cfg, "split_target", "is").strip().lower()
         
         # Valider le target
         if target not in ("is", "oos"):

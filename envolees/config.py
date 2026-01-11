@@ -42,13 +42,24 @@ def _parse_float_list(s: str) -> list[float]:
 
 
 def _parse_weights(prefix: str = "WEIGHT_") -> dict[str, float]:
-    """Parse les variables WEIGHT_* depuis l'environnement."""
+    """
+    Parse les variables WEIGHT_* depuis l'environnement.
+    
+    Supporte les alias (WEIGHT_BTC, WEIGHT_GOLD) qui seront mappés aux tickers réels.
+    Les caractères spéciaux (=, -, ^) sont remplacés par _ dans les noms de variables.
+    
+    Exemples:
+        WEIGHT_BTC=0.8         → {"BTC": 0.8}
+        WEIGHT_EURUSD=1.0      → {"EURUSD": 1.0}
+        WEIGHT_GSPC=0.9        → {"GSPC": 0.9}  (pour ^GSPC)
+    """
     weights = {}
     for key, value in os.environ.items():
         if key.startswith(prefix):
-            ticker_alias = key[len(prefix):]
+            # Extraire l'alias (tout après WEIGHT_)
+            alias = key[len(prefix):]
             try:
-                weights[ticker_alias] = float(value)
+                weights[alias] = float(value)
             except ValueError:
                 pass
     return weights
@@ -115,6 +126,11 @@ class Config:
 
     # Pondérations par ticker (optionnel)
     weights: dict[str, float] = field(default_factory=dict)
+    
+    # Paramètres avancés de risque (pour usage futur)
+    risk_mode: str = ""  # "", "challenge", "funded"
+    max_concurrent_trades: int = 0  # 0 = illimité
+    daily_risk_budget: float = 0.0  # 0 = pas de limite
 
     @classmethod
     def from_env(cls) -> Config:
@@ -150,6 +166,9 @@ class Config:
             cache_max_age_hours=float(os.getenv("CACHE_MAX_AGE_HOURS", "24")),
             output_dir=os.getenv("OUTPUT_DIR", "out"),
             weights=_parse_weights(),
+            risk_mode=os.getenv("RISK_MODE", "").strip().lower(),
+            max_concurrent_trades=int(os.getenv("MAX_CONCURRENT_TRADES", "0")),
+            daily_risk_budget=float(os.getenv("DAILY_RISK_BUDGET", "0")),
         )
 
 
@@ -188,8 +207,17 @@ def get_ticker_weight(ticker: str, cfg: Config) -> float:
     """
     Récupère le poids d'un ticker.
     
+    Les poids sont définis via WEIGHT_<ALIAS>=<poids> dans .env.
+    L'alias doit correspondre au ticker normalisé (sans =X, -USD, ^, =F).
+    
+    Exemples:
+        WEIGHT_BTC=0.8     → s'applique à BTC-USD
+        WEIGHT_EURUSD=1.0  → s'applique à EURUSD=X
+        WEIGHT_GSPC=0.9    → s'applique à ^GSPC
+        WEIGHT_GC=0.75     → s'applique à GC=F
+    
     Args:
-        ticker: Ticker ou alias
+        ticker: Ticker Yahoo (ex: BTC-USD, ^GSPC, EURUSD=X)
         cfg: Configuration avec les poids
     
     Returns:
@@ -198,18 +226,20 @@ def get_ticker_weight(ticker: str, cfg: Config) -> float:
     if not cfg.weights:
         return 1.0
     
-    # Essayer plusieurs variantes du nom
+    # Normaliser le ticker pour matcher les clés de weights
+    # BTC-USD → BTC, EURUSD=X → EURUSD, ^GSPC → GSPC, GC=F → GC
+    normalized = ticker.replace("=X", "").replace("-USD", "").replace("=F", "").replace("^", "")
+    
+    # Essayer plusieurs variantes
     variants = [
+        normalized,
+        normalized.upper(),
         ticker,
         ticker.upper(),
-        ticker.replace("=X", "").replace("-USD", "").replace("=F", ""),
-        ticker.replace("^", ""),
     ]
     
     for v in variants:
         if v in cfg.weights:
             return cfg.weights[v]
-        if v.upper() in cfg.weights:
-            return cfg.weights[v.upper()]
     
     return 1.0
