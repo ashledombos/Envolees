@@ -1,5 +1,13 @@
 """Output and export utilities."""
 
+from envolees.output.compare import (
+    OOSEligibility,
+    TickerComparison,
+    compare_is_oos,
+    evaluate_oos_eligibility,
+    export_comparison,
+    print_comparison_summary,
+)
 from envolees.output.export import (
     export_batch_summary,
     export_result,
@@ -24,4 +32,10 @@ __all__ = [
     "compute_ticker_score",
     "export_scoring",
     "generate_shortlist",
+    "OOSEligibility",
+    "TickerComparison",
+    "compare_is_oos",
+    "evaluate_oos_eligibility",
+    "export_comparison",
+    "print_comparison_summary",
 ]

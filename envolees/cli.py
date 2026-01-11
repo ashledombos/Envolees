@@ -399,6 +399,81 @@ def cache_clear() -> None:
     console.print(f"[green]✓[/green] Cleared {n} files from cache.")
 
 
+@main.command()
+@click.argument("is_dir")
+@click.argument("oos_dir")
+@click.option(
+    "--output", "-o",
+    default="out_compare",
+    help="Output directory for comparison report.",
+)
+@click.option(
+    "--penalty", "-p",
+    default=0.25,
+    type=float,
+    help="Reference penalty for validation (default: 0.25).",
+)
+@click.option(
+    "--min-trades",
+    default=15,
+    type=int,
+    help="Minimum OOS trades for eligibility (default: 15).",
+)
+def compare(
+    is_dir: str,
+    oos_dir: str,
+    output: str,
+    penalty: float,
+    min_trades: int,
+) -> None:
+    """Compare IS and OOS results for validation.
+    
+    Example:
+        python main.py compare out_is out_oos -o out_compare
+    """
+    from pathlib import Path
+    from envolees.output.compare import (
+        OOSEligibility,
+        export_comparison,
+        print_comparison_summary,
+        compare_is_oos,
+    )
+    
+    is_path = Path(is_dir) / "results.csv"
+    oos_path = Path(oos_dir) / "results.csv"
+    
+    if not is_path.exists():
+        console.print(f"[red]Error:[/red] {is_path} not found")
+        sys.exit(1)
+    if not oos_path.exists():
+        console.print(f"[red]Error:[/red] {oos_path} not found")
+        sys.exit(1)
+    
+    console.print(f"\n[bold cyan]📊 Comparing IS vs OOS[/bold cyan]")
+    console.print(f"   IS:  {is_dir}")
+    console.print(f"   OOS: {oos_dir}")
+    console.print(f"   Reference penalty: {penalty}")
+    console.print(f"   Min OOS trades: {min_trades}\n")
+    
+    criteria = OOSEligibility(min_trades=min_trades)
+    
+    # Export complet
+    validated = export_comparison(
+        is_path, oos_path, output,
+        criteria=criteria,
+        reference_penalty=penalty,
+    )
+    
+    # Afficher le résumé
+    comparison_df = compare_is_oos(is_path, oos_path, criteria, penalty)
+    print_comparison_summary(comparison_df)
+    
+    console.print(f"\n[dim]Rapports exportés dans {output}/[/dim]")
+    console.print(f"[dim]  • comparison_full.csv (toutes pénalités)[/dim]")
+    console.print(f"[dim]  • comparison_ref.csv  (PEN {penalty})[/dim]")
+    console.print(f"[dim]  • validated.csv       (tickers validés)[/dim]")
+
+
 def _cfg_to_dict(cfg: Config) -> dict:
     """Convertit une Config en dict pour recréation."""
     return {

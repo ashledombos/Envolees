@@ -80,6 +80,9 @@ python main.py run --split oos -o out_oos
 # Un seul ticker
 python main.py single BTC-USD --penalty 0.10
 
+# Comparer IS vs OOS
+python main.py compare out_is out_oos -o out_compare
+
 # Gestion du cache
 python main.py cache          # Stats cache
 python main.py cache-clear    # Vider le cache
@@ -104,20 +107,83 @@ head out_oos/results.csv
 
 ### Alias de tickers
 
-Plus besoin de retenir les symboles Yahoo :
+Plus besoin de retenir les symboles Yahoo. Les alias sont définis dans `envolees/data/aliases.py`.
 
-| Alias | Yahoo Symbol |
-|-------|-------------|
-| `GOLD` | `GC=F` |
-| `SILVER` | `SI=F` |
-| `WTI`, `CRUDE` | `CL=F` |
-| `BRENT` | `BZ=F` |
-| `BTC` | `BTC-USD` |
-| `ETH` | `ETH-USD` |
-| `SP500`, `SPX` | `^GSPC` |
-| `NASDAQ`, `NDX` | `^NDX` |
-| `DAX` | `^GDAXI` |
-| `EURUSD` | `EURUSD=X` |
+| Alias | Yahoo Symbol | Classe |
+|-------|-------------|--------|
+| `GOLD`, `XAUUSD` | `GC=F` | Metals |
+| `SILVER`, `XAGUSD` | `SI=F` | Metals |
+| `WTI`, `CRUDE` | `CL=F` | Energy |
+| `BRENT`, `BCO` | `BZ=F` | Energy |
+| `BTC` | `BTC-USD` | Crypto |
+| `ETH` | `ETH-USD` | Crypto |
+| `SOL` | `SOL-USD` | Crypto |
+| `SP500`, `SPX` | `^GSPC` | Index |
+| `NASDAQ`, `NDX` | `^NDX` | Index |
+| `DOW`, `DJI` | `^DJI` | Index |
+| `DAX` | `^GDAXI` | Index |
+| `FTSE` | `^FTSE` | Index |
+| `NIKKEI`, `N225`, `JAP225` | `^N225` | Index |
+| `CAC40` | `^FCHI` | Index |
+| `EURUSD` | `EURUSD=X` | FX |
+| `GBPUSD` | `GBPUSD=X` | FX |
+| `USDJPY` | `USDJPY=X` | FX |
+| `AUDUSD` | `AUDUSD=X` | FX |
+| `NZDUSD` | `NZDUSD=X` | FX |
+
+### Syntaxe WEIGHT_*
+
+Les pondérations utilisent des **alias normalisés** (sans caractères spéciaux) :
+
+```bash
+# ✅ Correct
+WEIGHT_BTC=0.8       # pour BTC-USD
+WEIGHT_EURUSD=1.0    # pour EURUSD=X
+WEIGHT_GSPC=0.9      # pour ^GSPC
+WEIGHT_GC=0.75       # pour GC=F
+WEIGHT_USDJPY=0.5    # pour USDJPY=X
+
+# ❌ Incorrect (caractères spéciaux non supportés dans les noms de variables)
+WEIGHT_BTC-USD=0.8
+WEIGHT_^GSPC=0.9
+WEIGHT_GC=F=0.75
+```
+
+## Validation IS/OOS
+
+### Workflow complet
+
+```bash
+# 1. In-sample (70% des données)
+SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
+
+# 2. Out-of-sample (30% des données)
+SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
+
+# 3. Comparer et valider
+python main.py compare out_is out_oos -o out_compare
+```
+
+### Critères d'éligibilité OOS
+
+Un ticker est validé si (à la pénalité de référence, défaut 0.25) :
+
+| Critère | Seuil | Description |
+|---------|-------|-------------|
+| `n_trades` | ≥ 15 | Assez de trades pour être significatif |
+| `expectancy_r` | > 0 | Expectancy positive |
+| `profit_factor` | ≥ 1.2 | PF minimum |
+| `max_daily_dd` | < 5% | Drawdown journalier acceptable |
+| `exp_drop` | < 50% | Dégradation IS→OOS limitée |
+
+### Rapports générés
+
+```
+out_compare/
+├── comparison_full.csv   # Toutes les pénalités
+├── comparison_ref.csv    # Pénalité de référence uniquement
+└── validated.csv         # Tickers validés OOS
+```
 
 ## Output
 
