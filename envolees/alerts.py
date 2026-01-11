@@ -492,3 +492,6 @@ def send_error_alert(profile: str, error: str) -> dict[str, bool]:
         telegram_message=f"❌ *Envolées — erreur*\n\nProfil: {profile}\n\n```\n{error}\n```",
     )
 
+
+# Alias pour compatibilité CLI
+send_heartbeat = send_heartbeat_simple
