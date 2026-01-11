@@ -287,3 +287,130 @@ def print_comparison_summary(comparison_df: pd.DataFrame) -> None:
                 f"IS: {row['is_trades']:>3}t ExpR {row['is_expectancy']:+.3f} │ "
                 f"OOS: {row['oos_trades']:>3}t ExpR {row['oos_expectancy']:+.3f}"
             )
+
+
+@dataclass
+class ShortlistConfig:
+    """Configuration pour la génération de shortlist."""
+    
+    min_trades_oos: int = 15
+    min_pf_oos: float = 1.2
+    min_expectancy_oos: float = 0.0
+    dd_cap: float = 0.012  # 1.2%
+    
+    # Poids du scoring
+    weight_expectancy: float = 0.55
+    weight_pf: float = 0.30
+    weight_dd: float = 0.15
+    
+    # Limites
+    min_score: float = 0.0
+    max_tickers: int = 10
+    
+    @classmethod
+    def from_env(cls) -> ShortlistConfig:
+        """Charge depuis l'environnement."""
+        import os
+        return cls(
+            min_trades_oos=int(os.getenv("MIN_TRADES_OOS", "15")),
+            dd_cap=float(os.getenv("DD_CAP", "0.012")),
+            min_score=float(os.getenv("SHORTLIST_MIN_SCORE", "0.0")),
+            max_tickers=int(os.getenv("SHORTLIST_MAX_TICKERS", "10")),
+        )
+
+
+def compute_oos_score(row: pd.Series, cfg: ShortlistConfig) -> float:
+    """
+    Calcule le score OOS d'un ticker.
+    
+    score = w_exp * oos_expectancy + w_pf * log(oos_pf) - w_dd * oos_dd
+    """
+    import math
+    
+    exp_score = cfg.weight_expectancy * row["oos_expectancy"]
+    pf_score = cfg.weight_pf * math.log(max(row["oos_pf"], 1e-9))
+    dd_penalty = cfg.weight_dd * row["oos_dd"]
+    
+    return exp_score + pf_score - dd_penalty
+
+
+def shortlist_from_compare(
+    comparison_path: str | Path,
+    cfg: ShortlistConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Génère une shortlist tradable depuis les résultats de comparaison.
+    
+    Règle (OOS-first, robuste) :
+    1. filter: oos_trades >= min_trades
+    2. filter: oos_pf >= 1.2 et oos_expectancy > 0
+    3. filter: oos_dd <= dd_cap
+    4. score: 0.55*exp + 0.30*log(pf) - 0.15*dd
+    5. tri décroissant, top N
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        cfg: Configuration de shortlist
+    
+    Returns:
+        DataFrame trié par score décroissant
+    """
+    if cfg is None:
+        cfg = ShortlistConfig.from_env()
+    
+    df = pd.read_csv(comparison_path)
+    
+    # Filtres
+    df = df[df["oos_trades"] >= cfg.min_trades_oos].copy()
+    df = df[df["oos_pf"] >= cfg.min_pf_oos].copy()
+    df = df[df["oos_expectancy"] > cfg.min_expectancy_oos].copy()
+    df = df[df["oos_dd"] <= cfg.dd_cap].copy()
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Scoring
+    df["oos_score"] = df.apply(lambda r: compute_oos_score(r, cfg), axis=1)
+    
+    # Filtre score minimum
+    if cfg.min_score > 0:
+        df = df[df["oos_score"] >= cfg.min_score].copy()
+    
+    # Tri et limite
+    df = df.sort_values("oos_score", ascending=False)
+    df = df.head(cfg.max_tickers)
+    
+    return df.reset_index(drop=True)
+
+
+def export_shortlist(
+    comparison_path: str | Path,
+    output_path: str | Path,
+    cfg: ShortlistConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Exporte la shortlist tradable.
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        output_path: Chemin de sortie
+        cfg: Configuration
+    
+    Returns:
+        DataFrame de la shortlist
+    """
+    shortlist = shortlist_from_compare(comparison_path, cfg)
+    
+    if not shortlist.empty:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Colonnes à exporter
+        cols = [
+            "ticker", "penalty", "oos_score",
+            "oos_trades", "oos_expectancy", "oos_pf", "oos_wr", "oos_dd",
+            "is_trades", "is_expectancy", "is_pf",
+        ]
+        shortlist[[c for c in cols if c in shortlist.columns]].to_csv(output_path, index=False)
+    
+    return shortlist

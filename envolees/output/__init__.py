@@ -2,11 +2,15 @@
 
 from envolees.output.compare import (
     OOSEligibility,
+    ShortlistConfig,
     TickerComparison,
     compare_is_oos,
+    compute_oos_score,
     evaluate_oos_eligibility,
     export_comparison,
+    export_shortlist,
     print_comparison_summary,
+    shortlist_from_compare,
 )
 from envolees.output.export import (
     export_batch_summary,
@@ -33,9 +37,13 @@ __all__ = [
     "export_scoring",
     "generate_shortlist",
     "OOSEligibility",
+    "ShortlistConfig",
     "TickerComparison",
     "compare_is_oos",
+    "compute_oos_score",
     "evaluate_oos_eligibility",
     "export_comparison",
+    "export_shortlist",
     "print_comparison_summary",
+    "shortlist_from_compare",
 ]

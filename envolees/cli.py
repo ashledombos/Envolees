@@ -399,6 +399,137 @@ def cache_clear() -> None:
     console.print(f"[green]✓[/green] Cleared {n} files from cache.")
 
 
+@main.command("cache-warm")
+@click.option(
+    "--tickers", "-t",
+    default=None,
+    help="Tickers to warm (comma-separated). Uses .env if not specified.",
+)
+def cache_warm(tickers: str | None) -> None:
+    """Pre-fetch data into cache for faster runs."""
+    from envolees.data import download_1h, resample_to_4h
+    
+    cfg = Config.from_env()
+    ticker_list = (
+        [t.strip() for t in tickers.split(",") if t.strip()]
+        if tickers
+        else get_tickers()
+    )
+    
+    console.print(f"\n[cyan]Warming cache for {len(ticker_list)} tickers...[/cyan]\n")
+    
+    success = 0
+    errors = []
+    
+    for ticker in ticker_list:
+        try:
+            df = download_1h(ticker, cfg, use_cache=False, verbose=True)
+            console.print(f"[green]✓[/green] {ticker}: {len(df)} bars 1H")
+            success += 1
+        except Exception as e:
+            console.print(f"[red]✗[/red] {ticker}: {e}")
+            errors.append((ticker, str(e)))
+    
+    console.print(f"\n[bold]Résultat:[/bold] {success}/{len(ticker_list)} tickers mis en cache")
+    
+    if errors:
+        console.print(f"[yellow]⚠ {len(errors)} erreur(s)[/yellow]")
+
+
+@main.command("cache-verify")
+@click.option(
+    "--tickers", "-t",
+    default=None,
+    help="Tickers to verify (comma-separated). Uses .env if not specified.",
+)
+@click.option(
+    "--fail-on-gaps",
+    is_flag=True,
+    help="Exit with error if gaps are detected.",
+)
+def cache_verify(tickers: str | None, fail_on_gaps: bool) -> None:
+    """Verify cache integrity and detect data gaps."""
+    from envolees.data import download_1h, resample_to_4h
+    from envolees.data.cache import get_cache_path, is_cache_valid, get_metadata_path
+    from datetime import datetime, timedelta
+    import json
+    
+    cfg = Config.from_env()
+    ticker_list = (
+        [t.strip() for t in tickers.split(",") if t.strip()]
+        if tickers
+        else get_tickers()
+    )
+    
+    console.print(f"\n[cyan]Verifying cache for {len(ticker_list)} tickers...[/cyan]\n")
+    
+    issues = []
+    
+    for ticker in ticker_list:
+        cache_path = get_cache_path(ticker, cfg.yf_period, cfg.yf_interval, cfg)
+        meta_path = get_metadata_path(cache_path)
+        
+        # Vérifier existence
+        if not cache_path.exists():
+            console.print(f"[yellow]⚠[/yellow] {ticker}: not in cache")
+            issues.append((ticker, "not_cached"))
+            continue
+        
+        # Vérifier validité
+        if not is_cache_valid(cache_path, cfg.cache_max_age_hours):
+            console.print(f"[yellow]⚠[/yellow] {ticker}: cache expired")
+            issues.append((ticker, "expired"))
+            continue
+        
+        # Charger et vérifier les données
+        try:
+            import pandas as pd
+            df = pd.read_parquet(cache_path)
+            
+            # Vérifier les trous
+            if len(df) > 1:
+                expected_gap = pd.Timedelta(hours=1)  # 1H data
+                actual_gaps = df.index.to_series().diff().dropna()
+                large_gaps = actual_gaps[actual_gaps > expected_gap * 6]  # >6h = suspect
+                
+                if len(large_gaps) > 0:
+                    max_gap = large_gaps.max()
+                    gap_hours = max_gap.total_seconds() / 3600
+                    console.print(
+                        f"[yellow]⚠[/yellow] {ticker}: {len(large_gaps)} gap(s), "
+                        f"max {gap_hours:.0f}h"
+                    )
+                    issues.append((ticker, f"gaps:{len(large_gaps)}"))
+                else:
+                    # Vérifier fraîcheur
+                    last_bar = df.index.max()
+                    age = datetime.now(last_bar.tzinfo) - last_bar
+                    age_hours = age.total_seconds() / 3600
+                    
+                    if age_hours > 24:
+                        console.print(
+                            f"[yellow]⚠[/yellow] {ticker}: last bar {age_hours:.0f}h ago"
+                        )
+                        issues.append((ticker, f"stale:{age_hours:.0f}h"))
+                    else:
+                        console.print(
+                            f"[green]✓[/green] {ticker}: {len(df)} bars, "
+                            f"last {age_hours:.1f}h ago"
+                        )
+            
+        except Exception as e:
+            console.print(f"[red]✗[/red] {ticker}: read error - {e}")
+            issues.append((ticker, "read_error"))
+    
+    # Résumé
+    console.print(f"\n[bold]Résultat:[/bold] {len(ticker_list) - len(issues)}/{len(ticker_list)} OK")
+    
+    if issues:
+        console.print(f"[yellow]⚠ {len(issues)} problème(s) détecté(s)[/yellow]")
+        if fail_on_gaps:
+            sys.exit(1)
+
+
 @main.command()
 @click.argument("is_dir")
 @click.argument("oos_dir")
@@ -419,12 +550,32 @@ def cache_clear() -> None:
     type=int,
     help="Minimum OOS trades for eligibility (default: 15).",
 )
+@click.option(
+    "--dd-cap",
+    default=0.012,
+    type=float,
+    help="Maximum DD for shortlist (default: 0.012 = 1.2%).",
+)
+@click.option(
+    "--max-tickers",
+    default=5,
+    type=int,
+    help="Maximum tickers in shortlist (default: 5).",
+)
+@click.option(
+    "--alert/--no-alert",
+    default=False,
+    help="Send alert with results.",
+)
 def compare(
     is_dir: str,
     oos_dir: str,
     output: str,
     penalty: float,
     min_trades: int,
+    dd_cap: float,
+    max_tickers: int,
+    alert: bool,
 ) -> None:
     """Compare IS and OOS results for validation.
     
@@ -434,9 +585,12 @@ def compare(
     from pathlib import Path
     from envolees.output.compare import (
         OOSEligibility,
+        ShortlistConfig,
         export_comparison,
         print_comparison_summary,
         compare_is_oos,
+        shortlist_from_compare,
+        export_shortlist,
     )
     
     is_path = Path(is_dir) / "results.csv"
@@ -453,7 +607,8 @@ def compare(
     console.print(f"   IS:  {is_dir}")
     console.print(f"   OOS: {oos_dir}")
     console.print(f"   Reference penalty: {penalty}")
-    console.print(f"   Min OOS trades: {min_trades}\n")
+    console.print(f"   Min OOS trades: {min_trades}")
+    console.print(f"   DD cap: {dd_cap*100:.1f}%\n")
     
     criteria = OOSEligibility(min_trades=min_trades)
     
@@ -468,10 +623,67 @@ def compare(
     comparison_df = compare_is_oos(is_path, oos_path, criteria, penalty)
     print_comparison_summary(comparison_df)
     
+    # Générer la shortlist
+    shortlist_cfg = ShortlistConfig(
+        min_trades_oos=min_trades,
+        dd_cap=dd_cap,
+        max_tickers=max_tickers,
+    )
+    
+    comparison_ref_path = Path(output) / "comparison_ref.csv"
+    shortlist = export_shortlist(
+        comparison_ref_path,
+        Path(output) / "shortlist_tradable.csv",
+        shortlist_cfg,
+    )
+    
+    if not shortlist.empty:
+        console.print(f"\n[bold green]🎯 Shortlist tradable ({len(shortlist)} tickers):[/bold green]")
+        for _, row in shortlist.iterrows():
+            console.print(
+                f"  • {row['ticker']:>12} │ "
+                f"score {row['oos_score']:.3f} │ "
+                f"OOS: {row['oos_trades']:>2}t ExpR {row['oos_expectancy']:+.3f} "
+                f"PF {row['oos_pf']:.2f} DD {row['oos_dd']*100:.2f}%"
+            )
+    else:
+        console.print(f"\n[yellow]⚠ Aucun ticker ne passe les critères shortlist[/yellow]")
+    
     console.print(f"\n[dim]Rapports exportés dans {output}/[/dim]")
-    console.print(f"[dim]  • comparison_full.csv (toutes pénalités)[/dim]")
-    console.print(f"[dim]  • comparison_ref.csv  (PEN {penalty})[/dim]")
-    console.print(f"[dim]  • validated.csv       (tickers validés)[/dim]")
+    console.print(f"[dim]  • comparison_full.csv    (toutes pénalités)[/dim]")
+    console.print(f"[dim]  • comparison_ref.csv     (PEN {penalty})[/dim]")
+    console.print(f"[dim]  • validated.csv          (tickers validés)[/dim]")
+    console.print(f"[dim]  • shortlist_tradable.csv (shortlist finale)[/dim]")
+    
+    # Alertes
+    if alert:
+        try:
+            from envolees.alerts import send_backtest_summary
+            
+            cfg = Config.from_env()
+            n_tickers = len(comparison_df["ticker"].unique()) if not comparison_df.empty else 0
+            n_trades = int(comparison_df["oos_trades"].sum()) if not comparison_df.empty else 0
+            
+            best_ticker = shortlist.iloc[0]["ticker"] if not shortlist.empty else "N/A"
+            best_score = float(shortlist.iloc[0]["oos_score"]) if not shortlist.empty else 0.0
+            validated_count = len(validated) if validated is not None else 0
+            
+            results = send_backtest_summary(
+                profile=cfg.risk_mode or "default",
+                n_tickers=n_tickers,
+                n_trades=n_trades,
+                best_ticker=best_ticker,
+                best_score=best_score,
+                validated_count=validated_count,
+            )
+            
+            if any(results.values()):
+                console.print(f"[green]✓[/green] Alerte envoyée")
+            else:
+                console.print(f"[dim]Alertes non configurées[/dim]")
+                
+        except Exception as e:
+            console.print(f"[yellow]⚠[/yellow] Alerte échouée: {e}")
 
 
 def _cfg_to_dict(cfg: Config) -> dict:

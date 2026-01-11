@@ -1,0 +1,42 @@
+# Envolées Research Service
+# Copier vers ~/.config/systemd/user/envolees-research.service
+#
+# Usage:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now envolees-research.timer
+#   journalctl --user -u envolees-research.service -f
+
+[Unit]
+Description=Envolées research (backtests + compare)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+
+# Répertoire de travail
+WorkingDirectory=%h/dev/envolees
+
+# Charger l'environnement virtuel et le fichier .env
+# Adapter le chemin selon votre installation
+ExecStart=/usr/bin/bash -lc '\
+    source %h/dev/envolees/.venv/bin/activate && \
+    set -a && source %h/dev/envolees/.env.challenge.example && set +a && \
+    python main.py cache-warm && \
+    SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run && \
+    SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run && \
+    python main.py compare out_is out_oos --alert \
+'
+
+# Timeout généreux pour le téléchargement des données
+TimeoutStartSec=1800
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+
+# Pas de restart automatique (oneshot)
+Restart=no
+
+[Install]
+WantedBy=default.target

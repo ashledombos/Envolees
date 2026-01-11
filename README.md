@@ -80,15 +80,36 @@ python main.py run --split oos -o out_oos
 # Un seul ticker
 python main.py single BTC-USD --penalty 0.10
 
-# Comparer IS vs OOS
-python main.py compare out_is out_oos -o out_compare
+# Comparer IS vs OOS (avec shortlist)
+python main.py compare out_is out_oos -o out_compare --alert
 
 # Gestion du cache
-python main.py cache          # Stats cache
-python main.py cache-clear    # Vider le cache
+python main.py cache           # Stats cache
+python main.py cache-warm      # Pré-charger les données
+python main.py cache-verify    # Vérifier intégrité
+python main.py cache-clear     # Vider le cache
 
 # Configuration
 python main.py config
+```
+
+### Workflow complet (recherche)
+
+```bash
+# 1. Pré-charger le cache
+python main.py cache-warm
+
+# 2. Vérifier les données
+python main.py cache-verify --fail-on-gaps
+
+# 3. In-sample
+SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
+
+# 4. Out-of-sample
+SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
+
+# 5. Comparer et générer shortlist
+python main.py compare out_is out_oos --dd-cap 0.012 --max-tickers 5 --alert
 ```
 
 ### Workflow validation IS/OOS
@@ -236,6 +257,66 @@ Si SL et TP touchés même bougie → SL prioritaire
 - **Kill-switch** : Trading arrêté si daily DD ≥ 4%
 - **Limite pertes** : Trading arrêté après 2 pertes clôturées/jour
 - **Métriques** : Max daily DD, P99, violations FTMO/GFT
+
+## Alertes
+
+### Configuration
+
+```bash
+# .env
+# ntfy (notifications push légères)
+NTFY_TOPIC=envolees-trading
+NTFY_SERVER=https://ntfy.sh
+
+# Telegram (notifications détaillées)
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+TELEGRAM_CHAT_ID=123456789
+```
+
+### Usage
+
+```bash
+# Envoyer une alerte après compare
+python main.py compare out_is out_oos --alert
+```
+
+### Format des alertes
+
+**ntfy** (une ligne) :
+```
+CHALLENGE │ open:2 │ exp:0.9R │ budget:0.7% │ E1/TP1/SL0
+```
+
+**Telegram** (détaillé) :
+```
+🚀 Envolées — challenge
+📅 2026-01-11 19:00
+
+💰 Budget jour: 1.5% │ consommé: 0.8% │ restant: 0.7%
+📊 Ouverts: 2 │ exposition: 0.9R │ max: 0.5R (NZDUSD)
+📝 Événements: 1 entrée │ 1 TP
+
+🎯 Shortlist: NZDUSD(1.2), GBPUSD(1.1), USDJPY(0.8)
+```
+
+## Services Systemd
+
+Pour automatiser la recherche 2x/jour :
+
+```bash
+# Copier les fichiers
+cp systemd/envolees-research.service ~/.config/systemd/user/
+cp systemd/envolees-research.timer ~/.config/systemd/user/
+
+# Activer
+systemctl --user daemon-reload
+systemctl --user enable --now envolees-research.timer
+
+# Logs
+journalctl --user -u envolees-research.service -f
+```
+
+Voir `systemd/README.md` pour plus de détails.
 
 ## Development
 
