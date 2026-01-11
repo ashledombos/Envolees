@@ -1,0 +1,18 @@
+# Envolées - Timer de validation quotidienne
+# Exécute la validation 1x/jour à 07:00
+
+[Unit]
+Description=Envolées - Validation quotidienne (timer)
+
+[Timer]
+# Exécuter tous les jours à 07:00 (heure locale)
+OnCalendar=*-*-* 07:00:00
+
+# Rattraper les exécutions manquées (ex: machine éteinte)
+Persistent=true
+
+# Délai aléatoire pour éviter les pics (0-5 min)
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

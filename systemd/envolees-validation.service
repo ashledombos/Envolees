@@ -1,0 +1,43 @@
+# Envolées - Validation quotidienne IS/OOS
+#
+# Pipeline complet : cache → verify → IS → OOS → compare → alerte
+#
+# Installation :
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/*.service systemd/*.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now envolees-validation.timer
+#
+# Logs :
+#   journalctl --user -u envolees-validation.service -f
+
+[Unit]
+Description=Envolées - Validation quotidienne IS/OOS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/envolees
+
+# Charger le venv et exécuter le pipeline
+ExecStart=/usr/bin/bash -lc '\
+    cd %h/dev/envolees && \
+    source .venv/bin/activate && \
+    set -a && source .env && source .env.secret 2>/dev/null || true && set +a && \
+    python main.py cache-warm && \
+    python main.py cache-verify --fail-on-gaps && \
+    SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run && \
+    SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run && \
+    python main.py compare out_is out_oos --alert \
+'
+
+# Timeout 30 min (backtests peuvent être longs)
+TimeoutStartSec=1800
+
+# Logs vers journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

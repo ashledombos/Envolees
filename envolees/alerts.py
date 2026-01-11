@@ -495,3 +495,4 @@ def send_error_alert(profile: str, error: str) -> dict[str, bool]:
 
 # Alias pour compatibilité CLI
 send_heartbeat = send_heartbeat_simple
+

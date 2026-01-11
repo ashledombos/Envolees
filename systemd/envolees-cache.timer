@@ -1,0 +1,15 @@
+# Envolées - Timer de rafraîchissement cache
+# Exécute toutes les 6h pour garder le cache frais
+
+[Unit]
+Description=Envolées - Rafraîchissement cache (timer)
+
+[Timer]
+# Exécuter toutes les 6h
+OnCalendar=*-*-* 00,06,12,18:00:00
+
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

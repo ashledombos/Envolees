@@ -1,0 +1,14 @@
+# Envolées - Timer heartbeat quotidien
+# Envoie un "tout va bien" 1x/jour à 08:30 (après la validation)
+
+[Unit]
+Description=Envolées - Heartbeat quotidien (timer)
+
+[Timer]
+# Exécuter tous les jours à 08:30 (après validation de 07:00)
+OnCalendar=*-*-* 08:30:00
+
+Persistent=true
+
+[Install]
+WantedBy=timers.target
