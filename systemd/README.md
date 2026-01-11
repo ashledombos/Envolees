@@ -1,85 +1,107 @@
-# Services Systemd pour Envolées
+# Envolées - Automatisation systemd
+
+## Architecture
+
+Trois timers indépendants :
+
+| Timer | Fréquence | Fonction |
+|-------|-----------|----------|
+| `envolees-cache` | 6h | Maintient le cache à jour |
+| `envolees-validation` | 1x/jour (07:00) | Pipeline complet IS/OOS + compare |
+| `envolees-heartbeat` | 1x/jour (08:30) | Signal de vie "tout va bien" |
 
 ## Installation
 
 ```bash
-# Créer le répertoire utilisateur si nécessaire
-mkdir -p ~/.config/systemd/user
-
 # Copier les fichiers
-cp systemd/envolees-research.service ~/.config/systemd/user/
-cp systemd/envolees-research.timer ~/.config/systemd/user/
+mkdir -p ~/.config/systemd/user
+cp systemd/*.service systemd/*.timer ~/.config/systemd/user/
 
 # Recharger systemd
 systemctl --user daemon-reload
 
-# Activer et démarrer le timer
-systemctl --user enable --now envolees-research.timer
+# Activer les timers
+systemctl --user enable --now envolees-cache.timer
+systemctl --user enable --now envolees-validation.timer
+systemctl --user enable --now envolees-heartbeat.timer
 ```
 
 ## Vérification
 
 ```bash
-# Statut du timer
-systemctl --user status envolees-research.timer
-
-# Liste des timers actifs
+# Voir les timers actifs
 systemctl --user list-timers
 
-# Prochaine exécution
-systemctl --user list-timers envolees-research.timer
+# Statut d'un timer
+systemctl --user status envolees-validation.timer
 
-# Logs
-journalctl --user -u envolees-research.service -n 100 -f
+# Logs d'un service
+journalctl --user -u envolees-validation.service -f
+
+# Exécuter manuellement
+systemctl --user start envolees-validation.service
 ```
 
-## Exécution manuelle
+## Workflow
 
-```bash
-# Lancer immédiatement (sans attendre le timer)
-systemctl --user start envolees-research.service
+### Cache (toutes les 6h)
+1. `cache-warm` : télécharge/rafraîchit les données
+2. `cache-verify` : vérifie l'intégrité
+3. Si erreur → alerte warning
 
-# Suivre les logs en direct
-journalctl --user -u envolees-research.service -f
-```
+### Validation (1x/jour à 07:00)
+1. `cache-warm` : données fraîches
+2. `cache-verify --fail-on-gaps` : bloquant si problème
+3. `run` IS : backtest in-sample
+4. `run` OOS : backtest out-of-sample
+5. `compare --alert` : validation + shortlist + alerte
+
+### Heartbeat (1x/jour à 08:30)
+- Envoie un signal de vie après la validation
+- Pas de chiffres anxiogènes, juste "tout va bien"
 
 ## Personnalisation
 
-### Modifier les horaires
+### Changer les horaires
 
-Éditer `~/.config/systemd/user/envolees-research.timer` :
-
-```ini
-[Timer]
-# Une seule fois par jour à 07:00
-OnCalendar=*-*-* 07:00:00
-
-# Ou toutes les 6 heures
-OnCalendar=*-*-* 00,06,12,18:00:00
-```
-
-Puis recharger :
-
-```bash
-systemctl --user daemon-reload
-```
-
-### Changer de profil
-
-Éditer `~/.config/systemd/user/envolees-research.service` :
+Éditer les fichiers `.timer` :
 
 ```ini
-# Ligne ExecStart : remplacer .env.challenge.example par .env.funded.example
-source %h/dev/envolees/.env.funded.example
+# Validation à 19:00 au lieu de 07:00
+OnCalendar=*-*-* 19:00:00
 ```
 
-## Désactivation
+### Désactiver un timer
 
 ```bash
-# Désactiver le timer
-systemctl --user disable --now envolees-research.timer
+systemctl --user disable envolees-heartbeat.timer
+systemctl --user stop envolees-heartbeat.timer
+```
 
-# Supprimer les fichiers
-rm ~/.config/systemd/user/envolees-research.*
-systemctl --user daemon-reload
+## Dépannage
+
+### Le service ne démarre pas
+
+```bash
+# Vérifier les erreurs
+journalctl --user -u envolees-validation.service --no-pager -n 50
+
+# Vérifier que .env et .env.secret existent
+ls -la ~/dev/envolees/.env*
+```
+
+### Permission denied sur .env.secret
+
+```bash
+chmod 600 ~/dev/envolees/.env.secret
+```
+
+### Le timer ne se déclenche pas
+
+```bash
+# Vérifier que le timer est actif
+systemctl --user is-enabled envolees-validation.timer
+
+# Vérifier l'heure du prochain déclenchement
+systemctl --user list-timers --all | grep envolees
 ```
