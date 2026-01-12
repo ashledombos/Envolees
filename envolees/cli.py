@@ -536,8 +536,12 @@ def cache_verify(
             has_gaps = gap_analysis.unexpected_gaps > 0
             is_stale = staleness.is_stale
             
-            if is_stale:
-                status_parts.append(f"last {staleness.age_hours:.0f}h ago")
+            # Affichage de la fraîcheur (calendar-aware)
+            if staleness.trading_hours_missed > 0:
+                status_parts.append(f"{staleness.trading_hours_missed:.0f}h trading manquées")
+            elif staleness.age_hours > 2:
+                # Âge brut pour info, mais pas de trading manqué = marché fermé
+                status_parts.append(f"last {staleness.age_hours:.0f}h ago (marché fermé)")
             
             if has_gaps:
                 status_parts.append(f"{gap_analysis.unexpected_gaps} unexpected gaps")
@@ -565,9 +569,19 @@ def cache_verify(
                 console.print(f"[yellow]⚠[/yellow] {ticker}: {' │ '.join(status_parts)}")
             
             # Détails si verbose
-            if verbose and gap_analysis.issues:
-                for issue in gap_analysis.issues[:3]:
-                    console.print(f"    [dim]{issue}[/dim]")
+            if verbose:
+                # Infos de debug pour staleness
+                now = datetime.now(staleness.last_bar.tzinfo) if staleness.last_bar and staleness.last_bar.tzinfo else datetime.now()
+                console.print(f"    [dim]now: {now.strftime('%Y-%m-%d %H:%M %Z')}[/dim]")
+                if staleness.last_bar:
+                    console.print(f"    [dim]last_bar: {staleness.last_bar.strftime('%Y-%m-%d %H:%M %Z')}[/dim]")
+                console.print(f"    [dim]age_hours: {staleness.age_hours:.1f}h │ trading_missed: {staleness.trading_hours_missed:.1f}h │ max_age: {staleness.max_age_hours}h[/dim]")
+                
+                # Gaps
+                if gap_analysis.issues:
+                    console.print(f"    [dim]gaps ({len(gap_analysis.issues)}):[/dim]")
+                    for issue in gap_analysis.issues[:3]:
+                        console.print(f"      [dim]{issue}[/dim]")
             
         except Exception as e:
             console.print(f"[red]✗[/red] {ticker}: read error - {e}")
@@ -896,7 +910,12 @@ def heartbeat() -> None:
 @click.option(
     "--strict",
     is_flag=True,
-    help="Fail if any ticker has issues (default: continue with eligible tickers).",
+    help="Fail if any ticker has gaps OR stale data.",
+)
+@click.option(
+    "--strict-gaps",
+    is_flag=True,
+    help="Fail only if any ticker has gaps (stale = warning but continue).",
 )
 @click.option(
     "--alert/--no-alert",
@@ -904,13 +923,15 @@ def heartbeat() -> None:
     help="Send alert after compare (default: yes).",
 )
 @click.pass_context
-def pipeline(ctx, skip_cache: bool, strict: bool, alert: bool) -> None:
+def pipeline(ctx, skip_cache: bool, strict: bool, strict_gaps: bool, alert: bool) -> None:
     """Run the complete validation pipeline.
     
     Steps: cache-warm → cache-verify → IS run → OOS run → compare
     
-    By default, continues with eligible tickers even if some have issues.
-    Use --strict to fail on any ticker issue.
+    Modes:
+    - Default: continue with eligible tickers (gaps excluded, stale tolerated)
+    - --strict-gaps: fail if ANY ticker has gaps (recommended for prod)
+    - --strict: fail if ANY ticker has gaps OR stale data
     """
     import subprocess
     import json
@@ -918,6 +939,14 @@ def pipeline(ctx, skip_cache: bool, strict: bool, alert: bool) -> None:
     import os
     
     console.print("\n[bold cyan]🚀 Envolées - Pipeline complet[/bold cyan]\n")
+    
+    # Afficher le mode
+    if strict:
+        console.print("[dim]Mode: strict (gaps + stale bloquants)[/dim]")
+    elif strict_gaps:
+        console.print("[dim]Mode: strict-gaps (gaps bloquants, stale = warning)[/dim]")
+    else:
+        console.print("[dim]Mode: tolérant (gaps exclus, stale tolérés)[/dim]")
     
     # Répertoire de travail
     work_dir = Path("out_pipeline")
@@ -927,6 +956,7 @@ def pipeline(ctx, skip_cache: bool, strict: bool, alert: bool) -> None:
     original_tickers = get_tickers()
     eligible_tickers = original_tickers.copy()
     excluded_tickers = []
+    stale_warning = False
     
     # Step 1: Cache warm
     if not skip_cache:
@@ -944,15 +974,19 @@ def pipeline(ctx, skip_cache: bool, strict: bool, alert: bool) -> None:
             "--export-eligible", str(eligible_file),
         ]
         
+        # Options selon le mode
         if strict:
             verify_cmd.append("--fail-on-gaps")
             verify_cmd.append("--fail-on-stale")
+        elif strict_gaps:
+            verify_cmd.append("--fail-on-gaps")
         
         result = subprocess.run(verify_cmd)
         
-        # En mode strict, vérifier le code de retour
-        if strict and result.returncode != 0:
-            console.print(f"\n[red]✗ Cache verify failed (strict mode)[/red]")
+        # En mode strict ou strict_gaps, vérifier le code de retour
+        if (strict or strict_gaps) and result.returncode != 0:
+            mode_name = "strict" if strict else "strict-gaps"
+            console.print(f"\n[red]✗ Cache verify failed ({mode_name} mode)[/red]")
             sys.exit(1)
         
         # Lire les tickers éligibles (si le fichier existe)
@@ -961,6 +995,14 @@ def pipeline(ctx, skip_cache: bool, strict: bool, alert: bool) -> None:
                 data = json.loads(eligible_file.read_text())
                 eligible_tickers = data.get("eligible", [])
                 excluded_tickers = data.get("excluded", [])
+                
+                # Vérifier si des tickers stale sont inclus (pour warning)
+                stale_tickers = [
+                    exc for exc in data.get("excluded", [])
+                    if exc.get("reason") == "stale"
+                ]
+                # Note: les stale sont inclus dans eligible si pas --fail-on-stale
+                # On veut détecter les stale pour le warning même s'ils sont éligibles
             except Exception as e:
                 console.print(f"[yellow]⚠ Erreur lecture {eligible_file}: {e}[/yellow]")
         else:

@@ -252,15 +252,18 @@ class StalenessCheck:
     
     ticker: str
     last_bar: datetime | None
-    age_hours: float
+    age_hours: float  # Âge brut (pour affichage)
     max_age_hours: float
     is_stale: bool
+    trading_hours_missed: float = 0.0  # Heures de trading réellement manquées
     
     @property
     def status(self) -> str:
         if self.is_stale:
-            return f"stale ({self.age_hours:.0f}h > {self.max_age_hours:.0f}h)"
-        return f"fresh ({self.age_hours:.1f}h)"
+            if self.trading_hours_missed > 0:
+                return f"stale ({self.trading_hours_missed:.0f}h trading manquées)"
+            return f"stale ({self.age_hours:.0f}h ago)"
+        return f"fresh ({self.age_hours:.1f}h ago, {self.trading_hours_missed:.0f}h trading)"
 
 
 def analyze_gaps(
@@ -333,7 +336,11 @@ def analyze_gaps(
 
 def check_staleness(df: "pd.DataFrame", ticker: str) -> StalenessCheck:
     """
-    Vérifie la fraîcheur des données.
+    Vérifie la fraîcheur des données de manière calendar-aware.
+    
+    Pour FX le week-end, on ne considère pas les données comme stale
+    car le marché est fermé. On calcule plutôt le retard par rapport
+    à la dernière bougie attendue.
     
     Args:
         df: DataFrame avec index DatetimeIndex
@@ -352,17 +359,125 @@ def check_staleness(df: "pd.DataFrame", ticker: str) -> StalenessCheck:
         )
     
     last_bar = df.index.max()
-    max_age = get_max_staleness_hours(ticker)
+    market = get_market_hours(ticker)
     
-    # Calculer l'âge
+    # Calculer l'âge brut
     now = datetime.now(last_bar.tzinfo) if last_bar.tzinfo else datetime.now()
-    age = now - last_bar
-    age_hours = age.total_seconds() / 3600
+    raw_age = now - last_bar
+    raw_age_hours = raw_age.total_seconds() / 3600
+    
+    # Crypto : simple, le marché est 24/7
+    if market.is_24_7:
+        max_age = 4  # 4h max pour crypto
+        return StalenessCheck(
+            ticker=ticker,
+            last_bar=last_bar,
+            age_hours=raw_age_hours,
+            max_age_hours=max_age,
+            is_stale=raw_age_hours > max_age,
+        )
+    
+    # Pour les autres marchés : calculer les heures de marché ouvert manquées
+    # au lieu de l'âge brut
+    trading_hours_missed = _calculate_trading_hours_missed(last_bar, now, market)
+    
+    # Seuils selon la classe d'actif
+    if market.asset_class == AssetClass.FX:
+        max_age = 6  # FX : 6h de trading manquées max
+    elif market.asset_class == AssetClass.COMMODITY:
+        max_age = 8  # Commodities : un peu plus tolérant
+    else:
+        max_age = 12  # Indices : 12h
     
     return StalenessCheck(
         ticker=ticker,
         last_bar=last_bar,
-        age_hours=age_hours,
+        age_hours=raw_age_hours,  # On garde l'âge brut pour l'affichage
         max_age_hours=max_age,
-        is_stale=age_hours > max_age,
+        is_stale=trading_hours_missed > max_age,
+        trading_hours_missed=trading_hours_missed,
     )
+
+
+def _calculate_trading_hours_missed(
+    last_bar: datetime,
+    now: datetime,
+    market: MarketHours,
+) -> float:
+    """
+    Calcule le nombre d'heures de trading manquées entre last_bar et now.
+    
+    Pour FX le week-end, retourne 0 (pas d'heures de trading manquées).
+    
+    Returns:
+        Heures de trading manquées
+    """
+    # Si le delta est petit, pas besoin de calcul complexe
+    delta_hours = (now - last_bar).total_seconds() / 3600
+    if delta_hours < 2:
+        return delta_hours
+    
+    # FX : fermé du vendredi 22h UTC au dimanche 22h UTC
+    if market.asset_class == AssetClass.FX:
+        # Jours fermés = samedi et dimanche (partiellement)
+        # On compte les heures de trading entre last_bar et now
+        
+        trading_hours = 0.0
+        current = last_bar
+        
+        # Simplification : on compte heure par heure
+        while current < now:
+            weekday = current.weekday()
+            hour = current.hour
+            
+            # FX ouvert : dimanche 22h → vendredi 22h (UTC)
+            # Fermé : vendredi 22h → dimanche 22h
+            is_open = True
+            
+            if weekday == 5:  # Samedi
+                is_open = False
+            elif weekday == 6:  # Dimanche
+                is_open = hour >= 22  # Ouvert à partir de 22h
+            elif weekday == 4:  # Vendredi
+                is_open = hour < 22  # Fermé à partir de 22h
+            
+            if is_open:
+                trading_hours += 1.0
+            
+            current += timedelta(hours=1)
+        
+        return trading_hours
+    
+    # Commodities : fermeture quotidienne + week-end
+    if market.asset_class == AssetClass.COMMODITY:
+        trading_hours = 0.0
+        current = last_bar
+        
+        while current < now:
+            weekday = current.weekday()
+            hour = current.hour
+            
+            # GC=F (Gold) : ~23h/jour, fermé samedi + dimanche matin
+            is_open = True
+            
+            if weekday == 5:  # Samedi
+                is_open = False
+            elif weekday == 6:  # Dimanche
+                is_open = hour >= 18  # Ouverture vers 18h UTC
+            
+            if is_open:
+                trading_hours += 1.0
+            
+            current += timedelta(hours=1)
+        
+        return trading_hours
+    
+    # Pour les indices : approximation simple
+    # On retire les week-ends et compte 8h/jour
+    full_days = int(delta_hours / 24)
+    weekend_days = sum(
+        1 for i in range(full_days)
+        if (last_bar + timedelta(days=i)).weekday() >= 5
+    )
+    trading_days = full_days - weekend_days
+    return trading_days * 8 + (delta_hours % 24) * (8/24)
