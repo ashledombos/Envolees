@@ -5,6 +5,7 @@ CLI pour Envolées.
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import click
@@ -949,11 +950,22 @@ def pipeline(ctx, skip_cache: bool, strict: bool, alert: bool) -> None:
         
         result = subprocess.run(verify_cmd)
         
-        # Lire les tickers éligibles
+        # En mode strict, vérifier le code de retour
+        if strict and result.returncode != 0:
+            console.print(f"\n[red]✗ Cache verify failed (strict mode)[/red]")
+            sys.exit(1)
+        
+        # Lire les tickers éligibles (si le fichier existe)
         if eligible_file.exists():
-            data = json.loads(eligible_file.read_text())
-            eligible_tickers = data.get("eligible", [])
-            excluded_tickers = data.get("excluded", [])
+            try:
+                data = json.loads(eligible_file.read_text())
+                eligible_tickers = data.get("eligible", [])
+                excluded_tickers = data.get("excluded", [])
+            except Exception as e:
+                console.print(f"[yellow]⚠ Erreur lecture {eligible_file}: {e}[/yellow]")
+        else:
+            # Si le fichier n'existe pas (crash de cache-verify), continuer avec tous les tickers
+            console.print(f"[yellow]⚠ Fichier éligibles non créé, utilisation de tous les tickers[/yellow]")
         
         if not eligible_tickers:
             console.print(f"\n[red]✗ Aucun ticker éligible après vérification du cache[/red]")
