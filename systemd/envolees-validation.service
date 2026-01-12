@@ -1,6 +1,9 @@
 # Envolées - Validation quotidienne IS/OOS
 #
-# Pipeline complet : cache → verify → IS → OOS → compare → alerte
+# Pipeline complet avec tolérance par ticker :
+# - Les tickers avec des problèmes de cache sont exclus
+# - Le pipeline continue avec les tickers éligibles
+# - Une alerte est envoyée avec les exclusions
 #
 # Installation :
 #   mkdir -p ~/.config/systemd/user
@@ -20,16 +23,12 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=%h/dev/envolees
 
-# Charger le venv et exécuter le pipeline
+# Pipeline complet avec tolérance par ticker
 ExecStart=/usr/bin/bash -lc '\
     cd %h/dev/envolees && \
     source .venv/bin/activate && \
     set -a && source .env && source .env.secret 2>/dev/null || true && set +a && \
-    python main.py cache-warm && \
-    python main.py cache-verify --fail-on-gaps && \
-    SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run && \
-    SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run && \
-    python main.py compare out_is out_oos --alert \
+    python main.py pipeline --alert \
 '
 
 # Timeout 30 min (backtests peuvent être longs)

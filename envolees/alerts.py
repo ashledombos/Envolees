@@ -463,22 +463,112 @@ def send_backtest_summary(
     best_ticker: str,
     best_score: float,
     validated_count: int,
+    excluded_tickers: list[dict] | None = None,
+    rejection_reasons: dict[str, int] | None = None,
+    shortlist: list[tuple[str, float]] | None = None,
 ) -> dict[str, bool]:
-    """Envoie un résumé de backtest."""
+    """Envoie un résumé de backtest enrichi.
+    
+    Args:
+        profile: Nom du profil
+        n_tickers: Nombre de tickers testés
+        n_trades: Nombre total de trades OOS
+        best_ticker: Meilleur ticker
+        best_score: Score du meilleur ticker
+        validated_count: Nombre de tickers validés OOS
+        excluded_tickers: Liste des tickers exclus (cache) [{"ticker": "X", "reason": "Y"}]
+        rejection_reasons: Compteur des motifs de rejet OOS {"insufficient_trades": 3, ...}
+        shortlist: Liste ordonnée [(ticker, score), ...]
+    """
     sender = AlertSender()
+    
+    # Message court pour ntfy
+    short_msg = f"{validated_count}/{n_tickers} validés"
+    if best_ticker != "N/A":
+        short_msg += f" | best: {best_ticker}"
+    if excluded_tickers:
+        short_msg += f" | {len(excluded_tickers)} exclus cache"
+    
+    # Message détaillé pour Telegram
+    lines = [
+        f"🔬 *Validation terminée — {profile}*",
+        "",
+    ]
+    
+    # Résumé principal
+    lines.append("📊 *Résultats OOS:*")
+    lines.append(f"  ✓ Validés: {validated_count}/{n_tickers}")
+    if n_trades > 0:
+        lines.append(f"  📈 Trades OOS: {n_trades}")
+    
+    # Tickers exclus (cache)
+    if excluded_tickers:
+        lines.append("")
+        lines.append(f"⚠️ *Exclus (cache):* {len(excluded_tickers)}")
+        for exc in excluded_tickers[:3]:  # Max 3
+            lines.append(f"  • {exc['ticker']}: {exc['reason']}")
+        if len(excluded_tickers) > 3:
+            lines.append(f"  • ... +{len(excluded_tickers) - 3} autres")
+    
+    # Motifs de rejet OOS
+    if rejection_reasons:
+        lines.append("")
+        lines.append("📋 *Motifs de rejet OOS:*")
+        for reason, count in sorted(rejection_reasons.items(), key=lambda x: -x[1]):
+            if count > 0:
+                # Traduire les raisons
+                reason_fr = {
+                    "insufficient_trades": "Trades insuffisants",
+                    "degraded": "Dégradation IS→OOS",
+                    "failed": "Critères non atteints",
+                    "dd_exceeded": "DD trop élevé",
+                }.get(reason, reason)
+                lines.append(f"  • {reason_fr}: {count}")
+    
+    # Shortlist finale
+    if shortlist:
+        lines.append("")
+        lines.append("🎯 *Shortlist tradable:*")
+        for ticker, score in shortlist[:5]:  # Max 5
+            lines.append(f"  • {ticker} (score {score:.3f})")
+    elif validated_count == 0:
+        lines.append("")
+        lines.append("⚠️ *Shortlist vide* — aucun ticker validé")
+    
+    # Meilleur ticker
+    if best_ticker != "N/A":
+        lines.append("")
+        lines.append(f"🏆 *Meilleur:* {best_ticker} (score {best_score:.3f})")
+    
+    telegram_msg = "\n".join(lines)
     
     return sender.send_alert(
         title=f"🔬 Envolées {profile}",
-        message=f"{n_tickers} tickers | {validated_count} validés | best: {best_ticker}",
-        level="info",
-        telegram_message=(
-            f"🔬 *Backtest terminé — {profile}*\n\n"
-            f"📊 Résultats:\n"
-            f"  • Tickers testés: {n_tickers}\n"
-            f"  • Trades totaux: {n_trades}\n"
-            f"  • Validés OOS: {validated_count}\n\n"
-            f"🏆 Meilleur: {best_ticker} (score {best_score:.3f})"
-        ),
+        message=short_msg,
+        level="info" if validated_count > 0 else "warning",
+        telegram_message=telegram_msg,
+    )
+
+
+def send_pipeline_summary(
+    profile: str,
+    eligible_tickers: list[str],
+    excluded_tickers: list[dict],
+    validated_tickers: list[str],
+    shortlist: list[tuple[str, float]],
+    rejection_reasons: dict[str, int],
+) -> dict[str, bool]:
+    """Envoie un résumé de pipeline complet."""
+    return send_backtest_summary(
+        profile=profile,
+        n_tickers=len(eligible_tickers),
+        n_trades=0,  # Non utilisé dans ce contexte
+        best_ticker=shortlist[0][0] if shortlist else "N/A",
+        best_score=shortlist[0][1] if shortlist else 0.0,
+        validated_count=len(validated_tickers),
+        excluded_tickers=excluded_tickers,
+        rejection_reasons=rejection_reasons,
+        shortlist=shortlist,
     )
 
 

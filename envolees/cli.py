@@ -452,15 +452,40 @@ def cache_warm(tickers: str | None) -> None:
     help="Exit with error if unexpected gaps are detected.",
 )
 @click.option(
+    "--fail-on-stale",
+    is_flag=True,
+    help="Exit with error if stale data is detected.",
+)
+@click.option(
+    "--export-eligible",
+    type=click.Path(),
+    default=None,
+    help="Export eligible tickers to file (for pipeline use).",
+)
+@click.option(
     "--verbose", "-v",
     is_flag=True,
     help="Show detailed gap analysis.",
 )
-def cache_verify(tickers: str | None, fail_on_gaps: bool, verbose: bool) -> None:
-    """Verify cache integrity and detect data gaps (calendar-aware)."""
-    from envolees.data.cache import get_cache_path, is_cache_valid, get_metadata_path
+def cache_verify(
+    tickers: str | None,
+    fail_on_gaps: bool,
+    fail_on_stale: bool,
+    export_eligible: str | None,
+    verbose: bool,
+) -> None:
+    """Verify cache integrity and detect data gaps (calendar-aware).
+    
+    Distinguishes between:
+    - gaps: missing data within expected trading hours (blocking)
+    - stale: data not recent enough (warning by default)
+    
+    Use --export-eligible to generate a list of valid tickers for pipeline.
+    """
+    from envolees.data.cache import get_cache_path, is_cache_valid
     from envolees.data.calendar import analyze_gaps, check_staleness, classify_ticker
     import pandas as pd
+    import json
     
     cfg = Config.from_env()
     ticker_list = (
@@ -471,8 +496,15 @@ def cache_verify(tickers: str | None, fail_on_gaps: bool, verbose: bool) -> None
     
     console.print(f"\n[cyan]Verifying cache for {len(ticker_list)} tickers (calendar-aware)...[/cyan]\n")
     
-    issues = []
-    ok_count = 0
+    # Résultats détaillés
+    results = {
+        "eligible": [],      # Tickers OK pour backtest
+        "excluded": [],      # Tickers exclus
+        "gaps": [],          # Tickers avec gaps (bloquant)
+        "stale": [],         # Tickers stale (warning)
+        "missing": [],       # Tickers sans cache
+        "errors": [],        # Erreurs de lecture
+    }
     
     for ticker in ticker_list:
         cache_path = get_cache_path(ticker, cfg.yf_period, cfg.yf_interval, cfg)
@@ -480,53 +512,56 @@ def cache_verify(tickers: str | None, fail_on_gaps: bool, verbose: bool) -> None
         # Vérifier existence
         if not cache_path.exists():
             console.print(f"[yellow]⚠[/yellow] {ticker}: not in cache")
-            issues.append((ticker, "not_cached"))
+            results["missing"].append(ticker)
+            results["excluded"].append((ticker, "not_cached"))
             continue
         
         # Vérifier validité TTL
         if not is_cache_valid(cache_path, cfg.cache_max_age_hours):
             console.print(f"[yellow]⚠[/yellow] {ticker}: cache expired")
-            issues.append((ticker, "expired"))
+            results["missing"].append(ticker)
+            results["excluded"].append((ticker, "expired"))
             continue
         
         # Charger et analyser
         try:
             df = pd.read_parquet(cache_path)
-            
-            # Classe d'actif
             asset_class = classify_ticker(ticker)
-            
-            # Analyser les gaps (avec calendrier)
             gap_analysis = analyze_gaps(df, ticker, expected_interval_hours=1.0)
-            
-            # Vérifier la fraîcheur
             staleness = check_staleness(df, ticker)
             
-            # Affichage
+            # Construire l'affichage
             status_parts = [f"{len(df)} bars", f"{asset_class.value}"]
+            has_gaps = gap_analysis.unexpected_gaps > 0
+            is_stale = staleness.is_stale
             
-            if staleness.is_stale:
+            if is_stale:
                 status_parts.append(f"last {staleness.age_hours:.0f}h ago")
             
-            # Décision
-            has_issue = False
-            
-            if gap_analysis.unexpected_gaps > 0:
-                has_issue = True
+            if has_gaps:
                 status_parts.append(f"{gap_analysis.unexpected_gaps} unexpected gaps")
-                issues.append((ticker, f"gaps:{gap_analysis.unexpected_gaps}"))
+                results["gaps"].append(ticker)
             
-            if staleness.is_stale:
-                has_issue = True
+            if is_stale:
                 status_parts.append("stale")
-                issues.append((ticker, f"stale:{staleness.age_hours:.0f}h"))
+                results["stale"].append(ticker)
             
-            # Afficher
-            if has_issue:
-                console.print(f"[yellow]⚠[/yellow] {ticker}: {' │ '.join(status_parts)}")
+            # Décision d'éligibilité
+            # Gaps = toujours bloquant (données manquantes = backtest faussé)
+            # Stale = bloquant seulement si --fail-on-stale
+            is_eligible = not has_gaps and (not is_stale or not fail_on_stale)
+            
+            if is_eligible:
+                results["eligible"].append(ticker)
+                if is_stale:
+                    # Éligible mais stale = warning
+                    console.print(f"[yellow]~[/yellow] {ticker}: {' │ '.join(status_parts)} [dim](stale but included)[/dim]")
+                else:
+                    console.print(f"[green]✓[/green] {ticker}: {' │ '.join(status_parts)}")
             else:
-                console.print(f"[green]✓[/green] {ticker}: {' │ '.join(status_parts)}")
-                ok_count += 1
+                reason = "gaps" if has_gaps else "stale"
+                results["excluded"].append((ticker, reason))
+                console.print(f"[yellow]⚠[/yellow] {ticker}: {' │ '.join(status_parts)}")
             
             # Détails si verbose
             if verbose and gap_analysis.issues:
@@ -535,15 +570,60 @@ def cache_verify(tickers: str | None, fail_on_gaps: bool, verbose: bool) -> None
             
         except Exception as e:
             console.print(f"[red]✗[/red] {ticker}: read error - {e}")
-            issues.append((ticker, "read_error"))
+            results["errors"].append(ticker)
+            results["excluded"].append((ticker, f"error:{e}"))
     
     # Résumé
-    console.print(f"\n[bold]Résultat:[/bold] {ok_count}/{len(ticker_list)} OK")
+    n_eligible = len(results["eligible"])
+    n_total = len(ticker_list)
+    n_excluded = len(results["excluded"])
     
-    if issues:
-        console.print(f"[yellow]⚠ {len(issues)} problème(s) détecté(s)[/yellow]")
-        if fail_on_gaps:
-            sys.exit(1)
+    console.print(f"\n[bold]Résultat:[/bold] {n_eligible}/{n_total} éligibles")
+    
+    if results["gaps"]:
+        console.print(f"[red]  • Gaps bloquants: {', '.join(results['gaps'])}[/red]")
+    if results["stale"]:
+        stale_in_eligible = [t for t in results["stale"] if t in results["eligible"]]
+        stale_excluded = [t for t in results["stale"] if t not in results["eligible"]]
+        if stale_in_eligible:
+            console.print(f"[yellow]  • Stale (inclus): {', '.join(stale_in_eligible)}[/yellow]")
+        if stale_excluded:
+            console.print(f"[yellow]  • Stale (exclus): {', '.join(stale_excluded)}[/yellow]")
+    if results["missing"]:
+        console.print(f"[dim]  • Manquants: {', '.join(results['missing'])}[/dim]")
+    
+    # Exporter les tickers éligibles
+    if export_eligible:
+        export_path = Path(export_eligible)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        export_data = {
+            "eligible": results["eligible"],
+            "excluded": [{"ticker": t, "reason": r} for t, r in results["excluded"]],
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        if export_path.suffix == ".json":
+            export_path.write_text(json.dumps(export_data, indent=2))
+        else:
+            # Format simple : un ticker par ligne
+            export_path.write_text("\n".join(results["eligible"]))
+        
+        console.print(f"\n[dim]Tickers éligibles exportés: {export_path}[/dim]")
+    
+    # Code de sortie
+    should_fail = False
+    if fail_on_gaps and results["gaps"]:
+        should_fail = True
+    if fail_on_stale and results["stale"]:
+        should_fail = True
+    
+    if should_fail:
+        console.print(f"\n[red]⚠ Échec de vérification (--fail-on-gaps={fail_on_gaps}, --fail-on-stale={fail_on_stale})[/red]")
+        sys.exit(1)
+    
+    # Retourner le nombre d'éligibles pour usage programmatique
+    return n_eligible
 
 
 @main.command()
@@ -653,6 +733,52 @@ def compare(
         shortlist_cfg,
     )
     
+    # Analyser les motifs de rejet
+    import pandas as pd
+    if comparison_ref_path.exists():
+        all_tickers_df = pd.read_csv(comparison_ref_path)
+        
+        rejected = []
+        for _, row in all_tickers_df.iterrows():
+            ticker = row["ticker"]
+            
+            # Si dans shortlist, pas rejeté
+            if not shortlist.empty and ticker in shortlist["ticker"].values:
+                continue
+            
+            # Déterminer le motif
+            reasons = []
+            
+            oos_trades = row.get("oos_trades", 0)
+            if pd.isna(oos_trades) or oos_trades < min_trades:
+                reasons.append(f"trades OOS ({int(oos_trades) if not pd.isna(oos_trades) else 0} < {min_trades})")
+            
+            oos_dd = row.get("oos_dd", 0)
+            if not pd.isna(oos_dd) and oos_dd > dd_cap:
+                reasons.append(f"DD OOS ({oos_dd*100:.2f}% > {dd_cap*100:.1f}%)")
+            
+            is_dd = row.get("is_dd", 0)
+            if not pd.isna(is_dd) and is_dd > dd_cap:
+                reasons.append(f"DD IS ({is_dd*100:.2f}% > {dd_cap*100:.1f}%)")
+            
+            oos_pf = row.get("oos_pf", 0)
+            if not pd.isna(oos_pf) and oos_pf < 1.2:
+                reasons.append(f"PF OOS ({oos_pf:.2f} < 1.2)")
+            
+            oos_exp = row.get("oos_expectancy", 0)
+            if not pd.isna(oos_exp) and oos_exp <= 0:
+                reasons.append(f"ExpR OOS ({oos_exp:.3f} ≤ 0)")
+            
+            if not reasons:
+                reasons.append("score insuffisant")
+            
+            rejected.append((ticker, reasons))
+        
+        if rejected:
+            console.print(f"\n[yellow]📋 Motifs de rejet ({len(rejected)} tickers):[/yellow]")
+            for ticker, reasons in rejected:
+                console.print(f"  [dim]• {ticker}: {', '.join(reasons)}[/dim]")
+    
     if not shortlist.empty:
         console.print(f"\n[bold green]🎯 Shortlist tradable ({len(shortlist)} tickers):[/bold green]")
         for _, row in shortlist.iterrows():
@@ -671,12 +797,14 @@ def compare(
     console.print(f"[dim]  • validated.csv          (tickers validés)[/dim]")
     console.print(f"[dim]  • shortlist_tradable.csv (shortlist finale)[/dim]")
     
-    # Alertes
+    # Alertes enrichies
     if alert:
         try:
             from envolees.alerts import send_backtest_summary
+            from envolees.profiles import get_profile
+            import json as json_mod
             
-            cfg = Config.from_env()
+            profile = get_profile()
             n_tickers = len(comparison_df["ticker"].unique()) if not comparison_df.empty else 0
             n_trades = int(comparison_df["oos_trades"].sum()) if not comparison_df.empty else 0
             
@@ -684,13 +812,46 @@ def compare(
             best_score = float(shortlist.iloc[0]["oos_score"]) if not shortlist.empty else 0.0
             validated_count = len(validated) if validated is not None else 0
             
+            # Collecter les motifs de rejet par catégorie
+            rejection_reasons = {}
+            if not comparison_df.empty and "oos_status" in comparison_df.columns:
+                for status in ["insufficient_trades", "degraded", "failed"]:
+                    count = len(comparison_df[comparison_df["oos_status"] == status])
+                    if count > 0:
+                        rejection_reasons[status] = count
+            
+            # Compter les DD exceeded côté IS
+            if not comparison_df.empty and "is_dd" in comparison_df.columns:
+                dd_exceeded = len(comparison_df[comparison_df["is_dd"] > dd_cap])
+                if dd_exceeded > 0:
+                    rejection_reasons["dd_exceeded"] = dd_exceeded
+            
+            # Préparer la shortlist pour l'alerte
+            shortlist_for_alert = []
+            if not shortlist.empty:
+                for _, row in shortlist.head(5).iterrows():
+                    shortlist_for_alert.append((row["ticker"], float(row["oos_score"])))
+            
+            # Lire les exclusions cache si disponibles
+            excluded_tickers = []
+            eligible_file = Path("out_pipeline/eligible_tickers.json")
+            if eligible_file.exists():
+                try:
+                    data = json_mod.loads(eligible_file.read_text())
+                    excluded_tickers = data.get("excluded", [])
+                except Exception:
+                    pass
+            
             results = send_backtest_summary(
-                profile=cfg.risk_mode or "default",
+                profile=profile.name,
                 n_tickers=n_tickers,
                 n_trades=n_trades,
                 best_ticker=best_ticker,
                 best_score=best_score,
                 validated_count=validated_count,
+                excluded_tickers=excluded_tickers if excluded_tickers else None,
+                rejection_reasons=rejection_reasons if rejection_reasons else None,
+                shortlist=shortlist_for_alert if shortlist_for_alert else None,
             )
             
             if any(results.values()):
@@ -732,65 +893,127 @@ def heartbeat() -> None:
     help="Skip cache warm/verify steps.",
 )
 @click.option(
+    "--strict",
+    is_flag=True,
+    help="Fail if any ticker has issues (default: continue with eligible tickers).",
+)
+@click.option(
     "--alert/--no-alert",
     default=True,
     help="Send alert after compare (default: yes).",
 )
 @click.pass_context
-def pipeline(ctx, skip_cache: bool, alert: bool) -> None:
+def pipeline(ctx, skip_cache: bool, strict: bool, alert: bool) -> None:
     """Run the complete validation pipeline.
     
     Steps: cache-warm → cache-verify → IS run → OOS run → compare
     
-    This is equivalent to the systemd validation service.
+    By default, continues with eligible tickers even if some have issues.
+    Use --strict to fail on any ticker issue.
     """
     import subprocess
+    import json
     from pathlib import Path
+    import os
     
     console.print("\n[bold cyan]🚀 Envolées - Pipeline complet[/bold cyan]\n")
     
-    steps = []
+    # Répertoire de travail
+    work_dir = Path("out_pipeline")
+    work_dir.mkdir(exist_ok=True)
+    eligible_file = work_dir / "eligible_tickers.json"
     
+    original_tickers = get_tickers()
+    eligible_tickers = original_tickers.copy()
+    excluded_tickers = []
+    
+    # Step 1: Cache warm
     if not skip_cache:
-        steps.append(("Cache warm", ["python", "main.py", "cache-warm"]))
-        steps.append(("Cache verify", ["python", "main.py", "cache-verify", "--fail-on-gaps"]))
+        console.print(f"\n[bold]Step 1: Cache warm[/bold]")
+        result = subprocess.run(["python", "main.py", "cache-warm"])
+        if result.returncode != 0:
+            console.print(f"[red]✗ Cache warm failed[/red]")
+            sys.exit(1)
+        
+        # Step 2: Cache verify (avec export des tickers éligibles)
+        console.print(f"\n[bold]Step 2: Cache verify[/bold]")
+        
+        verify_cmd = [
+            "python", "main.py", "cache-verify",
+            "--export-eligible", str(eligible_file),
+        ]
+        
+        if strict:
+            verify_cmd.append("--fail-on-gaps")
+            verify_cmd.append("--fail-on-stale")
+        
+        result = subprocess.run(verify_cmd)
+        
+        # Lire les tickers éligibles
+        if eligible_file.exists():
+            data = json.loads(eligible_file.read_text())
+            eligible_tickers = data.get("eligible", [])
+            excluded_tickers = data.get("excluded", [])
+        
+        if not eligible_tickers:
+            console.print(f"\n[red]✗ Aucun ticker éligible après vérification du cache[/red]")
+            sys.exit(1)
+        
+        if excluded_tickers:
+            console.print(f"\n[yellow]⚠ {len(excluded_tickers)} ticker(s) exclus:[/yellow]")
+            for exc in excluded_tickers:
+                console.print(f"    [dim]• {exc['ticker']}: {exc['reason']}[/dim]")
+            console.print(f"[cyan]→ Continue avec {len(eligible_tickers)} ticker(s): {', '.join(eligible_tickers)}[/cyan]\n")
     
-    steps.append(("Backtest IS", ["python", "main.py", "run"], {"SPLIT_TARGET": "is", "OUTPUT_DIR": "out_is"}))
-    steps.append(("Backtest OOS", ["python", "main.py", "run"], {"SPLIT_TARGET": "oos", "OUTPUT_DIR": "out_oos"}))
+    # Préparer l'environnement avec les tickers éligibles
+    env = os.environ.copy()
+    env["TICKERS"] = ",".join(eligible_tickers)
     
+    # Step 3: Backtest IS
+    step_n = 3 if not skip_cache else 1
+    console.print(f"\n[bold]Step {step_n}: Backtest IS[/bold]")
+    env_is = env.copy()
+    env_is["SPLIT_TARGET"] = "is"
+    env_is["OUTPUT_DIR"] = "out_is"
+    
+    result = subprocess.run(["python", "main.py", "run"], env=env_is)
+    if result.returncode != 0:
+        console.print(f"[red]✗ Backtest IS failed[/red]")
+        sys.exit(1)
+    
+    # Step 4: Backtest OOS
+    step_n += 1
+    console.print(f"\n[bold]Step {step_n}: Backtest OOS[/bold]")
+    env_oos = env.copy()
+    env_oos["SPLIT_TARGET"] = "oos"
+    env_oos["OUTPUT_DIR"] = "out_oos"
+    
+    result = subprocess.run(["python", "main.py", "run"], env=env_oos)
+    if result.returncode != 0:
+        console.print(f"[red]✗ Backtest OOS failed[/red]")
+        sys.exit(1)
+    
+    # Step 5: Compare
+    step_n += 1
+    console.print(f"\n[bold]Step {step_n}: Compare IS/OOS[/bold]")
     compare_cmd = ["python", "main.py", "compare", "out_is", "out_oos"]
     if alert:
         compare_cmd.append("--alert")
-    steps.append(("Compare IS/OOS", compare_cmd))
     
-    failed = False
-    for i, step in enumerate(steps, 1):
-        name = step[0]
-        cmd = step[1]
-        env_extra = step[2] if len(step) > 2 else {}
-        
-        console.print(f"\n[bold]Step {i}/{len(steps)}: {name}[/bold]")
-        console.print(f"[dim]$ {' '.join(cmd)}[/dim]")
-        
-        # Préparer l'environnement
-        import os
-        env = os.environ.copy()
-        env.update(env_extra)
-        
-        # Exécuter
-        result = subprocess.run(cmd, env=env)
-        
-        if result.returncode != 0:
-            console.print(f"\n[red]✗ Step '{name}' failed with code {result.returncode}[/red]")
-            failed = True
-            break
-    
-    if not failed:
-        console.print(f"\n[bold green]✓ Pipeline terminé avec succès[/bold green]")
-        console.print(f"[dim]Shortlist finale: out_compare/shortlist_tradable.csv[/dim]")
-    else:
-        console.print(f"\n[bold red]✗ Pipeline interrompu[/bold red]")
+    result = subprocess.run(compare_cmd, env=env)
+    if result.returncode != 0:
+        console.print(f"[red]✗ Compare failed[/red]")
         sys.exit(1)
+    
+    # Résumé final
+    console.print(f"\n[bold green]{'─' * 60}[/bold green]")
+    console.print(f"[bold green]✓ Pipeline terminé avec succès[/bold green]")
+    console.print(f"[bold green]{'─' * 60}[/bold green]")
+    
+    console.print(f"\n[dim]Tickers analysés: {len(eligible_tickers)}/{len(original_tickers)}[/dim]")
+    if excluded_tickers:
+        console.print(f"[dim]Tickers exclus: {len(excluded_tickers)} ({', '.join(e['ticker'] for e in excluded_tickers)})[/dim]")
+    console.print(f"[dim]Shortlist finale: out_compare/shortlist_tradable.csv[/dim]")
 
 
 @main.command()
