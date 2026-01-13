@@ -428,7 +428,9 @@ def cache_warm(tickers: str | None) -> None:
     
     for ticker in ticker_list:
         try:
-            df = download_1h(ticker, cfg, use_cache=False, verbose=True)
+            # FIX: use_cache=True avec cache_max_age_hours=0 force le téléchargement
+            # tout en permettant la sauvegarde dans le cache
+            df = download_1h(ticker, cfg, use_cache=True, cache_max_age_hours=0, verbose=True)
             console.print(f"[green]✓[/green] {ticker}: {len(df)} bars 1H")
             success += 1
         except Exception as e:
