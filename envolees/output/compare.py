@@ -305,7 +305,7 @@ class ShortlistConfig:
     
     # Limites
     min_score: float = 0.0
-    max_tickers: int = 10
+    max_tickers: int = 20
     
     @classmethod
     def from_env(cls) -> ShortlistConfig:
@@ -315,11 +315,48 @@ class ShortlistConfig:
             min_trades_oos=int(os.getenv("MIN_TRADES_OOS", "15")),
             dd_cap=float(os.getenv("DD_CAP", "0.012")),
             min_score=float(os.getenv("SHORTLIST_MIN_SCORE", "0.0")),
-            max_tickers=int(os.getenv("SHORTLIST_MAX_TICKERS", "10")),
+            max_tickers=int(os.getenv("SHORTLIST_MAX_TICKERS", "20")),
         )
 
 
-def compute_oos_score(row: pd.Series, cfg: ShortlistConfig) -> float:
+@dataclass
+class TieredShortlistConfig:
+    """Configuration pour la génération de shortlists par tier."""
+    
+    # Tier 1 (Funded) - critères stricts
+    tier1_min_trades: int = 15
+    
+    # Tier 2 (Challenge) - critères assouplis
+    tier2_min_trades: int = 10
+    
+    # Critères communs
+    min_pf_oos: float = 1.2
+    min_expectancy_oos: float = 0.0
+    dd_cap: float = 0.012  # 1.2%
+    
+    # Poids du scoring
+    weight_expectancy: float = 0.55
+    weight_pf: float = 0.30
+    weight_dd: float = 0.15
+    
+    # Limites
+    min_score: float = 0.0
+    max_tickers: int = 20
+    
+    @classmethod
+    def from_env(cls) -> TieredShortlistConfig:
+        """Charge depuis l'environnement."""
+        import os
+        return cls(
+            tier1_min_trades=int(os.getenv("MIN_TRADES_TIER1", "15")),
+            tier2_min_trades=int(os.getenv("MIN_TRADES_TIER2", "10")),
+            dd_cap=float(os.getenv("DD_CAP", "0.012")),
+            min_score=float(os.getenv("SHORTLIST_MIN_SCORE", "0.0")),
+            max_tickers=int(os.getenv("SHORTLIST_MAX_TICKERS", "20")),
+        )
+
+
+def compute_oos_score(row: pd.Series, cfg: ShortlistConfig | TieredShortlistConfig) -> float:
     """
     Calcule le score OOS d'un ticker.
     
@@ -414,3 +451,164 @@ def export_shortlist(
         shortlist[[c for c in cols if c in shortlist.columns]].to_csv(output_path, index=False)
     
     return shortlist
+
+
+def _generate_shortlist_for_tier(
+    df: pd.DataFrame,
+    min_trades: int,
+    cfg: TieredShortlistConfig,
+    exclude_tickers: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Génère une shortlist pour un tier spécifique.
+    
+    Args:
+        df: DataFrame de comparaison
+        min_trades: Minimum de trades OOS requis
+        cfg: Configuration
+        exclude_tickers: Tickers à exclure (déjà dans un tier supérieur)
+    
+    Returns:
+        DataFrame trié par score décroissant
+    """
+    filtered = df.copy()
+    
+    # Exclure les tickers déjà sélectionnés
+    if exclude_tickers:
+        filtered = filtered[~filtered["ticker"].isin(exclude_tickers)]
+    
+    # Filtres
+    filtered = filtered[filtered["oos_trades"] >= min_trades]
+    filtered = filtered[filtered["oos_pf"] >= cfg.min_pf_oos]
+    filtered = filtered[filtered["oos_expectancy"] > cfg.min_expectancy_oos]
+    filtered = filtered[filtered["oos_dd"] <= cfg.dd_cap]
+    
+    # Aussi vérifier le DD sur IS (sinon on risque l'overfitting)
+    filtered = filtered[filtered["is_dd"] <= cfg.dd_cap]
+    
+    if filtered.empty:
+        return pd.DataFrame()
+    
+    # Scoring
+    filtered["oos_score"] = filtered.apply(lambda r: compute_oos_score(r, cfg), axis=1)
+    
+    # Filtre score minimum
+    if cfg.min_score > 0:
+        filtered = filtered[filtered["oos_score"] >= cfg.min_score]
+    
+    # Tri
+    filtered = filtered.sort_values("oos_score", ascending=False)
+    filtered = filtered.head(cfg.max_tickers)
+    
+    return filtered.reset_index(drop=True)
+
+
+def export_tiered_shortlists(
+    comparison_path: str | Path,
+    output_dir: str | Path,
+    cfg: TieredShortlistConfig | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Exporte les shortlists par tier.
+    
+    Tier 1 (Funded): MIN_TRADES=15, critères stricts
+    Tier 2 (Challenge): MIN_TRADES=10, HORS Tier 1
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        output_dir: Répertoire de sortie
+        cfg: Configuration
+    
+    Returns:
+        Tuple (tier1_df, tier2_df)
+    """
+    if cfg is None:
+        cfg = TieredShortlistConfig.from_env()
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    df = pd.read_csv(comparison_path)
+    
+    # Colonnes à exporter
+    export_cols = [
+        "ticker", "penalty", "oos_score",
+        "oos_trades", "oos_expectancy", "oos_pf", "oos_wr", "oos_dd",
+        "is_trades", "is_expectancy", "is_pf",
+    ]
+    
+    # Tier 1: critères stricts (≥15 trades)
+    tier1 = _generate_shortlist_for_tier(df, cfg.tier1_min_trades, cfg)
+    tier1_tickers = tier1["ticker"].tolist() if not tier1.empty else []
+    
+    if not tier1.empty:
+        tier1[[c for c in export_cols if c in tier1.columns]].to_csv(
+            output_dir / "shortlist_tier1.csv", index=False
+        )
+    else:
+        # Créer fichier vide avec headers
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tier1.csv", index=False
+        )
+    
+    # Tier 2: critères assouplis (≥10 trades), HORS tier 1
+    tier2 = _generate_shortlist_for_tier(df, cfg.tier2_min_trades, cfg, exclude_tickers=tier1_tickers)
+    
+    if not tier2.empty:
+        tier2[[c for c in export_cols if c in tier2.columns]].to_csv(
+            output_dir / "shortlist_tier2.csv", index=False
+        )
+    else:
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tier2.csv", index=False
+        )
+    
+    # Shortlist combinée pour rétrocompatibilité (tier1 + tier2)
+    combined = pd.concat([tier1, tier2], ignore_index=True) if not tier1.empty or not tier2.empty else pd.DataFrame()
+    if not combined.empty:
+        combined[[c for c in export_cols if c in combined.columns]].to_csv(
+            output_dir / "shortlist_tradable.csv", index=False
+        )
+    else:
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tradable.csv", index=False
+        )
+    
+    return tier1, tier2
+
+
+def print_tiered_shortlists(tier1: pd.DataFrame, tier2: pd.DataFrame) -> None:
+    """Affiche les shortlists par tier."""
+    from rich.console import Console
+    console = Console()
+    
+    if not tier1.empty:
+        console.print(f"\n[bold green]🎯 Tier 1 - Funded ({len(tier1)} tickers, ≥15 trades):[/bold green]")
+        for _, row in tier1.iterrows():
+            console.print(
+                f"  • {row['ticker']:>12} │ "
+                f"score {row['oos_score']:.3f} │ "
+                f"OOS: {row['oos_trades']:>2}t ExpR {row['oos_expectancy']:+.3f} "
+                f"PF {row['oos_pf']:.2f} DD {row['oos_dd']*100:.2f}%"
+            )
+    else:
+        console.print(f"\n[yellow]⚠ Tier 1 - Funded: aucun ticker[/yellow]")
+    
+    if not tier2.empty:
+        console.print(f"\n[bold cyan]🎯 Tier 2 - Challenge bonus ({len(tier2)} tickers, ≥10 trades):[/bold cyan]")
+        for _, row in tier2.iterrows():
+            console.print(
+                f"  • {row['ticker']:>12} │ "
+                f"score {row['oos_score']:.3f} │ "
+                f"OOS: {row['oos_trades']:>2}t ExpR {row['oos_expectancy']:+.3f} "
+                f"PF {row['oos_pf']:.2f} DD {row['oos_dd']*100:.2f}%"
+            )
+    else:
+        console.print(f"\n[dim]Tier 2 - Challenge bonus: aucun ticker additionnel[/dim]")
+    
+    # Résumé
+    total = len(tier1) + len(tier2)
+    if total > 0:
+        console.print(f"\n[bold]Résumé:[/bold]")
+        console.print(f"  • Funded (Tier 1 seul): {len(tier1)} instruments")
+        console.print(f"  • Challenge (Tier 1 + 2): {total} instruments")
