@@ -1,0 +1,70 @@
+# Instruments GFT → Yahoo Finance
+# Utiliser avec : TICKERS=$(cat instruments_gft.txt | grep -v '^#' | tr '\n' ',')
+#
+# 28 paires FX + 7 indices + 2 énergies + 2 métaux = 39 instruments
+
+# === FOREX MAJEURS (vs USD) ===
+EURUSD=X
+GBPUSD=X
+AUDUSD=X
+NZDUSD=X
+USDCHF=X
+USDJPY=X
+USDCAD=X
+
+# === FOREX CROSSES EUR ===
+EURGBP=X
+EURJPY=X
+EURCHF=X
+EURCAD=X
+EURAUD=X
+EURNZD=X
+
+# === FOREX CROSSES GBP ===
+GBPJPY=X
+GBPCHF=X
+GBPCAD=X
+GBPAUD=X
+GBPNZD=X
+
+# === FOREX CROSSES JPY ===
+CHFJPY=X
+CADJPY=X
+AUDJPY=X
+NZDJPY=X
+
+# === FOREX CROSSES AUTRES ===
+CADCHF=X
+AUDCHF=X
+NZDCHF=X
+AUDCAD=X
+AUDNZD=X
+NZDCAD=X
+
+# === INDICES ===
+# SPX500 → S&P 500 futures
+ES=F
+# NAS100 → Nasdaq 100 futures
+NQ=F
+# US30 → Dow Jones futures
+YM=F
+# JAP225 → Nikkei 225
+^N225
+# UK100 → FTSE 100
+^FTSE
+# AUS200 → ASX 200
+^AXJO
+# GER40 → DAX 40
+^GDAXI
+
+# === ÉNERGIES ===
+# Brent Crude
+BZ=F
+# WTI Crude
+CL=F
+
+# === MÉTAUX ===
+# Gold (XAU)
+GC=F
+# Silver (XAG)
+SI=F
