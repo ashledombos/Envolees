@@ -692,18 +692,22 @@ def compare(
 ) -> None:
     """Compare IS and OOS results for validation.
     
+    Generates tiered shortlists:
+    - Tier 1 (Funded): ≥15 trades OOS, strict criteria
+    - Tier 2 (Challenge): ≥10 trades OOS, excludes Tier 1
+    
     Example:
         python main.py compare out_is out_oos -o out_compare
     """
     from pathlib import Path
     from envolees.output.compare import (
         OOSEligibility,
-        ShortlistConfig,
+        TieredShortlistConfig,
         export_comparison,
         print_comparison_summary,
         compare_is_oos,
-        shortlist_from_compare,
-        export_shortlist,
+        export_tiered_shortlists,
+        print_tiered_shortlists,
     )
     
     is_path = Path(is_dir) / "results.csv"
@@ -720,10 +724,12 @@ def compare(
     console.print(f"   IS:  {is_dir}")
     console.print(f"   OOS: {oos_dir}")
     console.print(f"   Reference penalty: {penalty}")
-    console.print(f"   Min OOS trades: {min_trades}")
+    console.print(f"   Tier 1 min trades: 15 (Funded)")
+    console.print(f"   Tier 2 min trades: 10 (Challenge)")
     console.print(f"   DD cap: {dd_cap*100:.1f}%\n")
     
-    criteria = OOSEligibility(min_trades=min_trades)
+    # Utiliser min_trades=10 pour voir tous les candidats potentiels
+    criteria = OOSEligibility(min_trades=10)
     
     # Export complet
     validated = export_comparison(
@@ -736,18 +742,19 @@ def compare(
     comparison_df = compare_is_oos(is_path, oos_path, criteria, penalty)
     print_comparison_summary(comparison_df)
     
-    # Générer la shortlist
-    shortlist_cfg = ShortlistConfig(
-        min_trades_oos=min_trades,
+    # Générer les shortlists par tier
+    tiered_cfg = TieredShortlistConfig(
+        tier1_min_trades=15,
+        tier2_min_trades=10,
         dd_cap=dd_cap,
         max_tickers=max_tickers,
     )
     
     comparison_ref_path = Path(output) / "comparison_ref.csv"
-    shortlist = export_shortlist(
+    tier1, tier2 = export_tiered_shortlists(
         comparison_ref_path,
-        Path(output) / "shortlist_tradable.csv",
-        shortlist_cfg,
+        output,
+        tiered_cfg,
     )
     
     # Analyser les motifs de rejet
@@ -755,20 +762,27 @@ def compare(
     if comparison_ref_path.exists():
         all_tickers_df = pd.read_csv(comparison_ref_path)
         
+        # Tickers dans les shortlists
+        shortlisted = set()
+        if not tier1.empty:
+            shortlisted.update(tier1["ticker"].tolist())
+        if not tier2.empty:
+            shortlisted.update(tier2["ticker"].tolist())
+        
         rejected = []
         for _, row in all_tickers_df.iterrows():
             ticker = row["ticker"]
             
-            # Si dans shortlist, pas rejeté
-            if not shortlist.empty and ticker in shortlist["ticker"].values:
+            # Si dans une shortlist, pas rejeté
+            if ticker in shortlisted:
                 continue
             
             # Déterminer le motif
             reasons = []
             
             oos_trades = row.get("oos_trades", 0)
-            if pd.isna(oos_trades) or oos_trades < min_trades:
-                reasons.append(f"trades OOS ({int(oos_trades) if not pd.isna(oos_trades) else 0} < {min_trades})")
+            if pd.isna(oos_trades) or oos_trades < 10:
+                reasons.append(f"trades OOS ({int(oos_trades) if not pd.isna(oos_trades) else 0} < 10)")
             
             oos_dd = row.get("oos_dd", 0)
             if not pd.isna(oos_dd) and oos_dd > dd_cap:
@@ -796,23 +810,15 @@ def compare(
             for ticker, reasons in rejected:
                 console.print(f"  [dim]• {ticker}: {', '.join(reasons)}[/dim]")
     
-    if not shortlist.empty:
-        console.print(f"\n[bold green]🎯 Shortlist tradable ({len(shortlist)} tickers):[/bold green]")
-        for _, row in shortlist.iterrows():
-            console.print(
-                f"  • {row['ticker']:>12} │ "
-                f"score {row['oos_score']:.3f} │ "
-                f"OOS: {row['oos_trades']:>2}t ExpR {row['oos_expectancy']:+.3f} "
-                f"PF {row['oos_pf']:.2f} DD {row['oos_dd']*100:.2f}%"
-            )
-    else:
-        console.print(f"\n[yellow]⚠ Aucun ticker ne passe les critères shortlist[/yellow]")
+    # Afficher les shortlists par tier
+    print_tiered_shortlists(tier1, tier2)
     
     console.print(f"\n[dim]Rapports exportés dans {output}/[/dim]")
     console.print(f"[dim]  • comparison_full.csv    (toutes pénalités)[/dim]")
     console.print(f"[dim]  • comparison_ref.csv     (PEN {penalty})[/dim]")
-    console.print(f"[dim]  • validated.csv          (tickers validés)[/dim]")
-    console.print(f"[dim]  • shortlist_tradable.csv (shortlist finale)[/dim]")
+    console.print(f"[dim]  • shortlist_tier1.csv    (Funded, ≥15 trades)[/dim]")
+    console.print(f"[dim]  • shortlist_tier2.csv    (Challenge bonus, ≥10 trades)[/dim]")
+    console.print(f"[dim]  • shortlist_tradable.csv (combiné Tier 1 + 2)[/dim]")
     
     # Alertes enrichies
     if alert:
@@ -825,8 +831,17 @@ def compare(
             n_tickers = len(comparison_df["ticker"].unique()) if not comparison_df.empty else 0
             n_trades = int(comparison_df["oos_trades"].sum()) if not comparison_df.empty else 0
             
-            best_ticker = shortlist.iloc[0]["ticker"] if not shortlist.empty else "N/A"
-            best_score = float(shortlist.iloc[0]["oos_score"]) if not shortlist.empty else 0.0
+            # Best ticker from tier1, or tier2 if tier1 empty
+            if not tier1.empty:
+                best_ticker = tier1.iloc[0]["ticker"]
+                best_score = float(tier1.iloc[0]["oos_score"])
+            elif not tier2.empty:
+                best_ticker = tier2.iloc[0]["ticker"]
+                best_score = float(tier2.iloc[0]["oos_score"])
+            else:
+                best_ticker = "N/A"
+                best_score = 0.0
+            
             validated_count = len(validated) if validated is not None else 0
             
             # Collecter les motifs de rejet par catégorie
@@ -843,11 +858,16 @@ def compare(
                 if dd_exceeded > 0:
                     rejection_reasons["dd_exceeded"] = dd_exceeded
             
-            # Préparer la shortlist pour l'alerte
-            shortlist_for_alert = []
-            if not shortlist.empty:
-                for _, row in shortlist.head(5).iterrows():
-                    shortlist_for_alert.append((row["ticker"], float(row["oos_score"])))
+            # Préparer les deux tiers pour l'alerte
+            tier1_for_alert = []
+            if not tier1.empty:
+                for _, row in tier1.head(5).iterrows():
+                    tier1_for_alert.append((row["ticker"], float(row["oos_score"])))
+            
+            tier2_for_alert = []
+            if not tier2.empty:
+                for _, row in tier2.head(5).iterrows():
+                    tier2_for_alert.append((row["ticker"], float(row["oos_score"])))
             
             # Lire les exclusions cache si disponibles
             excluded_tickers = []
@@ -868,7 +888,8 @@ def compare(
                 validated_count=validated_count,
                 excluded_tickers=excluded_tickers if excluded_tickers else None,
                 rejection_reasons=rejection_reasons if rejection_reasons else None,
-                shortlist=shortlist_for_alert if shortlist_for_alert else None,
+                shortlist=tier1_for_alert if tier1_for_alert else None,
+                tier2=tier2_for_alert if tier2_for_alert else None,
             )
             
             if any(results.values()):
