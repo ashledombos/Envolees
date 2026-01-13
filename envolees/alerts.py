@@ -456,6 +456,8 @@ def send_status_simple(
     return sender.send_status(status)
 
 
+# Remplacer la fonction send_backtest_summary dans envolees/alerts.py par celle-ci:
+
 def send_backtest_summary(
     profile: str,
     n_tickers: int,
@@ -466,6 +468,7 @@ def send_backtest_summary(
     excluded_tickers: list[dict] | None = None,
     rejection_reasons: dict[str, int] | None = None,
     shortlist: list[tuple[str, float]] | None = None,
+    tier2: list[tuple[str, float]] | None = None,
 ) -> dict[str, bool]:
     """Envoie un résumé de backtest enrichi.
     
@@ -478,12 +481,20 @@ def send_backtest_summary(
         validated_count: Nombre de tickers validés OOS
         excluded_tickers: Liste des tickers exclus (cache) [{"ticker": "X", "reason": "Y"}]
         rejection_reasons: Compteur des motifs de rejet OOS {"insufficient_trades": 3, ...}
-        shortlist: Liste ordonnée [(ticker, score), ...]
+        shortlist: Liste Tier 1 ordonnée [(ticker, score), ...]
+        tier2: Liste Tier 2 (Challenge bonus) [(ticker, score), ...]
     """
     sender = AlertSender()
     
+    # Calculer le total
+    tier1_count = len(shortlist) if shortlist else 0
+    tier2_count = len(tier2) if tier2 else 0
+    total_tradable = tier1_count + tier2_count
+    
     # Message court pour ntfy
-    short_msg = f"{validated_count}/{n_tickers} validés"
+    short_msg = f"{total_tradable}/{n_tickers} tradables"
+    if tier1_count > 0 and tier2_count > 0:
+        short_msg += f" (T1:{tier1_count} T2:{tier2_count})"
     if best_ticker != "N/A":
         short_msg += f" | best: {best_ticker}"
     if excluded_tickers:
@@ -497,7 +508,7 @@ def send_backtest_summary(
     
     # Résumé principal
     lines.append("📊 *Résultats OOS:*")
-    lines.append(f"  ✓ Validés: {validated_count}/{n_tickers}")
+    lines.append(f"  ✓ Tradables: {total_tradable}/{n_tickers}")
     if n_trades > 0:
         lines.append(f"  📈 Trades OOS: {n_trades}")
     
@@ -525,15 +536,33 @@ def send_backtest_summary(
                 }.get(reason, reason)
                 lines.append(f"  • {reason_fr}: {count}")
     
-    # Shortlist finale
+    # Tier 1 (Funded)
     if shortlist:
         lines.append("")
-        lines.append("🎯 *Shortlist tradable:*")
+        lines.append(f"🎯 *Tier 1 — Funded ({tier1_count} instr., ≥15 trades):*")
         for ticker, score in shortlist[:5]:  # Max 5
             lines.append(f"  • {ticker} (score {score:.3f})")
-    elif validated_count == 0:
+        if tier1_count > 5:
+            lines.append(f"  • ... +{tier1_count - 5} autres")
+    elif validated_count == 0 and not tier2:
         lines.append("")
-        lines.append("⚠️ *Shortlist vide* — aucun ticker validé")
+        lines.append("⚠️ *Aucun instrument tradable*")
+    
+    # Tier 2 (Challenge bonus)
+    if tier2:
+        lines.append("")
+        lines.append(f"🎯 *Tier 2 — Challenge bonus ({tier2_count} instr., ≥10 trades):*")
+        for ticker, score in tier2[:5]:  # Max 5
+            lines.append(f"  • {ticker} (score {score:.3f})")
+        if tier2_count > 5:
+            lines.append(f"  • ... +{tier2_count - 5} autres")
+    
+    # Résumé final
+    if total_tradable > 0:
+        lines.append("")
+        lines.append("📋 *Utilisation:*")
+        lines.append(f"  • Funded: Tier 1 seul ({tier1_count} instr.)")
+        lines.append(f"  • Challenge: Tier 1 + 2 ({total_tradable} instr.)")
     
     # Meilleur ticker
     if best_ticker != "N/A":
@@ -545,7 +574,7 @@ def send_backtest_summary(
     return sender.send_alert(
         title=f"🔬 Envolées {profile}",
         message=short_msg,
-        level="info" if validated_count > 0 else "warning",
+        level="info" if total_tradable > 0 else "warning",
         telegram_message=telegram_msg,
     )
 
