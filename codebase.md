@@ -1,0 +1,8899 @@
+
+./envolees/backtest/__init__.py
+────────────────────────────────────────────────────────────
+
+"""Backtest engine and simulation."""
+
+from envolees.backtest.engine import BacktestEngine, BacktestResult
+from envolees.backtest.position import OpenPosition, PendingOrder, TradeRecord
+from envolees.backtest.prop_sim import DailyState, PropSimulator
+
+__all__ = [
+    "BacktestEngine",
+    "BacktestResult",
+    "OpenPosition",
+    "PendingOrder",
+    "TradeRecord",
+    "DailyState",
+    "PropSimulator",
+]
+
+
+
+./envolees/backtest/engine.py
+────────────────────────────────────────────────────────────
+
+"""
+Moteur de backtest principal.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+import pandas as pd
+
+from envolees.backtest.position import OpenPosition, PendingOrder, TradeRecord
+from envolees.backtest.prop_sim import DailyState, PropSimulator
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+    from envolees.strategy.base import Strategy
+
+
+@dataclass
+class EquityRow:
+    """Ligne de la courbe d'equity."""
+
+    time: pd.Timestamp
+    balance: float
+    equity: float
+    dd_global: float
+    dd_daily: float
+    halt_today: bool
+
+    def to_dict(self) -> dict:
+        return {
+            "time": self.time,
+            "balance": self.balance,
+            "equity": self.equity,
+            "dd_global": self.dd_global,
+            "dd_daily": self.dd_daily,
+            "halt_today": self.halt_today,
+        }
+
+
+@dataclass
+class BacktestResult:
+    """Résultat d'un backtest."""
+
+    ticker: str
+    exec_penalty_atr: float
+    trades: list[TradeRecord]
+    equity_curve: list[EquityRow]
+    daily_stats: list[dict]
+    summary: dict
+
+    def trades_df(self) -> pd.DataFrame:
+        """Retourne les trades en DataFrame."""
+        if not self.trades:
+            return pd.DataFrame()
+        return pd.DataFrame([t.to_dict() for t in self.trades])
+
+    def equity_df(self) -> pd.DataFrame:
+        """Retourne la courbe d'equity en DataFrame."""
+        if not self.equity_curve:
+            return pd.DataFrame()
+        df = pd.DataFrame([e.to_dict() for e in self.equity_curve])
+        return df.set_index("time")
+
+    def daily_df(self) -> pd.DataFrame:
+        """Retourne les stats journalières en DataFrame."""
+        return pd.DataFrame(self.daily_stats)
+
+
+class BacktestEngine:
+    """
+    Moteur de backtest générique.
+
+    Exécute une stratégie sur des données OHLCV avec :
+    - Gestion des ordres stop en attente
+    - Simulation des règles prop firm
+    - Tracking de l'equity et du drawdown
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        strategy: Strategy,
+        ticker: str,
+        exec_penalty_atr: float,
+    ) -> None:
+        self.cfg = cfg
+        self.strategy = strategy
+        self.ticker = ticker
+        self.exec_penalty_atr = exec_penalty_atr
+
+        # État
+        self.balance = cfg.start_balance
+        self.open_position: OpenPosition | None = None
+        self.pending_order: PendingOrder | None = None
+
+        # Prop simulation
+        self.prop_sim = PropSimulator(cfg)
+
+        # Daily tracking
+        self.daily_state = DailyState()
+        self.daily_stats: list[dict] = []
+
+        # Résultats
+        self.trades: list[TradeRecord] = []
+        self.equity_curve: list[EquityRow] = []
+
+    def _compute_equity(self, row: pd.Series) -> float:
+        """Calcule l'equity mark-to-market."""
+        if self.open_position is None:
+            return self.balance
+
+        if self.cfg.daily_equity_mode == "close":
+            ref_price = float(row["Close"])
+        else:
+            # Worst-case intrabar
+            if self.open_position.direction == "LONG":
+                ref_price = float(row["Low"])
+            else:
+                ref_price = float(row["High"])
+
+        unreal_r = self.open_position.compute_unrealized_r(ref_price)
+        return self.balance + unreal_r * self.open_position.risk_cash
+
+    def _handle_day_change(self, day, equity: float) -> None:
+        """Gère le changement de jour."""
+        # Flush stats du jour précédent
+        if self.daily_state.current_day is not None:
+            self.daily_stats.append({
+                "date": str(self.daily_state.current_day),
+                "start_equity": self.daily_state.start_equity,
+                "min_equity": self.daily_state.min_equity,
+                "max_daily_dd_pct": self.daily_state.daily_dd,
+                "losses_closed": self.daily_state.losses_closed,
+                "halted": self.daily_state.halted,
+            })
+
+        # Reset pour nouveau jour
+        self.daily_state.reset(day, equity)
+        self.prop_sim.on_new_day(day, equity)
+
+    def _process_open_position(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
+        """Gère les sorties SL/TP d'une position ouverte."""
+        if self.open_position is None:
+            return
+
+        exit_reason, exit_price = self.open_position.check_exit(
+            float(row["High"]),
+            float(row["Low"]),
+            self.cfg.conservative_same_bar,
+        )
+
+        if exit_reason is None:
+            return
+
+        # Calcul P&L
+        result_r = self.open_position.compute_pnl_r(exit_price)
+        result_cash = result_r * self.open_position.risk_cash
+        self.balance += result_cash
+
+        # Enregistrement
+        trade = TradeRecord(
+            ticker=self.ticker,
+            penalty_atr=self.exec_penalty_atr,
+            direction=self.open_position.direction,
+            ts_signal=self.open_position.ts_signal,
+            ts_entry=self.open_position.ts_entry,
+            ts_exit=ts,
+            entry=self.open_position.entry,
+            sl=self.open_position.sl,
+            tp=self.open_position.tp,
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+            atr_signal=self.open_position.atr_signal,
+            result_r=result_r,
+            result_cash=result_cash,
+            balance_after=self.balance,
+            duration_bars=bar_idx - self.open_position.entry_bar_idx,
+        )
+        self.trades.append(trade)
+
+        # Update prop sim
+        self.prop_sim.on_trade_closed(result_r, self.balance)
+
+        # Reset
+        self.open_position = None
+        self.pending_order = None
+
+        # Update daily min
+        self.daily_state.update_min_equity(self.balance)
+
+    def _process_pending_order(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
+        """Gère le déclenchement d'un ordre en attente."""
+        if self.open_position is not None or self.pending_order is None:
+            return
+
+        # Expiration ?
+        if self.pending_order.is_expired(bar_idx):
+            self.pending_order = None
+            return
+
+        # Déclenchement ?
+        if not self.pending_order.is_triggered(float(row["High"]), float(row["Low"])):
+            return
+
+        # Halted ?
+        if self.prop_sim.is_halted:
+            return
+
+        # Calcul entry/SL/TP avec pénalité
+        from envolees.strategy.base import Signal
+
+        signal = Signal(
+            direction=self.pending_order.direction,
+            entry_level=self.pending_order.entry_level,
+            atr_at_signal=self.pending_order.atr_signal,
+            timestamp=self.pending_order.ts_signal,
+        )
+        entry, sl, tp = self.strategy.compute_entry_sl_tp(signal, self.exec_penalty_atr)
+
+        # Ouverture position
+        self.open_position = OpenPosition(
+            direction=self.pending_order.direction,
+            entry=entry,
+            sl=sl,
+            tp=tp,
+            ts_signal=self.pending_order.ts_signal,
+            ts_entry=ts,
+            atr_signal=self.pending_order.atr_signal,
+            entry_bar_idx=bar_idx,
+            risk_cash=self.balance * self.cfg.risk_per_trade,
+        )
+        self.pending_order = None
+
+    def _generate_new_signal(self, df: pd.DataFrame, bar_idx: int) -> None:
+        """Génère un nouveau signal si conditions remplies."""
+        if self.open_position is not None or self.pending_order is not None:
+            return
+
+        if self.prop_sim.is_halted:
+            return
+
+        # Demande à la stratégie
+        signal = self.strategy.generate_signal(df, bar_idx, None, None)
+        if signal is not None:
+            self.pending_order = PendingOrder.from_signal(signal, bar_idx)
+
+    def run(self, df: pd.DataFrame) -> BacktestResult:
+        """
+        Exécute le backtest.
+
+        Args:
+            df: DataFrame OHLCV (sera enrichi avec les indicateurs)
+
+        Returns:
+            BacktestResult avec trades, equity, stats
+        """
+        # Préparation indicateurs
+        df = self.strategy.prepare_indicators(df)
+        idx = df.index.to_list()
+
+        for bar_idx in range(len(df)):
+            ts = idx[bar_idx]
+            row = df.iloc[bar_idx]
+            day = ts.date()
+
+            # Equity mark-to-market
+            equity = self._compute_equity(row)
+
+            # Changement de jour ?
+            if self.daily_state.current_day is None or day != self.daily_state.current_day:
+                self._handle_day_change(day, equity)
+
+            # Update equity tracking
+            self.daily_state.update_min_equity(equity)
+            self.prop_sim.update_equity(equity, day)
+
+            # Enregistrement equity
+            self.equity_curve.append(EquityRow(
+                time=ts,
+                balance=self.balance,
+                equity=equity,
+                dd_global=self.prop_sim.global_dd(equity),
+                dd_daily=self.daily_state.daily_dd,
+                halt_today=self.prop_sim.is_halted,
+            ))
+
+            # 1. Gestion position ouverte (SL/TP)
+            self._process_open_position(row, bar_idx, ts)
+
+            # 2. Gestion ordre en attente
+            self._process_pending_order(row, bar_idx, ts)
+
+            # 3. Génération nouveau signal
+            self._generate_new_signal(df, bar_idx)
+
+        # Flush dernière journée
+        if self.daily_state.current_day is not None:
+            self.daily_stats.append({
+                "date": str(self.daily_state.current_day),
+                "start_equity": self.daily_state.start_equity,
+                "min_equity": self.daily_state.min_equity,
+                "max_daily_dd_pct": self.daily_state.daily_dd,
+                "losses_closed": self.daily_state.losses_closed,
+                "halted": self.daily_state.halted,
+            })
+
+        # Construction summary
+        summary = self._build_summary(len(df))
+
+        return BacktestResult(
+            ticker=self.ticker,
+            exec_penalty_atr=self.exec_penalty_atr,
+            trades=self.trades,
+            equity_curve=self.equity_curve,
+            daily_stats=self.daily_stats,
+            summary=summary,
+        )
+
+    def _build_summary(self, n_bars: int) -> dict:
+        """Construit le dictionnaire de résumé."""
+        trades_df = pd.DataFrame([t.to_dict() for t in self.trades]) if self.trades else pd.DataFrame()
+        daily_df = pd.DataFrame(self.daily_stats) if self.daily_stats else pd.DataFrame()
+
+        if len(trades_df):
+            win_rate = float((trades_df["result_r"] > 0).mean())
+            exp_r = float(trades_df["result_r"].mean())
+            gross_win = trades_df.loc[trades_df["result_r"] > 0, "result_r"].sum()
+            gross_loss = abs(trades_df.loc[trades_df["result_r"] < 0, "result_r"].sum())
+            pf = float(gross_win / gross_loss) if gross_loss > 0 else (float("inf") if gross_win > 0 else 0.0)
+        else:
+            win_rate, exp_r, pf = 0.0, 0.0, 0.0
+
+        prop_stats = self.prop_sim.get_stats()
+
+        return {
+            "ticker": self.ticker,
+            "exec_penalty_atr": self.exec_penalty_atr,
+            "bars_4h": n_bars,
+            "start_balance": self.cfg.start_balance,
+            "end_balance": self.balance,
+            "risk_per_trade": self.cfg.risk_per_trade,
+            "n_trades": len(self.trades),
+            "win_rate": win_rate,
+            "profit_factor": pf,
+            "expectancy_r": exp_r,
+            "prop": {
+                "daily_equity_mode": self.cfg.daily_equity_mode,
+                "max_daily_dd_pct": float(daily_df["max_daily_dd_pct"].max()) if len(daily_df) else 0.0,
+                "p99_daily_dd_pct": float(daily_df["max_daily_dd_pct"].quantile(0.99)) if len(daily_df) else 0.0,
+                "n_daily_violate_ftmo_bars": prop_stats["n_violate_ftmo_bars"],
+                "n_daily_violate_gft_bars": prop_stats["n_violate_gft_bars"],
+                "n_total_violate_bars": prop_stats["n_violate_total_bars"],
+            },
+            "params": {
+                "ema_period": self.cfg.ema_period,
+                "atr_period": self.cfg.atr_period,
+                "donchian_n": self.cfg.donchian_n,
+                "buffer_atr": self.cfg.buffer_atr,
+                "sl_atr": self.cfg.sl_atr,
+                "tp_r": self.cfg.tp_r,
+                "vol_quantile": self.cfg.vol_quantile,
+                "vol_window_bars": self.cfg.vol_window_bars,
+                "order_valid_bars": self.cfg.order_valid_bars,
+                "conservative_same_bar": self.cfg.conservative_same_bar,
+                "daily_dd_ftmo": self.cfg.daily_dd_ftmo,
+                "daily_dd_gft": self.cfg.daily_dd_gft,
+                "daily_kill_switch": self.cfg.daily_kill_switch,
+                "stop_after_n_losses": self.cfg.stop_after_n_losses,
+            },
+            "notes": [
+                "Backtest bar-based 4H ; déclenchement STOP via High/Low.",
+                "Si SL et TP touchés même bougie, SL prioritaire (conservateur).",
+                "Pénalité d'exécution appliquée à l'entrée (k×ATR au signal), SL/TP recalculés.",
+                "Daily DD simulé avec mark-to-market (close ou worst).",
+                "Reset daily à minuit (Europe/Paris).",
+            ],
+        }
+
+
+
+./envolees/backtest/position.py
+────────────────────────────────────────────────────────────
+
+"""
+Gestion des positions et ordres en attente.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
+
+import pandas as pd
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+    from envolees.strategy.base import Direction, Signal
+
+
+ExitReason = Literal["SL", "TP"]
+
+
+@dataclass
+class OpenPosition:
+    """Position ouverte."""
+
+    direction: Literal["LONG", "SHORT"]
+    entry: float
+    sl: float
+    tp: float
+    ts_signal: pd.Timestamp
+    ts_entry: pd.Timestamp
+    atr_signal: float
+    entry_bar_idx: int
+    risk_cash: float
+
+    @property
+    def risk_points(self) -> float:
+        """Distance entry → SL en points."""
+        return abs(self.entry - self.sl)
+
+    def compute_pnl_r(self, exit_price: float) -> float:
+        """Calcule le P&L en R-multiples."""
+        if self.risk_points <= 0:
+            return 0.0
+
+        if self.direction == "LONG":
+            pnl_points = exit_price - self.entry
+        else:
+            pnl_points = self.entry - exit_price
+
+        return pnl_points / self.risk_points
+
+    def compute_unrealized_r(self, current_price: float) -> float:
+        """Calcule le P&L non réalisé en R."""
+        return self.compute_pnl_r(current_price)
+
+    def check_exit(
+        self,
+        high: float,
+        low: float,
+        conservative_same_bar: bool = True,
+    ) -> tuple[ExitReason | None, float | None]:
+        """
+        Vérifie si SL ou TP est touché.
+
+        Args:
+            high: High de la bougie
+            low: Low de la bougie
+            conservative_same_bar: Si True, SL prioritaire si les deux sont touchés
+
+        Returns:
+            Tuple (exit_reason, exit_price) ou (None, None)
+        """
+        if self.direction == "LONG":
+            hit_sl = low <= self.sl
+            hit_tp = high >= self.tp
+        else:
+            hit_sl = high >= self.sl
+            hit_tp = low <= self.tp
+
+        # Convention conservative
+        if hit_sl and hit_tp and conservative_same_bar:
+            hit_tp = False
+
+        if hit_sl:
+            return "SL", self.sl
+        if hit_tp:
+            return "TP", self.tp
+
+        return None, None
+
+
+@dataclass
+class PendingOrder:
+    """Ordre en attente de déclenchement."""
+
+    direction: Literal["LONG", "SHORT"]
+    entry_level: float
+    ts_signal: pd.Timestamp
+    atr_signal: float
+    expiry_bar_idx: int
+
+    def is_expired(self, current_bar_idx: int) -> bool:
+        """L'ordre a-t-il expiré ?"""
+        return current_bar_idx > self.expiry_bar_idx
+
+    def is_triggered(self, high: float, low: float) -> bool:
+        """L'ordre est-il déclenché ?"""
+        if self.direction == "LONG":
+            return high >= self.entry_level
+        return low <= self.entry_level
+
+    @classmethod
+    def from_signal(cls, signal: Signal, current_bar_idx: int) -> PendingOrder:
+        """Crée un ordre en attente depuis un signal."""
+        return cls(
+            direction=signal.direction,
+            entry_level=signal.entry_level,
+            ts_signal=signal.timestamp,
+            atr_signal=signal.atr_at_signal,
+            expiry_bar_idx=current_bar_idx + signal.expiry_bars,
+        )
+
+
+@dataclass
+class TradeRecord:
+    """Enregistrement d'un trade clôturé."""
+
+    ticker: str
+    penalty_atr: float
+    direction: Literal["LONG", "SHORT"]
+    ts_signal: pd.Timestamp
+    ts_entry: pd.Timestamp
+    ts_exit: pd.Timestamp
+    entry: float
+    sl: float
+    tp: float
+    exit_price: float
+    exit_reason: ExitReason
+    atr_signal: float
+    result_r: float
+    result_cash: float
+    balance_after: float
+    duration_bars: int
+
+    def to_dict(self) -> dict:
+        """Convertit en dictionnaire pour export."""
+        return {
+            "ticker": self.ticker,
+            "penalty_atr": self.penalty_atr,
+            "direction": self.direction,
+            "ts_signal": self.ts_signal,
+            "ts_entry": self.ts_entry,
+            "ts_exit": self.ts_exit,
+            "entry": self.entry,
+            "sl": self.sl,
+            "tp": self.tp,
+            "exit": self.exit_price,
+            "exit_reason": self.exit_reason,
+            "atr_signal": self.atr_signal,
+            "result_r": self.result_r,
+            "result_cash": self.result_cash,
+            "balance_after": self.balance_after,
+            "duration_bars": self.duration_bars,
+        }
+
+
+
+./envolees/backtest/prop_sim.py
+────────────────────────────────────────────────────────────
+
+"""
+Simulation des règles prop firm (FTMO, GFT, etc.).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import date
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+
+
+@dataclass
+class DailyState:
+    """État quotidien pour le tracking du drawdown."""
+
+    current_day: date | None = None
+    start_equity: float = 0.0
+    min_equity: float = 0.0
+    losses_closed: int = 0
+    halted: bool = False
+
+    def reset(self, day: date, equity: float) -> None:
+        """Reset pour un nouveau jour."""
+        self.current_day = day
+        self.start_equity = equity
+        self.min_equity = equity
+        self.losses_closed = 0
+        self.halted = False
+
+    def update_min_equity(self, equity: float) -> None:
+        """Met à jour le minimum equity du jour."""
+        if equity < self.min_equity:
+            self.min_equity = equity
+
+    @property
+    def daily_dd(self) -> float:
+        """Drawdown quotidien en pourcentage."""
+        if self.start_equity <= 0:
+            return 0.0
+        return (self.start_equity - self.min_equity) / self.start_equity
+
+
+@dataclass
+class PropSimulator:
+    """
+    Simulateur des règles prop firm.
+
+    Gère :
+    - Daily drawdown (mode close ou worst-case intrabar)
+    - Kill-switch journalier
+    - Limite de pertes consécutives
+    - Tracking des violations FTMO/GFT
+    """
+
+    cfg: Config
+    daily: DailyState = field(default_factory=DailyState)
+    peak_equity: float = 0.0
+
+    # Compteurs de violations (informatif)
+    n_violate_ftmo_bars: int = 0
+    n_violate_gft_bars: int = 0
+    n_violate_total_bars: int = 0
+
+    def __post_init__(self) -> None:
+        self.peak_equity = self.cfg.start_balance
+
+    def on_new_day(self, day: date, equity: float) -> None:
+        """Appelé au changement de jour."""
+        self.daily.reset(day, equity)
+
+    def update_equity(self, equity: float, day: date) -> None:
+        """
+        Met à jour l'equity et vérifie les règles.
+
+        Args:
+            equity: Equity actuelle (mark-to-market)
+            day: Date courante
+        """
+        # Changement de jour ?
+        if self.daily.current_day is None or day != self.daily.current_day:
+            self.on_new_day(day, equity)
+            return
+
+        # Update min equity
+        self.daily.update_min_equity(equity)
+
+        # Update peak
+        if equity > self.peak_equity:
+            self.peak_equity = equity
+
+        # Check violations
+        daily_dd = self.daily.daily_dd
+        global_dd = self.global_dd(equity)
+
+        if daily_dd > self.cfg.daily_dd_ftmo:
+            self.n_violate_ftmo_bars += 1
+        if daily_dd > self.cfg.daily_dd_gft:
+            self.n_violate_gft_bars += 1
+        if global_dd > self.cfg.max_loss:
+            self.n_violate_total_bars += 1
+
+        # Kill-switch
+        if daily_dd >= self.cfg.daily_kill_switch:
+            self.daily.halted = True
+
+    def global_dd(self, equity: float) -> float:
+        """Drawdown global depuis le peak."""
+        if self.peak_equity <= 0:
+            return 0.0
+        return (self.peak_equity - equity) / self.peak_equity
+
+    def on_trade_closed(self, result_r: float, balance: float) -> None:
+        """Appelé à la clôture d'un trade."""
+        if result_r < 0:
+            self.daily.losses_closed += 1
+            if self.daily.losses_closed >= self.cfg.stop_after_n_losses:
+                self.daily.halted = True
+
+        # Re-check daily DD après clôture
+        self.daily.update_min_equity(balance)
+        if self.daily.daily_dd >= self.cfg.daily_kill_switch:
+            self.daily.halted = True
+
+    @property
+    def is_halted(self) -> bool:
+        """Trading arrêté pour la journée ?"""
+        return self.daily.halted
+
+    def get_stats(self) -> dict:
+        """Retourne les statistiques prop."""
+        return {
+            "n_violate_ftmo_bars": self.n_violate_ftmo_bars,
+            "n_violate_gft_bars": self.n_violate_gft_bars,
+            "n_violate_total_bars": self.n_violate_total_bars,
+        }
+
+
+
+./envolees/data/__init__.py
+────────────────────────────────────────────────────────────
+
+"""Data loading and preprocessing."""
+
+from envolees.data.aliases import get_canonical_name, resolve_ticker, TICKER_ALIASES
+from envolees.data.cache import (
+    cache_stats,
+    clear_cache,
+    get_cache_dir,
+    is_cache_valid,
+    load_from_cache,
+    save_to_cache,
+)
+from envolees.data.calendar import (
+    AssetClass,
+    GapAnalysis,
+    MarketHours,
+    StalenessCheck,
+    analyze_gaps,
+    check_staleness,
+    classify_ticker,
+    get_market_hours,
+    get_max_staleness_hours,
+    is_gap_expected,
+)
+from envolees.data.resample import resample_to_4h, resample_to_timeframe
+from envolees.data.yahoo import download_1h, download_1h_no_cache
+
+__all__ = [
+    "download_1h",
+    "download_1h_no_cache",
+    "resample_to_4h",
+    "resample_to_timeframe",
+    "resolve_ticker",
+    "get_canonical_name",
+    "TICKER_ALIASES",
+    "cache_stats",
+    "clear_cache",
+    "get_cache_dir",
+    "is_cache_valid",
+    "load_from_cache",
+    "save_to_cache",
+    "AssetClass",
+    "GapAnalysis",
+    "MarketHours",
+    "StalenessCheck",
+    "analyze_gaps",
+    "check_staleness",
+    "classify_ticker",
+    "get_market_hours",
+    "get_max_staleness_hours",
+    "is_gap_expected",
+]
+
+
+
+./envolees/data/aliases.py
+────────────────────────────────────────────────────────────
+
+"""
+Mapping d'alias pour les tickers Yahoo Finance.
+
+Permet d'utiliser des noms plus intuitifs et gère les fallbacks automatiques.
+"""
+
+from __future__ import annotations
+
+# Mapping alias → liste de tickers Yahoo à essayer (dans l'ordre)
+TICKER_ALIASES: dict[str, list[str]] = {
+    # Métaux précieux
+    "XAUUSD": ["XAUUSD=X", "GC=F"],
+    "GOLD": ["GC=F", "XAUUSD=X"],
+    "XAGUSD": ["XAGUSD=X", "SI=F"],
+    "SILVER": ["SI=F", "XAGUSD=X"],
+    
+    # Pétrole
+    "WTI": ["CL=F"],
+    "CRUDE": ["CL=F"],
+    "BRENT": ["BZ=F"],
+    "BCO": ["BZ=F"],
+    
+    # Forex (alias courts)
+    "EURUSD": ["EURUSD=X"],
+    "GBPUSD": ["GBPUSD=X"],
+    "USDJPY": ["USDJPY=X"],
+    "AUDUSD": ["AUDUSD=X"],
+    "USDCAD": ["USDCAD=X"],
+    "USDCHF": ["USDCHF=X"],
+    "NZDUSD": ["NZDUSD=X"],
+    "EURGBP": ["EURGBP=X"],
+    "EURJPY": ["EURJPY=X"],
+    "GBPJPY": ["GBPJPY=X"],
+    
+    # Crypto (alias courts)
+    "BTC": ["BTC-USD"],
+    "ETH": ["ETH-USD"],
+    "SOL": ["SOL-USD"],
+    "XRP": ["XRP-USD"],
+    "ADA": ["ADA-USD"],
+    
+    # Indices (alias lisibles)
+    "SP500": ["^GSPC"],
+    "SPX": ["^GSPC"],
+    "NASDAQ": ["^NDX"],
+    "NDX": ["^NDX"],
+    "DOW": ["^DJI"],
+    "DJI": ["^DJI"],
+    "DAX": ["^GDAXI"],
+    "FTSE": ["^FTSE"],
+    "NIKKEI": ["^N225"],
+    "N225": ["^N225"],
+    "JAP225": ["^N225"],
+    "CAC40": ["^FCHI"],
+}
+
+
+def resolve_ticker(ticker: str) -> list[str]:
+    """
+    Résout un ticker en liste de tickers Yahoo à essayer.
+    
+    Args:
+        ticker: Ticker ou alias (ex: "GOLD", "BTC", "EURUSD")
+    
+    Returns:
+        Liste de tickers Yahoo à essayer dans l'ordre
+    """
+    # Normaliser (majuscules, sans espaces)
+    normalized = ticker.strip().upper()
+    
+    # Si c'est un alias connu, retourner les alternatives
+    if normalized in TICKER_ALIASES:
+        return TICKER_ALIASES[normalized]
+    
+    # Sinon, essayer le ticker tel quel + quelques variantes
+    candidates = [ticker]
+    
+    # Si pas de suffixe, essayer avec =X (forex)
+    if "=" not in ticker and "-" not in ticker and "^" not in ticker:
+        candidates.append(f"{ticker}=X")
+    
+    return candidates
+
+
+def get_canonical_name(ticker: str) -> str:
+    """
+    Retourne un nom canonique pour le ticker (pour les fichiers de sortie).
+    
+    Args:
+        ticker: Ticker Yahoo (ex: "EURUSD=X", "^GSPC")
+    
+    Returns:
+        Nom nettoyé (ex: "EURUSD", "SP500")
+    """
+    # Mapping inverse pour les noms lisibles
+    CANONICAL_NAMES = {
+        "^GSPC": "SP500",
+        "^NDX": "NASDAQ",
+        "^DJI": "DOW",
+        "^GDAXI": "DAX",
+        "^FTSE": "FTSE",
+        "^N225": "NIKKEI",
+        "^FCHI": "CAC40",
+        "GC=F": "GOLD",
+        "SI=F": "SILVER",
+        "CL=F": "WTI",
+        "BZ=F": "BRENT",
+    }
+    
+    if ticker in CANONICAL_NAMES:
+        return CANONICAL_NAMES[ticker]
+    
+    # Nettoyer les suffixes
+    clean = ticker.replace("=X", "").replace("-USD", "").replace("=F", "")
+    return clean
+
+
+
+./envolees/data/cache.py
+────────────────────────────────────────────────────────────
+
+"""
+Cache local pour les données Yahoo Finance.
+
+Évite de retélécharger les données à chaque exécution.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pandas as pd
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+
+# Répertoire de cache par défaut
+DEFAULT_CACHE_DIR = Path.home() / ".cache" / "envolees"
+
+
+def get_cache_dir(cfg: Config | None = None) -> Path:
+    """Retourne le répertoire de cache."""
+    if cfg and hasattr(cfg, "cache_dir") and cfg.cache_dir:
+        cache_dir = Path(cfg.cache_dir)
+    else:
+        cache_dir = DEFAULT_CACHE_DIR
+    
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_cache_key(ticker: str, period: str, interval: str) -> str:
+    """Génère une clé de cache unique."""
+    key_str = f"{ticker}_{period}_{interval}"
+    return hashlib.md5(key_str.encode()).hexdigest()[:12]
+
+
+def get_cache_path(ticker: str, period: str, interval: str, cfg: Config | None = None) -> Path:
+    """Retourne le chemin du fichier cache."""
+    cache_dir = get_cache_dir(cfg)
+    key = get_cache_key(ticker, period, interval)
+    # Nom lisible + hash pour unicité
+    safe_ticker = ticker.replace("=", "_").replace("^", "_").replace("-", "_")
+    return cache_dir / f"{safe_ticker}_{key}.parquet"
+
+
+def get_metadata_path(cache_path: Path) -> Path:
+    """Retourne le chemin du fichier de métadonnées."""
+    return cache_path.with_suffix(".json")
+
+
+def is_cache_valid(cache_path: Path, max_age_hours: float = 24.0) -> bool:
+    """
+    Vérifie si le cache est valide.
+    
+    Args:
+        cache_path: Chemin du fichier cache
+        max_age_hours: Âge maximum en heures (défaut: 24h)
+    
+    Returns:
+        True si le cache existe et n'est pas expiré
+    """
+    if not cache_path.exists():
+        return False
+    
+    meta_path = get_metadata_path(cache_path)
+    if not meta_path.exists():
+        return False
+    
+    try:
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        
+        cached_at = datetime.fromisoformat(meta["cached_at"])
+        age = datetime.now() - cached_at
+        
+        return age < timedelta(hours=max_age_hours)
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return False
+
+
+def load_from_cache(cache_path: Path) -> pd.DataFrame | None:
+    """
+    Charge les données depuis le cache.
+    
+    Args:
+        cache_path: Chemin du fichier cache
+    
+    Returns:
+        DataFrame ou None si échec
+    """
+    try:
+        df = pd.read_parquet(cache_path)
+        return df
+    except Exception:
+        return None
+
+
+def save_to_cache(df: pd.DataFrame, cache_path: Path, ticker: str, period: str, interval: str) -> None:
+    """
+    Sauvegarde les données dans le cache.
+    
+    Args:
+        df: DataFrame à sauvegarder
+        cache_path: Chemin du fichier cache
+        ticker: Ticker original
+        period: Période demandée
+        interval: Intervalle demandé
+    """
+    try:
+        # Sauvegarder les données
+        df.to_parquet(cache_path)
+        
+        # Sauvegarder les métadonnées
+        meta = {
+            "ticker": ticker,
+            "period": period,
+            "interval": interval,
+            "cached_at": datetime.now().isoformat(),
+            "rows": len(df),
+            "date_range": {
+                "start": str(df.index.min()) if len(df) > 0 else None,
+                "end": str(df.index.max()) if len(df) > 0 else None,
+            },
+        }
+        
+        meta_path = get_metadata_path(cache_path)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+            
+    except Exception as e:
+        # Le cache est optionnel, on ne fait pas échouer l'exécution
+        print(f"[cache] Warning: impossible de sauvegarder le cache: {e}")
+
+
+def clear_cache(cfg: Config | None = None) -> int:
+    """
+    Vide le cache.
+    
+    Returns:
+        Nombre de fichiers supprimés
+    """
+    cache_dir = get_cache_dir(cfg)
+    count = 0
+    
+    for f in cache_dir.glob("*.parquet"):
+        f.unlink()
+        count += 1
+    
+    for f in cache_dir.glob("*.json"):
+        f.unlink()
+        count += 1
+    
+    return count
+
+
+def cache_stats(cfg: Config | None = None) -> dict:
+    """
+    Retourne des statistiques sur le cache.
+    
+    Returns:
+        Dict avec nb fichiers, taille totale, etc.
+    """
+    cache_dir = get_cache_dir(cfg)
+    
+    parquet_files = list(cache_dir.glob("*.parquet"))
+    total_size = sum(f.stat().st_size for f in parquet_files)
+    
+    tickers = []
+    for f in parquet_files:
+        meta_path = get_metadata_path(f)
+        if meta_path.exists():
+            try:
+                with open(meta_path, "r") as mf:
+                    meta = json.load(mf)
+                    tickers.append(meta.get("ticker", "?"))
+            except Exception:
+                pass
+    
+    return {
+        "cache_dir": str(cache_dir),
+        "n_files": len(parquet_files),
+        "total_size_mb": round(total_size / (1024 * 1024), 2),
+        "tickers": tickers,
+    }
+
+
+
+./envolees/data/resample.py
+────────────────────────────────────────────────────────────
+
+"""
+Resampling des données OHLCV.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+
+def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resample des données 1H vers 4H.
+
+    Args:
+        df_1h: DataFrame OHLCV en 1H
+
+    Returns:
+        DataFrame OHLCV en 4H
+    """
+    ohlcv = pd.DataFrame({
+        "Open": df_1h["Open"].resample("4h").first(),
+        "High": df_1h["High"].resample("4h").max(),
+        "Low": df_1h["Low"].resample("4h").min(),
+        "Close": df_1h["Close"].resample("4h").last(),
+        "Volume": df_1h["Volume"].resample("4h").sum(),
+    })
+    return ohlcv.dropna()
+
+
+def resample_to_timeframe(df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    """
+    Resample générique vers un timeframe donné.
+
+    Args:
+        df: DataFrame OHLCV source
+        timeframe: Timeframe cible (ex: "4h", "1d", "1w")
+
+    Returns:
+        DataFrame OHLCV resampleé
+    """
+    ohlcv = pd.DataFrame({
+        "Open": df["Open"].resample(timeframe).first(),
+        "High": df["High"].resample(timeframe).max(),
+        "Low": df["Low"].resample(timeframe).min(),
+        "Close": df["Close"].resample(timeframe).last(),
+        "Volume": df["Volume"].resample(timeframe).sum(),
+    })
+    return ohlcv.dropna()
+
+
+
+./envolees/data/yahoo.py
+────────────────────────────────────────────────────────────
+
+"""
+Téléchargement des données depuis Yahoo Finance avec cache et alias.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+import yfinance as yf
+from zoneinfo import ZoneInfo
+
+from envolees.config import Config
+from envolees.data.aliases import resolve_ticker
+from envolees.data.cache import (
+    get_cache_path,
+    is_cache_valid,
+    load_from_cache,
+    save_to_cache,
+)
+
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def _download_raw(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    """Télécharge les données brutes depuis Yahoo Finance."""
+    df = yf.download(
+        ticker,
+        period=period,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+    )
+
+    if df.empty:
+        raise RuntimeError(f"Yahoo Finance: aucune donnée pour {ticker}")
+
+    # Gestion MultiIndex (yfinance peut retourner des colonnes multi-niveau)
+    if isinstance(df.columns, pd.MultiIndex):
+        if len(df.columns.get_level_values(-1).unique()) == 1:
+            df.columns = df.columns.get_level_values(0)
+        else:
+            df = df.xs(ticker, axis=1, level=-1)
+
+    return df
+
+
+def _normalize_df(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """Normalise le DataFrame (timezone, colonnes)."""
+    # Timezone
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df = df.tz_convert(PARIS)
+
+    # Validation colonnes
+    required = {"Open", "High", "Low", "Close", "Volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise RuntimeError(f"Colonnes manquantes pour {ticker}: {sorted(missing)}")
+
+    return df[["Open", "High", "Low", "Close", "Volume"]]
+
+
+def download_1h(
+    ticker: str,
+    cfg: Config,
+    use_cache: bool = True,
+    cache_max_age_hours: float = 24.0,
+    verbose: bool = False,
+) -> pd.DataFrame:
+    """
+    Télécharge les données 1H depuis Yahoo Finance.
+
+    Utilise le cache local si disponible et gère les alias de tickers.
+
+    Args:
+        ticker: Symbole ou alias (ex: "EURUSD", "GOLD", "BTC")
+        cfg: Configuration du backtest
+        use_cache: Utiliser le cache local (défaut: True)
+        cache_max_age_hours: Durée de validité du cache en heures (défaut: 24)
+        verbose: Afficher les messages de debug
+
+    Returns:
+        DataFrame avec colonnes OHLCV, index tz-aware (Europe/Paris)
+
+    Raises:
+        RuntimeError: Si aucune donnée disponible pour aucun alias
+    """
+    # Résoudre les alias
+    candidates = resolve_ticker(ticker)
+    
+    last_error = None
+    
+    for candidate in candidates:
+        cache_path = get_cache_path(candidate, cfg.yf_period, cfg.yf_interval, cfg)
+        
+        # Essayer le cache d'abord
+        if use_cache and is_cache_valid(cache_path, cache_max_age_hours):
+            df = load_from_cache(cache_path)
+            if df is not None:
+                if verbose:
+                    print(f"[cache] {ticker} → {candidate} (depuis cache)")
+                return _normalize_df(df, candidate)
+        
+        # Télécharger depuis Yahoo
+        try:
+            if verbose:
+                print(f"[yahoo] {ticker} → {candidate} (téléchargement...)")
+            
+            df = _download_raw(candidate, cfg.yf_period, cfg.yf_interval)
+            
+            # Sauvegarder dans le cache
+            if use_cache:
+                save_to_cache(df, cache_path, candidate, cfg.yf_period, cfg.yf_interval)
+            
+            return _normalize_df(df, candidate)
+            
+        except Exception as e:
+            last_error = e
+            if verbose:
+                print(f"[yahoo] {candidate} échoué: {e}")
+            continue
+    
+    # Aucun candidat n'a fonctionné
+    tried = ", ".join(candidates)
+    raise RuntimeError(f"Yahoo Finance: aucune donnée pour {ticker} (essayé: {tried}). Dernière erreur: {last_error}")
+
+
+def download_1h_no_cache(ticker: str, cfg: Config) -> pd.DataFrame:
+    """
+    Télécharge les données 1H sans utiliser le cache.
+    
+    Utile pour forcer le rafraîchissement des données.
+    """
+    return download_1h(ticker, cfg, use_cache=False)
+
+
+
+./envolees/data/calendar.py
+────────────────────────────────────────────────────────────
+
+"""
+Calendrier des heures de marché par classe d'actifs.
+
+Utilisé pour distinguer les gaps normaux (fermeture marché) des vrais problèmes.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, time, timedelta
+from enum import Enum
+from typing import Callable, TYPE_CHECKING
+from zoneinfo import ZoneInfo
+
+if TYPE_CHECKING:
+    import pandas as pd
+
+
+class AssetClass(Enum):
+    """Classes d'actifs avec leurs règles de trading."""
+    
+    FX = "fx"
+    CRYPTO = "crypto"
+    INDEX_US = "index_us"
+    INDEX_EU = "index_eu"
+    INDEX_ASIA = "index_asia"
+    COMMODITY = "commodity"
+    UNKNOWN = "unknown"
+
+
+# Timezones de référence
+UTC = ZoneInfo("UTC")
+NEW_YORK = ZoneInfo("America/New_York")
+PARIS = ZoneInfo("Europe/Paris")
+TOKYO = ZoneInfo("Asia/Tokyo")
+
+
+@dataclass
+class MarketHours:
+    """Heures de marché pour une classe d'actifs."""
+    
+    asset_class: AssetClass
+    
+    # Heures d'ouverture/fermeture (heure locale du marché)
+    open_time: time | None = None
+    close_time: time | None = None
+    timezone: ZoneInfo = UTC
+    
+    # Jours de fermeture (0=lundi, 6=dimanche)
+    closed_days: tuple[int, ...] = ()
+    
+    # Tolérance pour les gaps (en heures)
+    max_expected_gap_hours: float = 6.0
+    
+    # 24/7 ?
+    is_24_7: bool = False
+
+
+# Configuration par classe d'actifs
+MARKET_HOURS: dict[AssetClass, MarketHours] = {
+    AssetClass.FX: MarketHours(
+        asset_class=AssetClass.FX,
+        # FX : 24h du dimanche 22h UTC au vendredi 22h UTC
+        # Fermé samedi et dimanche (sauf ouverture dimanche soir)
+        closed_days=(5, 6),  # Samedi, Dimanche (partiellement)
+        max_expected_gap_hours=60,  # Week-end = ~48h + marge
+        timezone=UTC,
+    ),
+    AssetClass.CRYPTO: MarketHours(
+        asset_class=AssetClass.CRYPTO,
+        is_24_7=True,
+        max_expected_gap_hours=4,  # Crypto devrait être quasi-continu
+        timezone=UTC,
+    ),
+    AssetClass.INDEX_US: MarketHours(
+        asset_class=AssetClass.INDEX_US,
+        open_time=time(9, 30),
+        close_time=time(16, 0),
+        timezone=NEW_YORK,
+        closed_days=(5, 6),
+        max_expected_gap_hours=18,  # Nuit + possible jour férié
+    ),
+    AssetClass.INDEX_EU: MarketHours(
+        asset_class=AssetClass.INDEX_EU,
+        open_time=time(9, 0),
+        close_time=time(17, 30),
+        timezone=PARIS,
+        closed_days=(5, 6),
+        max_expected_gap_hours=18,
+    ),
+    AssetClass.INDEX_ASIA: MarketHours(
+        asset_class=AssetClass.INDEX_ASIA,
+        open_time=time(9, 0),
+        close_time=time(15, 0),
+        timezone=TOKYO,
+        closed_days=(5, 6),
+        max_expected_gap_hours=20,
+    ),
+    AssetClass.COMMODITY: MarketHours(
+        asset_class=AssetClass.COMMODITY,
+        # Futures : sessions avec pauses
+        closed_days=(5, 6),
+        max_expected_gap_hours=60,  # Week-end + sessions
+        timezone=NEW_YORK,
+    ),
+    AssetClass.UNKNOWN: MarketHours(
+        asset_class=AssetClass.UNKNOWN,
+        max_expected_gap_hours=72,  # Tolérant par défaut
+    ),
+}
+
+
+def classify_ticker(ticker: str) -> AssetClass:
+    """
+    Détermine la classe d'actifs d'un ticker.
+    
+    Args:
+        ticker: Symbole Yahoo Finance
+    
+    Returns:
+        AssetClass correspondante
+    """
+    ticker_upper = ticker.upper()
+    
+    # Crypto
+    if "-USD" in ticker_upper or "-EUR" in ticker_upper:
+        if any(c in ticker_upper for c in ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC"]):
+            return AssetClass.CRYPTO
+    
+    # FX (forex)
+    if "=X" in ticker_upper:
+        return AssetClass.FX
+    
+    # Indices US
+    if ticker_upper in ("^GSPC", "^NDX", "^DJI", "^VIX", "^RUT"):
+        return AssetClass.INDEX_US
+    
+    # Indices EU
+    if ticker_upper in ("^GDAXI", "^FTSE", "^FCHI", "^STOXX50E", "^AEX"):
+        return AssetClass.INDEX_EU
+    
+    # Indices Asie
+    if ticker_upper in ("^N225", "^HSI", "^SSEC", "^KS11", "^TWII"):
+        return AssetClass.INDEX_ASIA
+    
+    # Commodities (futures)
+    if "=F" in ticker_upper:
+        return AssetClass.COMMODITY
+    
+    # Par défaut : inconnu (tolérant)
+    return AssetClass.UNKNOWN
+
+
+def get_market_hours(ticker: str) -> MarketHours:
+    """Retourne les heures de marché pour un ticker."""
+    asset_class = classify_ticker(ticker)
+    return MARKET_HOURS.get(asset_class, MARKET_HOURS[AssetClass.UNKNOWN])
+
+
+def is_gap_expected(
+    ticker: str,
+    gap_start: datetime,
+    gap_end: datetime,
+    gap_hours: float,
+) -> tuple[bool, str]:
+    """
+    Détermine si un gap est attendu (normal) ou anormal.
+    
+    Args:
+        ticker: Symbole
+        gap_start: Début du gap
+        gap_end: Fin du gap
+        gap_hours: Durée du gap en heures
+    
+    Returns:
+        Tuple (is_expected, reason)
+    """
+    market = get_market_hours(ticker)
+    
+    # Crypto 24/7 : tout gap > seuil est suspect
+    if market.is_24_7:
+        if gap_hours > market.max_expected_gap_hours:
+            return False, f"crypto gap {gap_hours:.0f}h > {market.max_expected_gap_hours}h"
+        return True, "crypto normal"
+    
+    # Vérifier si le gap chevauche un jour de fermeture
+    current = gap_start
+    while current < gap_end:
+        if current.weekday() in market.closed_days:
+            return True, "market closed (weekend/holiday)"
+        current += timedelta(hours=1)
+    
+    # Gap pendant les heures de marché ?
+    if market.open_time and market.close_time:
+        gap_start_local = gap_start.astimezone(market.timezone)
+        
+        # Si le gap commence après la fermeture, c'est normal
+        if gap_start_local.time() >= market.close_time:
+            return True, "after market close"
+        
+        # Si le gap se termine avant l'ouverture, c'est normal
+        if gap_start_local.time() < market.open_time:
+            return True, "before market open"
+    
+    # Gap trop long dans tous les cas ?
+    if gap_hours > market.max_expected_gap_hours:
+        return False, f"gap {gap_hours:.0f}h > max {market.max_expected_gap_hours}h"
+    
+    return True, "within expected range"
+
+
+def get_max_staleness_hours(ticker: str) -> float:
+    """
+    Retourne l'âge maximum acceptable pour la dernière bougie.
+    
+    Args:
+        ticker: Symbole
+    
+    Returns:
+        Heures maximum avant alerte "stale"
+    """
+    market = get_market_hours(ticker)
+    
+    if market.is_24_7:
+        return 4  # Crypto : 4h max
+    
+    # Autres : dépend du marché
+    # Week-end : jusqu'à 72h
+    # Jour normal : 24h
+    return 72 if datetime.now().weekday() in (5, 6) else 24
+
+
+@dataclass
+class GapAnalysis:
+    """Résultat de l'analyse des gaps."""
+    
+    ticker: str
+    total_gaps: int
+    expected_gaps: int
+    unexpected_gaps: int
+    max_gap_hours: float
+    issues: list[str]
+    
+    @property
+    def has_issues(self) -> bool:
+        return self.unexpected_gaps > 0
+
+
+@dataclass
+class StalenessCheck:
+    """Résultat de la vérification de fraîcheur."""
+    
+    ticker: str
+    last_bar: datetime | None
+    age_hours: float  # Âge brut (pour affichage)
+    max_age_hours: float
+    is_stale: bool
+    trading_hours_missed: float = 0.0  # Heures de trading réellement manquées
+    
+    @property
+    def status(self) -> str:
+        if self.is_stale:
+            if self.trading_hours_missed > 0:
+                return f"stale ({self.trading_hours_missed:.0f}h trading manquées)"
+            return f"stale ({self.age_hours:.0f}h ago)"
+        return f"fresh ({self.age_hours:.1f}h ago, {self.trading_hours_missed:.0f}h trading)"
+
+
+def analyze_gaps(
+    df: "pd.DataFrame",
+    ticker: str,
+    expected_interval_hours: float = 1.0,
+) -> GapAnalysis:
+    """
+    Analyse les gaps dans les données en tenant compte du calendrier.
+    
+    Args:
+        df: DataFrame avec index DatetimeIndex
+        ticker: Symbole pour le calendrier
+        expected_interval_hours: Intervalle attendu entre les barres
+    
+    Returns:
+        GapAnalysis avec les détails
+    """
+    import pandas as pd
+    
+    if df is None or len(df) < 2:
+        return GapAnalysis(
+            ticker=ticker,
+            total_gaps=0,
+            expected_gaps=0,
+            unexpected_gaps=0,
+            max_gap_hours=0,
+            issues=[],
+        )
+    
+    # Calculer les gaps
+    df = df.sort_index()
+    gaps = df.index.to_series().diff().dropna()
+    expected_td = pd.Timedelta(hours=expected_interval_hours)
+    
+    # Gaps > intervalle attendu
+    significant_gaps = gaps[gaps > expected_td * 1.5]
+    
+    total_gaps = len(significant_gaps)
+    expected_count = 0
+    unexpected_count = 0
+    max_gap_hours = 0.0
+    issues = []
+    
+    for i, (idx, gap) in enumerate(significant_gaps.items()):
+        gap_hours = gap.total_seconds() / 3600
+        max_gap_hours = max(max_gap_hours, gap_hours)
+        
+        # Trouver le début du gap
+        gap_start = df.index[df.index.get_loc(idx) - 1]
+        gap_end = idx
+        
+        is_expected, reason = is_gap_expected(ticker, gap_start, gap_end, gap_hours)
+        
+        if is_expected:
+            expected_count += 1
+        else:
+            unexpected_count += 1
+            issues.append(f"{gap_start.strftime('%Y-%m-%d %H:%M')} - {gap_hours:.0f}h - {reason}")
+    
+    return GapAnalysis(
+        ticker=ticker,
+        total_gaps=total_gaps,
+        expected_gaps=expected_count,
+        unexpected_gaps=unexpected_count,
+        max_gap_hours=max_gap_hours,
+        issues=issues[:5],  # Limiter à 5 issues
+    )
+
+
+def check_staleness(df: "pd.DataFrame", ticker: str) -> StalenessCheck:
+    """
+    Vérifie la fraîcheur des données de manière calendar-aware.
+    
+    Pour FX le week-end, on ne considère pas les données comme stale
+    car le marché est fermé. On calcule plutôt le retard par rapport
+    à la dernière bougie attendue.
+    
+    Args:
+        df: DataFrame avec index DatetimeIndex
+        ticker: Symbole pour le calendrier
+    
+    Returns:
+        StalenessCheck avec les détails
+    """
+    if df is None or len(df) == 0:
+        return StalenessCheck(
+            ticker=ticker,
+            last_bar=None,
+            age_hours=float("inf"),
+            max_age_hours=24,
+            is_stale=True,
+        )
+    
+    last_bar = df.index.max()
+    market = get_market_hours(ticker)
+    
+    # Calculer l'âge brut
+    now = datetime.now(last_bar.tzinfo) if last_bar.tzinfo else datetime.now()
+    raw_age = now - last_bar
+    raw_age_hours = raw_age.total_seconds() / 3600
+    
+    # Crypto : simple, le marché est 24/7
+    if market.is_24_7:
+        max_age = 4  # 4h max pour crypto
+        return StalenessCheck(
+            ticker=ticker,
+            last_bar=last_bar,
+            age_hours=raw_age_hours,
+            max_age_hours=max_age,
+            is_stale=raw_age_hours > max_age,
+        )
+    
+    # Pour les autres marchés : calculer les heures de marché ouvert manquées
+    # au lieu de l'âge brut
+    trading_hours_missed = _calculate_trading_hours_missed(last_bar, now, market)
+    
+    # Seuils selon la classe d'actif
+    if market.asset_class == AssetClass.FX:
+        max_age = 6  # FX : 6h de trading manquées max
+    elif market.asset_class == AssetClass.COMMODITY:
+        max_age = 8  # Commodities : un peu plus tolérant
+    else:
+        max_age = 12  # Indices : 12h
+    
+    return StalenessCheck(
+        ticker=ticker,
+        last_bar=last_bar,
+        age_hours=raw_age_hours,  # On garde l'âge brut pour l'affichage
+        max_age_hours=max_age,
+        is_stale=trading_hours_missed > max_age,
+        trading_hours_missed=trading_hours_missed,
+    )
+
+
+def _calculate_trading_hours_missed(
+    last_bar: datetime,
+    now: datetime,
+    market: MarketHours,
+) -> float:
+    """
+    Calcule le nombre d'heures de trading manquées entre last_bar et now.
+    
+    Pour FX le week-end, retourne 0 (pas d'heures de trading manquées).
+    
+    Returns:
+        Heures de trading manquées
+    """
+    # Si le delta est petit, pas besoin de calcul complexe
+    delta_hours = (now - last_bar).total_seconds() / 3600
+    if delta_hours < 2:
+        return delta_hours
+    
+    # FX : fermé du vendredi 22h UTC au dimanche 22h UTC
+    if market.asset_class == AssetClass.FX:
+        # Jours fermés = samedi et dimanche (partiellement)
+        # On compte les heures de trading entre last_bar et now
+        
+        trading_hours = 0.0
+        current = last_bar
+        
+        # Simplification : on compte heure par heure
+        while current < now:
+            weekday = current.weekday()
+            hour = current.hour
+            
+            # FX ouvert : dimanche 22h → vendredi 22h (UTC)
+            # Fermé : vendredi 22h → dimanche 22h
+            is_open = True
+            
+            if weekday == 5:  # Samedi
+                is_open = False
+            elif weekday == 6:  # Dimanche
+                is_open = hour >= 22  # Ouvert à partir de 22h
+            elif weekday == 4:  # Vendredi
+                is_open = hour < 22  # Fermé à partir de 22h
+            
+            if is_open:
+                trading_hours += 1.0
+            
+            current += timedelta(hours=1)
+        
+        return trading_hours
+    
+    # Commodities : fermeture quotidienne + week-end
+    if market.asset_class == AssetClass.COMMODITY:
+        trading_hours = 0.0
+        current = last_bar
+        
+        while current < now:
+            weekday = current.weekday()
+            hour = current.hour
+            
+            # GC=F (Gold) : ~23h/jour, fermé samedi + dimanche matin
+            is_open = True
+            
+            if weekday == 5:  # Samedi
+                is_open = False
+            elif weekday == 6:  # Dimanche
+                is_open = hour >= 18  # Ouverture vers 18h UTC
+            
+            if is_open:
+                trading_hours += 1.0
+            
+            current += timedelta(hours=1)
+        
+        return trading_hours
+    
+    # Pour les indices : approximation simple
+    # On retire les week-ends et compte 8h/jour
+    full_days = int(delta_hours / 24)
+    weekend_days = sum(
+        1 for i in range(full_days)
+        if (last_bar + timedelta(days=i)).weekday() >= 5
+    )
+    trading_days = full_days - weekend_days
+    return trading_days * 8 + (delta_hours % 24) * (8/24)
+
+
+
+./envolees/indicators/__init__.py
+────────────────────────────────────────────────────────────
+
+"""Technical indicators."""
+
+from envolees.indicators.atr import compute_atr, compute_atr_relative
+from envolees.indicators.donchian import compute_donchian, compute_donchian_mid
+from envolees.indicators.ema import compute_ema, compute_sma
+
+__all__ = [
+    "compute_atr",
+    "compute_atr_relative",
+    "compute_donchian",
+    "compute_donchian_mid",
+    "compute_ema",
+    "compute_sma",
+]
+
+
+
+./envolees/indicators/atr.py
+────────────────────────────────────────────────────────────
+
+"""
+Average True Range (ATR) indicator.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Calcule l'Average True Range (ATR).
+
+    Args:
+        df: DataFrame avec colonnes High, Low, Close
+        period: Période de lissage (défaut: 14)
+
+    Returns:
+        Series ATR
+    """
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    prev_close = close.shift(1)
+
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    return tr.rolling(period, min_periods=period).mean()
+
+
+def compute_atr_relative(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """
+    Calcule l'ATR relatif (ATR / Close).
+
+    Args:
+        df: DataFrame avec colonnes High, Low, Close
+        period: Période de lissage (défaut: 14)
+
+    Returns:
+        Series ATR relatif (en pourcentage du prix)
+    """
+    atr = compute_atr(df, period)
+    return atr / df["Close"]
+
+
+
+./envolees/indicators/donchian.py
+────────────────────────────────────────────────────────────
+
+"""
+Donchian Channel indicator.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+
+def compute_donchian(df: pd.DataFrame, period: int = 20, shift: int = 1) -> tuple[pd.Series, pd.Series]:
+    """
+    Calcule le canal de Donchian.
+
+    Args:
+        df: DataFrame avec colonnes High, Low
+        period: Période du canal (défaut: 20)
+        shift: Décalage pour éviter le look-ahead bias (défaut: 1)
+
+    Returns:
+        Tuple (donchian_high, donchian_low)
+    """
+    d_high = df["High"].rolling(period, min_periods=period).max().shift(shift)
+    d_low = df["Low"].rolling(period, min_periods=period).min().shift(shift)
+    return d_high, d_low
+
+
+def compute_donchian_mid(df: pd.DataFrame, period: int = 20, shift: int = 1) -> pd.Series:
+    """
+    Calcule la ligne médiane du canal de Donchian.
+
+    Args:
+        df: DataFrame avec colonnes High, Low
+        period: Période du canal (défaut: 20)
+        shift: Décalage (défaut: 1)
+
+    Returns:
+        Series médiane Donchian
+    """
+    d_high, d_low = compute_donchian(df, period, shift)
+    return (d_high + d_low) / 2
+
+
+
+./envolees/indicators/ema.py
+────────────────────────────────────────────────────────────
+
+"""
+Exponential Moving Average (EMA) indicator.
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+
+
+def compute_ema(series: pd.Series, period: int = 200) -> pd.Series:
+    """
+    Calcule l'Exponential Moving Average (EMA).
+
+    Args:
+        series: Série de prix (typiquement Close)
+        period: Période de l'EMA (défaut: 200)
+
+    Returns:
+        Series EMA
+    """
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def compute_sma(series: pd.Series, period: int = 200) -> pd.Series:
+    """
+    Calcule la Simple Moving Average (SMA).
+
+    Args:
+        series: Série de prix
+        period: Période de la SMA (défaut: 200)
+
+    Returns:
+        Series SMA
+    """
+    return series.rolling(period, min_periods=period).mean()
+
+
+
+./envolees/output/export.py
+────────────────────────────────────────────────────────────
+
+"""
+Export des résultats de backtest.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pandas as pd
+
+if TYPE_CHECKING:
+    from envolees.backtest.engine import BacktestResult
+
+
+def sanitize_path(s: str, max_len: int = 120) -> str:
+    """Nettoie une chaîne pour l'utiliser dans un chemin de fichier."""
+    clean = re.sub(r"[^A-Za-z0-9._=-]+", "_", s.strip())
+    return clean[:max_len] if len(clean) > max_len else clean
+
+
+def export_result(result: BacktestResult, base_dir: str = "out") -> Path:
+    """
+    Exporte un résultat de backtest.
+
+    Crée :
+    - trades.csv
+    - equity_curve.csv
+    - daily_stats.csv
+    - summary.json
+
+    Args:
+        result: Résultat du backtest
+        base_dir: Répertoire de sortie racine
+
+    Returns:
+        Chemin du dossier créé
+    """
+    # Chemin : out/<ticker>/PEN_<penalty>/
+    ticker_dir = sanitize_path(result.ticker)
+    pen_dir = f"PEN_{result.exec_penalty_atr:.2f}"
+    out_path = Path(base_dir) / ticker_dir / pen_dir
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # Trades
+    trades_df = result.trades_df()
+    if not trades_df.empty:
+        trades_df.to_csv(out_path / "trades.csv", index=False)
+
+    # Equity curve
+    equity_df = result.equity_df()
+    if not equity_df.empty:
+        equity_df.to_csv(out_path / "equity_curve.csv")
+
+    # Daily stats
+    daily_df = result.daily_df()
+    if not daily_df.empty:
+        daily_df.to_csv(out_path / "daily_stats.csv", index=False)
+
+    # Summary JSON
+    with open(out_path / "summary.json", "w", encoding="utf-8") as f:
+        json.dump(result.summary, f, ensure_ascii=False, indent=2, default=str)
+
+    return out_path
+
+
+def export_batch_summary(
+    results: list[BacktestResult],
+    base_dir: str = "out",
+) -> pd.DataFrame:
+    """
+    Exporte un résumé de tous les backtests.
+
+    Args:
+        results: Liste des résultats
+        base_dir: Répertoire de sortie
+
+    Returns:
+        DataFrame avec une ligne par backtest
+    """
+    rows = []
+    for r in results:
+        s = r.summary
+        rows.append({
+            "ticker": s["ticker"],
+            "penalty_atr": s["exec_penalty_atr"],
+            "bars_4h": s["bars_4h"],
+            "n_trades": s["n_trades"],
+            "win_rate": s["win_rate"],
+            "profit_factor": s["profit_factor"],
+            "expectancy_r": s["expectancy_r"],
+            "end_balance": s["end_balance"],
+            "max_daily_dd_pct": s["prop"]["max_daily_dd_pct"],
+            "p99_daily_dd_pct": s["prop"]["p99_daily_dd_pct"],
+            "viol_ftmo_bars": s["prop"]["n_daily_violate_ftmo_bars"],
+            "viol_gft_bars": s["prop"]["n_daily_violate_gft_bars"],
+            "viol_total_bars": s["prop"]["n_total_violate_bars"],
+            "status": "ok",
+            "error": "",
+        })
+
+    df = pd.DataFrame(rows)
+    out_path = Path(base_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_path / "results.csv", index=False)
+
+    return df
+
+
+def format_summary_line(result: BacktestResult) -> str:
+    """Formate une ligne de résumé pour affichage console."""
+    s = result.summary
+    return (
+        f"{s['ticker']:>12} │ PEN {s['exec_penalty_atr']:.2f} │ "
+        f"trades {s['n_trades']:>4} │ WR {s['win_rate']:.3f} │ "
+        f"PF {s['profit_factor']:.3f} │ ExpR {s['expectancy_r']:+.3f} │ "
+        f"DDmax {s['prop']['max_daily_dd_pct']*100:.2f}%"
+    )
+
+
+
+./envolees/output/scoring.py
+────────────────────────────────────────────────────────────
+
+"""
+Basket scoring et génération de shortlist.
+
+Calcule un score agrégé par ticker et génère une shortlist des meilleurs candidats.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+
+
+@dataclass
+class ScoringConfig:
+    """Configuration du scoring."""
+    
+    # Poids des métriques dans le score final
+    weight_expectancy: float = 0.35
+    weight_pf: float = 0.25
+    weight_stability: float = 0.20
+    weight_dd: float = 0.20
+    
+    # Seuils pour la shortlist
+    min_expectancy: float = 0.10  # ExpR minimum à la pénalité de référence
+    min_pf: float = 1.2
+    max_dd: float = 0.045  # 4.5%
+    min_trades: int = 30
+    
+    # Pénalité de référence pour la shortlist
+    reference_penalty: float = 0.25
+    
+    # Normalisation
+    expectancy_cap: float = 0.50  # Plafonner pour éviter les outliers
+    pf_cap: float = 3.0
+    dd_floor: float = 0.01  # Minimum DD pour éviter division par 0
+
+
+def compute_ticker_score(
+    df: pd.DataFrame,
+    ticker: str,
+    scoring_cfg: ScoringConfig | None = None,
+) -> dict:
+    """
+    Calcule un score agrégé pour un ticker sur toutes les pénalités.
+    
+    Le score combine :
+    - Expectancy moyenne (pondérée vers les hautes pénalités)
+    - Profit Factor moyen
+    - Stabilité (faible variance de l'expectancy selon la pénalité)
+    - Inverse du DDmax
+    
+    Args:
+        df: DataFrame results.csv filtré pour ce ticker
+        ticker: Nom du ticker
+        scoring_cfg: Configuration du scoring
+    
+    Returns:
+        Dict avec scores détaillés et score final
+    """
+    if scoring_cfg is None:
+        scoring_cfg = ScoringConfig()
+    
+    if df.empty:
+        return {
+            "ticker": ticker,
+            "score": 0.0,
+            "expectancy_score": 0.0,
+            "pf_score": 0.0,
+            "stability_score": 0.0,
+            "dd_score": 0.0,
+            "avg_expectancy": 0.0,
+            "avg_pf": 0.0,
+            "max_dd": 0.0,
+            "total_trades": 0,
+            "penalties_tested": 0,
+        }
+    
+    # Métriques de base
+    avg_exp = df["expectancy_r"].mean()
+    avg_pf = df["profit_factor"].mean()
+    max_dd = df["max_daily_dd_pct"].max()
+    total_trades = int(df["n_trades"].sum())
+    
+    # Score Expectancy (0-1, normalisé)
+    exp_capped = min(avg_exp, scoring_cfg.expectancy_cap)
+    expectancy_score = max(0, exp_capped / scoring_cfg.expectancy_cap)
+    
+    # Score PF (0-1, normalisé)
+    pf_capped = min(avg_pf, scoring_cfg.pf_cap)
+    pf_score = max(0, (pf_capped - 1) / (scoring_cfg.pf_cap - 1)) if pf_capped > 1 else 0
+    
+    # Score Stabilité (variance de l'expectancy selon pénalité)
+    # Plus c'est stable, mieux c'est
+    exp_std = df["expectancy_r"].std()
+    if pd.isna(exp_std) or avg_exp <= 0:
+        stability_score = 0.0
+    else:
+        # Coefficient de variation inversé
+        cv = exp_std / max(abs(avg_exp), 0.01)
+        stability_score = max(0, 1 - min(cv, 1))
+    
+    # Score DD (inverse, plafonné)
+    dd_safe = max(max_dd, scoring_cfg.dd_floor)
+    # 1% DD = score 1.0, 5% DD = score ~0.2
+    dd_score = min(1.0, scoring_cfg.dd_floor / dd_safe)
+    
+    # Score final pondéré
+    final_score = (
+        scoring_cfg.weight_expectancy * expectancy_score +
+        scoring_cfg.weight_pf * pf_score +
+        scoring_cfg.weight_stability * stability_score +
+        scoring_cfg.weight_dd * dd_score
+    )
+    
+    return {
+        "ticker": ticker,
+        "score": round(final_score, 4),
+        "expectancy_score": round(expectancy_score, 4),
+        "pf_score": round(pf_score, 4),
+        "stability_score": round(stability_score, 4),
+        "dd_score": round(dd_score, 4),
+        "avg_expectancy": round(avg_exp, 4),
+        "avg_pf": round(avg_pf, 4),
+        "max_dd": round(max_dd, 4),
+        "total_trades": total_trades,
+        "penalties_tested": len(df),
+    }
+
+
+def compute_all_scores(
+    results_df: pd.DataFrame,
+    scoring_cfg: ScoringConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Calcule les scores pour tous les tickers.
+    
+    Args:
+        results_df: DataFrame complet de results.csv
+        scoring_cfg: Configuration du scoring
+    
+    Returns:
+        DataFrame avec un score par ticker, trié par score décroissant
+    """
+    if scoring_cfg is None:
+        scoring_cfg = ScoringConfig()
+    
+    # Filtrer les erreurs
+    df = results_df[results_df["status"] == "ok"].copy()
+    
+    scores = []
+    for ticker in df["ticker"].unique():
+        ticker_df = df[df["ticker"] == ticker]
+        score = compute_ticker_score(ticker_df, ticker, scoring_cfg)
+        scores.append(score)
+    
+    scores_df = pd.DataFrame(scores)
+    
+    if not scores_df.empty:
+        scores_df = scores_df.sort_values("score", ascending=False).reset_index(drop=True)
+    
+    return scores_df
+
+
+def generate_shortlist(
+    results_df: pd.DataFrame,
+    scoring_cfg: ScoringConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Génère une shortlist des meilleurs candidats pour production.
+    
+    Critères :
+    - Expectancy > seuil à la pénalité de référence
+    - PF > seuil
+    - DDmax < seuil
+    - Nombre de trades minimum
+    
+    Args:
+        results_df: DataFrame complet de results.csv
+        scoring_cfg: Configuration du scoring
+    
+    Returns:
+        DataFrame shortlist avec les candidats prod
+    """
+    if scoring_cfg is None:
+        scoring_cfg = ScoringConfig()
+    
+    # Filtrer les erreurs
+    df = results_df[results_df["status"] == "ok"].copy()
+    
+    # Filtrer à la pénalité de référence
+    ref_pen = scoring_cfg.reference_penalty
+    df_ref = df[df["penalty_atr"] == ref_pen].copy()
+    
+    if df_ref.empty:
+        # Fallback : prendre la pénalité la plus élevée disponible
+        max_pen = df["penalty_atr"].max()
+        df_ref = df[df["penalty_atr"] == max_pen].copy()
+    
+    # Appliquer les filtres
+    shortlist = df_ref[
+        (df_ref["expectancy_r"] >= scoring_cfg.min_expectancy) &
+        (df_ref["profit_factor"] >= scoring_cfg.min_pf) &
+        (df_ref["max_daily_dd_pct"] <= scoring_cfg.max_dd) &
+        (df_ref["n_trades"] >= scoring_cfg.min_trades)
+    ].copy()
+    
+    # Ajouter le score
+    scores_df = compute_all_scores(results_df, scoring_cfg)
+    if not scores_df.empty:
+        score_map = dict(zip(scores_df["ticker"], scores_df["score"]))
+        shortlist["score"] = shortlist["ticker"].map(score_map)
+        shortlist = shortlist.sort_values("score", ascending=False)
+    
+    # Colonnes à garder
+    cols = [
+        "ticker", "score", "expectancy_r", "profit_factor", "win_rate",
+        "max_daily_dd_pct", "n_trades", "penalty_atr",
+    ]
+    
+    return shortlist[[c for c in cols if c in shortlist.columns]].reset_index(drop=True)
+
+
+def export_scoring(
+    results_df: pd.DataFrame,
+    output_dir: str = "out",
+    scoring_cfg: ScoringConfig | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Exporte les scores et la shortlist.
+    
+    Crée :
+    - {output_dir}/scores.csv : Score par ticker
+    - {output_dir}/shortlist.csv : Candidats prod
+    
+    Args:
+        results_df: DataFrame complet de results.csv
+        output_dir: Répertoire de sortie
+        scoring_cfg: Configuration du scoring
+    
+    Returns:
+        Tuple (scores_df, shortlist_df)
+    """
+    from pathlib import Path
+    
+    if scoring_cfg is None:
+        scoring_cfg = ScoringConfig()
+    
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Scores
+    scores_df = compute_all_scores(results_df, scoring_cfg)
+    scores_df.to_csv(output_path / "scores.csv", index=False)
+    
+    # Shortlist
+    shortlist_df = generate_shortlist(results_df, scoring_cfg)
+    shortlist_df.to_csv(output_path / "shortlist.csv", index=False)
+    
+    return scores_df, shortlist_df
+
+
+
+./envolees/output/__init__.py
+────────────────────────────────────────────────────────────
+
+"""Output and export utilities."""
+
+from envolees.output.compare import (
+    OOSEligibility,
+    ShortlistConfig,
+    TieredShortlistConfig,
+    TickerComparison,
+    compare_is_oos,
+    compute_oos_score,
+    evaluate_oos_eligibility,
+    export_comparison,
+    export_shortlist,
+    export_tiered_shortlists,
+    print_comparison_summary,
+    print_tiered_shortlists,
+    shortlist_from_compare,
+)
+from envolees.output.export import (
+    export_batch_summary,
+    export_result,
+    format_summary_line,
+    sanitize_path,
+)
+from envolees.output.scoring import (
+    ScoringConfig,
+    compute_all_scores,
+    compute_ticker_score,
+    export_scoring,
+    generate_shortlist,
+)
+
+__all__ = [
+    "export_batch_summary",
+    "export_result",
+    "format_summary_line",
+    "sanitize_path",
+    "ScoringConfig",
+    "compute_all_scores",
+    "compute_ticker_score",
+    "export_scoring",
+    "generate_shortlist",
+    "OOSEligibility",
+    "ShortlistConfig",
+    "TieredShortlistConfig",
+    "TickerComparison",
+    "compare_is_oos",
+    "compute_oos_score",
+    "evaluate_oos_eligibility",
+    "export_comparison",
+    "export_shortlist",
+    "export_tiered_shortlists",
+    "print_comparison_summary",
+    "print_tiered_shortlists",
+    "shortlist_from_compare",
+]
+
+
+
+./envolees/output/compare.py
+────────────────────────────────────────────────────────────
+
+"""
+Comparaison IS vs OOS et validation croisée.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+import pandas as pd
+
+
+@dataclass
+class OOSEligibility:
+    """Critères d'éligibilité OOS."""
+    
+    min_trades: int = 15
+    min_expectancy: float = 0.0
+    min_pf: float = 1.2
+    max_dd: float = 0.05
+    
+    # Dégradation acceptable IS → OOS
+    max_expectancy_drop: float = 0.50  # 50% de drop max
+    max_pf_drop: float = 0.40  # 40% de drop max
+
+
+@dataclass
+class TickerComparison:
+    """Comparaison IS/OOS pour un ticker."""
+    
+    ticker: str
+    penalty: float
+    
+    # IS metrics
+    is_trades: int
+    is_expectancy: float
+    is_pf: float
+    is_wr: float
+    is_dd: float
+    is_bars: int
+    
+    # OOS metrics
+    oos_trades: int
+    oos_expectancy: float
+    oos_pf: float
+    oos_wr: float
+    oos_dd: float
+    oos_bars: int
+    
+    # Status
+    oos_status: str  # "valid", "insufficient_trades", "degraded", "failed"
+    oos_notes: str
+    
+    def to_dict(self) -> dict:
+        return {
+            "ticker": self.ticker,
+            "penalty": self.penalty,
+            "is_trades": self.is_trades,
+            "is_expectancy": self.is_expectancy,
+            "is_pf": self.is_pf,
+            "is_wr": self.is_wr,
+            "is_dd": self.is_dd,
+            "is_bars": self.is_bars,
+            "oos_trades": self.oos_trades,
+            "oos_expectancy": self.oos_expectancy,
+            "oos_pf": self.oos_pf,
+            "oos_wr": self.oos_wr,
+            "oos_dd": self.oos_dd,
+            "oos_bars": self.oos_bars,
+            "exp_delta": self.oos_expectancy - self.is_expectancy,
+            "pf_delta": self.oos_pf - self.is_pf,
+            "oos_status": self.oos_status,
+            "oos_notes": self.oos_notes,
+        }
+
+
+def evaluate_oos_eligibility(
+    is_row: pd.Series,
+    oos_row: pd.Series,
+    criteria: OOSEligibility | None = None,
+) -> tuple[str, str]:
+    """
+    Évalue l'éligibilité OOS d'un ticker.
+    
+    Args:
+        is_row: Ligne IS de results.csv
+        oos_row: Ligne OOS de results.csv
+        criteria: Critères d'éligibilité
+    
+    Returns:
+        Tuple (status, notes)
+    """
+    if criteria is None:
+        criteria = OOSEligibility()
+    
+    notes = []
+    
+    # 1. Nombre de trades suffisant ?
+    if oos_row["n_trades"] < criteria.min_trades:
+        return "insufficient_trades", f"OOS trades ({oos_row['n_trades']}) < {criteria.min_trades}"
+    
+    # 2. Expectancy positive ?
+    if oos_row["expectancy_r"] < criteria.min_expectancy:
+        notes.append(f"ExpR {oos_row['expectancy_r']:.3f} < {criteria.min_expectancy}")
+    
+    # 3. PF suffisant ?
+    if oos_row["profit_factor"] < criteria.min_pf:
+        notes.append(f"PF {oos_row['profit_factor']:.2f} < {criteria.min_pf}")
+    
+    # 4. DD acceptable ?
+    if oos_row["max_daily_dd_pct"] > criteria.max_dd:
+        notes.append(f"DD {oos_row['max_daily_dd_pct']*100:.1f}% > {criteria.max_dd*100:.0f}%")
+    
+    # 5. Dégradation IS → OOS acceptable ?
+    if is_row["expectancy_r"] > 0:
+        exp_drop = 1 - (oos_row["expectancy_r"] / is_row["expectancy_r"])
+        if exp_drop > criteria.max_expectancy_drop:
+            notes.append(f"ExpR drop {exp_drop*100:.0f}% > {criteria.max_expectancy_drop*100:.0f}%")
+    
+    if is_row["profit_factor"] > 1:
+        pf_drop = 1 - ((oos_row["profit_factor"] - 1) / (is_row["profit_factor"] - 1))
+        if pf_drop > criteria.max_pf_drop and oos_row["profit_factor"] < is_row["profit_factor"]:
+            notes.append(f"PF drop significant")
+    
+    # Verdict
+    if not notes:
+        return "valid", "OOS validation passed"
+    
+    # Distinguer "degraded" (partiel) de "failed" (critique)
+    critical = any(
+        "ExpR" in n and "< 0" in n or
+        "PF" in n and "< 1" in n
+        for n in notes
+    )
+    
+    if critical or len(notes) >= 3:
+        return "failed", "; ".join(notes)
+    
+    return "degraded", "; ".join(notes)
+
+
+def compare_is_oos(
+    is_results_path: str | Path,
+    oos_results_path: str | Path,
+    criteria: OOSEligibility | None = None,
+    penalty_filter: float | None = None,
+) -> pd.DataFrame:
+    """
+    Compare les résultats IS et OOS.
+    
+    Args:
+        is_results_path: Chemin vers results.csv IS
+        oos_results_path: Chemin vers results.csv OOS
+        criteria: Critères d'éligibilité OOS
+        penalty_filter: Filtrer sur une pénalité spécifique
+    
+    Returns:
+        DataFrame de comparaison
+    """
+    if criteria is None:
+        criteria = OOSEligibility()
+    
+    is_df = pd.read_csv(is_results_path)
+    oos_df = pd.read_csv(oos_results_path)
+    
+    # Filtrer les erreurs
+    is_df = is_df[is_df["status"] == "ok"].copy()
+    oos_df = oos_df[oos_df["status"] == "ok"].copy()
+    
+    # Filtrer par pénalité si demandé
+    if penalty_filter is not None:
+        is_df = is_df[is_df["penalty_atr"] == penalty_filter]
+        oos_df = oos_df[oos_df["penalty_atr"] == penalty_filter]
+    
+    comparisons = []
+    
+    # Merger sur ticker + penalty
+    for _, is_row in is_df.iterrows():
+        ticker = is_row["ticker"]
+        penalty = is_row["penalty_atr"]
+        
+        oos_match = oos_df[
+            (oos_df["ticker"] == ticker) & 
+            (oos_df["penalty_atr"] == penalty)
+        ]
+        
+        if oos_match.empty:
+            continue
+        
+        oos_row = oos_match.iloc[0]
+        
+        status, notes = evaluate_oos_eligibility(is_row, oos_row, criteria)
+        
+        comp = TickerComparison(
+            ticker=ticker,
+            penalty=penalty,
+            is_trades=int(is_row["n_trades"]),
+            is_expectancy=float(is_row["expectancy_r"]),
+            is_pf=float(is_row["profit_factor"]),
+            is_wr=float(is_row["win_rate"]),
+            is_dd=float(is_row["max_daily_dd_pct"]),
+            is_bars=int(is_row["bars_4h"]),
+            oos_trades=int(oos_row["n_trades"]),
+            oos_expectancy=float(oos_row["expectancy_r"]),
+            oos_pf=float(oos_row["profit_factor"]),
+            oos_wr=float(oos_row["win_rate"]),
+            oos_dd=float(oos_row["max_daily_dd_pct"]),
+            oos_bars=int(oos_row["bars_4h"]),
+            oos_status=status,
+            oos_notes=notes,
+        )
+        comparisons.append(comp.to_dict())
+    
+    return pd.DataFrame(comparisons)
+
+
+def export_comparison(
+    is_results_path: str | Path,
+    oos_results_path: str | Path,
+    output_path: str | Path,
+    criteria: OOSEligibility | None = None,
+    reference_penalty: float = 0.25,
+) -> pd.DataFrame:
+    """
+    Exporte un rapport de comparaison IS/OOS.
+    
+    Crée:
+    - comparison_full.csv : Toutes les pénalités
+    - comparison_ref.csv : Pénalité de référence uniquement
+    - validated.csv : Tickers validés OOS
+    
+    Args:
+        is_results_path: Chemin vers results.csv IS
+        oos_results_path: Chemin vers results.csv OOS
+        output_path: Répertoire de sortie
+        criteria: Critères d'éligibilité
+        reference_penalty: Pénalité de référence
+    
+    Returns:
+        DataFrame des tickers validés
+    """
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Comparaison complète
+    full_df = compare_is_oos(is_results_path, oos_results_path, criteria)
+    full_df.to_csv(output_path / "comparison_full.csv", index=False)
+    
+    # Comparaison à la pénalité de référence
+    ref_df = compare_is_oos(is_results_path, oos_results_path, criteria, reference_penalty)
+    ref_df.to_csv(output_path / "comparison_ref.csv", index=False)
+    
+    # Tickers validés
+    validated = ref_df[ref_df["oos_status"] == "valid"].copy()
+    validated.to_csv(output_path / "validated.csv", index=False)
+    
+    return validated
+
+
+def print_comparison_summary(comparison_df: pd.DataFrame) -> None:
+    """Affiche un résumé de la comparaison."""
+    if comparison_df.empty:
+        print("Aucune comparaison disponible.")
+        return
+    
+    total = len(comparison_df)
+    valid = len(comparison_df[comparison_df["oos_status"] == "valid"])
+    insufficient = len(comparison_df[comparison_df["oos_status"] == "insufficient_trades"])
+    degraded = len(comparison_df[comparison_df["oos_status"] == "degraded"])
+    failed = len(comparison_df[comparison_df["oos_status"] == "failed"])
+    
+    print(f"\n{'='*60}")
+    print(f"COMPARAISON IS/OOS - {total} ticker×penalty")
+    print(f"{'='*60}")
+    print(f"  ✓ Valid:              {valid:>3} ({valid/total*100:.0f}%)")
+    print(f"  ⚠ Insufficient trades: {insufficient:>3} ({insufficient/total*100:.0f}%)")
+    print(f"  ~ Degraded:           {degraded:>3} ({degraded/total*100:.0f}%)")
+    print(f"  ✗ Failed:             {failed:>3} ({failed/total*100:.0f}%)")
+    print(f"{'='*60}")
+    
+    if valid > 0:
+        print("\nTickers validés OOS:")
+        for _, row in comparison_df[comparison_df["oos_status"] == "valid"].iterrows():
+            print(
+                f"  • {row['ticker']:>12} PEN {row['penalty']:.2f} │ "
+                f"IS: {row['is_trades']:>3}t ExpR {row['is_expectancy']:+.3f} │ "
+                f"OOS: {row['oos_trades']:>3}t ExpR {row['oos_expectancy']:+.3f}"
+            )
+
+
+@dataclass
+class ShortlistConfig:
+    """Configuration pour la génération de shortlist."""
+    
+    min_trades_oos: int = 15
+    min_pf_oos: float = 1.2
+    min_expectancy_oos: float = 0.0
+    dd_cap: float = 0.012  # 1.2%
+    
+    # Poids du scoring
+    weight_expectancy: float = 0.55
+    weight_pf: float = 0.30
+    weight_dd: float = 0.15
+    
+    # Limites
+    min_score: float = 0.0
+    max_tickers: int = 20
+    
+    @classmethod
+    def from_env(cls) -> ShortlistConfig:
+        """Charge depuis l'environnement."""
+        import os
+        return cls(
+            min_trades_oos=int(os.getenv("MIN_TRADES_OOS", "15")),
+            dd_cap=float(os.getenv("DD_CAP", "0.012")),
+            min_score=float(os.getenv("SHORTLIST_MIN_SCORE", "0.0")),
+            max_tickers=int(os.getenv("SHORTLIST_MAX_TICKERS", "20")),
+        )
+
+
+@dataclass
+class TieredShortlistConfig:
+    """Configuration pour la génération de shortlists par tier."""
+    
+    # Tier 1 (Funded) - critères stricts
+    tier1_min_trades: int = 15
+    
+    # Tier 2 (Challenge) - critères assouplis
+    tier2_min_trades: int = 10
+    
+    # Critères communs
+    min_pf_oos: float = 1.2
+    min_expectancy_oos: float = 0.0
+    dd_cap: float = 0.012  # 1.2%
+    
+    # Poids du scoring
+    weight_expectancy: float = 0.55
+    weight_pf: float = 0.30
+    weight_dd: float = 0.15
+    
+    # Limites
+    min_score: float = 0.0
+    max_tickers: int = 20
+    
+    @classmethod
+    def from_env(cls) -> TieredShortlistConfig:
+        """Charge depuis l'environnement."""
+        import os
+        return cls(
+            tier1_min_trades=int(os.getenv("MIN_TRADES_TIER1", "15")),
+            tier2_min_trades=int(os.getenv("MIN_TRADES_TIER2", "10")),
+            dd_cap=float(os.getenv("DD_CAP", "0.012")),
+            min_score=float(os.getenv("SHORTLIST_MIN_SCORE", "0.0")),
+            max_tickers=int(os.getenv("SHORTLIST_MAX_TICKERS", "20")),
+        )
+
+
+def compute_oos_score(row: pd.Series, cfg: ShortlistConfig | TieredShortlistConfig) -> float:
+    """
+    Calcule le score OOS d'un ticker.
+    
+    score = w_exp * oos_expectancy + w_pf * log(oos_pf) - w_dd * oos_dd
+    """
+    import math
+    
+    exp_score = cfg.weight_expectancy * row["oos_expectancy"]
+    pf_score = cfg.weight_pf * math.log(max(row["oos_pf"], 1e-9))
+    dd_penalty = cfg.weight_dd * row["oos_dd"]
+    
+    return exp_score + pf_score - dd_penalty
+
+
+def shortlist_from_compare(
+    comparison_path: str | Path,
+    cfg: ShortlistConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Génère une shortlist tradable depuis les résultats de comparaison.
+    
+    Règle (OOS-first, robuste) :
+    1. filter: oos_trades >= min_trades
+    2. filter: oos_pf >= 1.2 et oos_expectancy > 0
+    3. filter: oos_dd <= dd_cap
+    4. score: 0.55*exp + 0.30*log(pf) - 0.15*dd
+    5. tri décroissant, top N
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        cfg: Configuration de shortlist
+    
+    Returns:
+        DataFrame trié par score décroissant
+    """
+    if cfg is None:
+        cfg = ShortlistConfig.from_env()
+    
+    df = pd.read_csv(comparison_path)
+    
+    # Filtres
+    df = df[df["oos_trades"] >= cfg.min_trades_oos].copy()
+    df = df[df["oos_pf"] >= cfg.min_pf_oos].copy()
+    df = df[df["oos_expectancy"] > cfg.min_expectancy_oos].copy()
+    df = df[df["oos_dd"] <= cfg.dd_cap].copy()
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Scoring
+    df["oos_score"] = df.apply(lambda r: compute_oos_score(r, cfg), axis=1)
+    
+    # Filtre score minimum
+    if cfg.min_score > 0:
+        df = df[df["oos_score"] >= cfg.min_score].copy()
+    
+    # Tri et limite
+    df = df.sort_values("oos_score", ascending=False)
+    df = df.head(cfg.max_tickers)
+    
+    return df.reset_index(drop=True)
+
+
+def export_shortlist(
+    comparison_path: str | Path,
+    output_path: str | Path,
+    cfg: ShortlistConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Exporte la shortlist tradable.
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        output_path: Chemin de sortie
+        cfg: Configuration
+    
+    Returns:
+        DataFrame de la shortlist
+    """
+    shortlist = shortlist_from_compare(comparison_path, cfg)
+    
+    if not shortlist.empty:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Colonnes à exporter
+        cols = [
+            "ticker", "penalty", "oos_score",
+            "oos_trades", "oos_expectancy", "oos_pf", "oos_wr", "oos_dd",
+            "is_trades", "is_expectancy", "is_pf",
+        ]
+        shortlist[[c for c in cols if c in shortlist.columns]].to_csv(output_path, index=False)
+    
+    return shortlist
+
+
+def _generate_shortlist_for_tier(
+    df: pd.DataFrame,
+    min_trades: int,
+    cfg: TieredShortlistConfig,
+    exclude_tickers: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Génère une shortlist pour un tier spécifique.
+    
+    Args:
+        df: DataFrame de comparaison
+        min_trades: Minimum de trades OOS requis
+        cfg: Configuration
+        exclude_tickers: Tickers à exclure (déjà dans un tier supérieur)
+    
+    Returns:
+        DataFrame trié par score décroissant
+    """
+    filtered = df.copy()
+    
+    # Exclure les tickers déjà sélectionnés
+    if exclude_tickers:
+        filtered = filtered[~filtered["ticker"].isin(exclude_tickers)]
+    
+    # Filtres
+    filtered = filtered[filtered["oos_trades"] >= min_trades]
+    filtered = filtered[filtered["oos_pf"] >= cfg.min_pf_oos]
+    filtered = filtered[filtered["oos_expectancy"] > cfg.min_expectancy_oos]
+    filtered = filtered[filtered["oos_dd"] <= cfg.dd_cap]
+    
+    # Aussi vérifier le DD sur IS (sinon on risque l'overfitting)
+    filtered = filtered[filtered["is_dd"] <= cfg.dd_cap]
+    
+    if filtered.empty:
+        return pd.DataFrame()
+    
+    # Scoring
+    filtered["oos_score"] = filtered.apply(lambda r: compute_oos_score(r, cfg), axis=1)
+    
+    # Filtre score minimum
+    if cfg.min_score > 0:
+        filtered = filtered[filtered["oos_score"] >= cfg.min_score]
+    
+    # Tri
+    filtered = filtered.sort_values("oos_score", ascending=False)
+    filtered = filtered.head(cfg.max_tickers)
+    
+    return filtered.reset_index(drop=True)
+
+
+def export_tiered_shortlists(
+    comparison_path: str | Path,
+    output_dir: str | Path,
+    cfg: TieredShortlistConfig | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Exporte les shortlists par tier.
+    
+    Tier 1 (Funded): MIN_TRADES=15, critères stricts
+    Tier 2 (Challenge): MIN_TRADES=10, HORS Tier 1
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        output_dir: Répertoire de sortie
+        cfg: Configuration
+    
+    Returns:
+        Tuple (tier1_df, tier2_df)
+    """
+    if cfg is None:
+        cfg = TieredShortlistConfig.from_env()
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    df = pd.read_csv(comparison_path)
+    
+    # Colonnes à exporter
+    export_cols = [
+        "ticker", "penalty", "oos_score",
+        "oos_trades", "oos_expectancy", "oos_pf", "oos_wr", "oos_dd",
+        "is_trades", "is_expectancy", "is_pf",
+    ]
+    
+    # Tier 1: critères stricts (≥15 trades)
+    tier1 = _generate_shortlist_for_tier(df, cfg.tier1_min_trades, cfg)
+    tier1_tickers = tier1["ticker"].tolist() if not tier1.empty else []
+    
+    if not tier1.empty:
+        tier1[[c for c in export_cols if c in tier1.columns]].to_csv(
+            output_dir / "shortlist_tier1.csv", index=False
+        )
+    else:
+        # Créer fichier vide avec headers
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tier1.csv", index=False
+        )
+    
+    # Tier 2: critères assouplis (≥10 trades), HORS tier 1
+    tier2 = _generate_shortlist_for_tier(df, cfg.tier2_min_trades, cfg, exclude_tickers=tier1_tickers)
+    
+    if not tier2.empty:
+        tier2[[c for c in export_cols if c in tier2.columns]].to_csv(
+            output_dir / "shortlist_tier2.csv", index=False
+        )
+    else:
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tier2.csv", index=False
+        )
+    
+    # Shortlist combinée pour rétrocompatibilité (tier1 + tier2)
+    combined = pd.concat([tier1, tier2], ignore_index=True) if not tier1.empty or not tier2.empty else pd.DataFrame()
+    if not combined.empty:
+        combined[[c for c in export_cols if c in combined.columns]].to_csv(
+            output_dir / "shortlist_tradable.csv", index=False
+        )
+    else:
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tradable.csv", index=False
+        )
+    
+    return tier1, tier2
+
+
+def print_tiered_shortlists(tier1: pd.DataFrame, tier2: pd.DataFrame) -> None:
+    """Affiche les shortlists par tier."""
+    from rich.console import Console
+    console = Console()
+    
+    if not tier1.empty:
+        console.print(f"\n[bold green]🎯 Tier 1 - Funded ({len(tier1)} tickers, ≥15 trades):[/bold green]")
+        for _, row in tier1.iterrows():
+            console.print(
+                f"  • {row['ticker']:>12} │ "
+                f"score {row['oos_score']:.3f} │ "
+                f"OOS: {row['oos_trades']:>2}t ExpR {row['oos_expectancy']:+.3f} "
+                f"PF {row['oos_pf']:.2f} DD {row['oos_dd']*100:.2f}%"
+            )
+    else:
+        console.print(f"\n[yellow]⚠ Tier 1 - Funded: aucun ticker[/yellow]")
+    
+    if not tier2.empty:
+        console.print(f"\n[bold cyan]🎯 Tier 2 - Challenge bonus ({len(tier2)} tickers, ≥10 trades):[/bold cyan]")
+        for _, row in tier2.iterrows():
+            console.print(
+                f"  • {row['ticker']:>12} │ "
+                f"score {row['oos_score']:.3f} │ "
+                f"OOS: {row['oos_trades']:>2}t ExpR {row['oos_expectancy']:+.3f} "
+                f"PF {row['oos_pf']:.2f} DD {row['oos_dd']*100:.2f}%"
+            )
+    else:
+        console.print(f"\n[dim]Tier 2 - Challenge bonus: aucun ticker additionnel[/dim]")
+    
+    # Résumé
+    total = len(tier1) + len(tier2)
+    if total > 0:
+        console.print(f"\n[bold]Résumé:[/bold]")
+        console.print(f"  • Funded (Tier 1 seul): {len(tier1)} instruments")
+        console.print(f"  • Challenge (Tier 1 + 2): {total} instruments")
+
+
+
+./envolees/strategy/__init__.py
+────────────────────────────────────────────────────────────
+
+"""Trading strategies."""
+
+from envolees.strategy.base import Direction, Position, Signal, Strategy
+from envolees.strategy.donchian_breakout import DonchianBreakoutStrategy
+
+__all__ = [
+    "Direction",
+    "Position",
+    "Signal",
+    "Strategy",
+    "DonchianBreakoutStrategy",
+]
+
+
+
+./envolees/strategy/base.py
+────────────────────────────────────────────────────────────
+
+"""
+Base class for trading strategies.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
+
+import pandas as pd
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+
+
+Direction = Literal["LONG", "SHORT"]
+
+
+@dataclass
+class Signal:
+    """Signal de trading généré par une stratégie."""
+
+    direction: Direction
+    entry_level: float
+    atr_at_signal: float
+    timestamp: pd.Timestamp
+    expiry_bars: int = 1
+
+
+@dataclass
+class Position:
+    """Position ouverte."""
+
+    direction: Direction
+    entry: float
+    sl: float
+    tp: float
+    ts_signal: pd.Timestamp
+    ts_entry: pd.Timestamp
+    atr_signal: float
+    entry_bar_idx: int
+    risk_cash: float
+
+
+class Strategy(ABC):
+    """Classe abstraite pour les stratégies de trading."""
+
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+
+    @abstractmethod
+    def prepare_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Ajoute les indicateurs nécessaires au DataFrame.
+
+        Args:
+            df: DataFrame OHLCV
+
+        Returns:
+            DataFrame enrichi avec les indicateurs
+        """
+        ...
+
+    @abstractmethod
+    def generate_signal(
+        self,
+        df: pd.DataFrame,
+        bar_idx: int,
+        current_position: Position | None,
+        pending_signal: Signal | None,
+    ) -> Signal | None:
+        """
+        Génère un signal de trading pour la barre courante.
+
+        Args:
+            df: DataFrame avec indicateurs
+            bar_idx: Index de la barre courante
+            current_position: Position ouverte (ou None)
+            pending_signal: Signal en attente (ou None)
+
+        Returns:
+            Signal si conditions remplies, None sinon
+        """
+        ...
+
+    @abstractmethod
+    def compute_entry_sl_tp(
+        self,
+        signal: Signal,
+        exec_penalty_atr: float,
+    ) -> tuple[float, float, float]:
+        """
+        Calcule les niveaux d'entrée, SL et TP.
+
+        Args:
+            signal: Signal de trading
+            exec_penalty_atr: Pénalité d'exécution en multiples d'ATR
+
+        Returns:
+            Tuple (entry, sl, tp)
+        """
+        ...
+
+
+
+./envolees/strategy/donchian_breakout.py
+────────────────────────────────────────────────────────────
+
+"""
+Stratégie Donchian Breakout avec filtre EMA et volatilité.
+"""
+
+from __future__ import annotations
+
+from datetime import time
+from typing import TYPE_CHECKING
+
+import numpy as np
+import pandas as pd
+
+from envolees.indicators import compute_atr, compute_donchian, compute_ema
+from envolees.strategy.base import Direction, Position, Signal, Strategy
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+
+
+class DonchianBreakoutStrategy(Strategy):
+    """
+    Stratégie de breakout Donchian.
+
+    - Filtre tendance : EMA200
+    - Signal : breakout Donchian(N=20) + buffer 0.10×ATR
+    - Filtre volatilité : ATR relatif < quantile 90%
+    - Fenêtre sans trading : 22:30 - 06:30 Paris
+    """
+
+    def __init__(self, cfg: Config) -> None:
+        super().__init__(cfg)
+
+    def prepare_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Ajoute EMA, ATR, Donchian et filtre volatilité."""
+        df = df.copy()
+
+        # EMA tendance
+        df["EMA"] = compute_ema(df["Close"], self.cfg.ema_period)
+
+        # ATR
+        df["ATR"] = compute_atr(df, self.cfg.atr_period)
+        df["ATR_rel"] = df["ATR"] / df["Close"]
+
+        # Donchian channels (shifted pour éviter look-ahead)
+        df["D_high"], df["D_low"] = compute_donchian(df, self.cfg.donchian_n, shift=1)
+
+        # Filtre volatilité : quantile glissant
+        df["ATR_rel_q"] = df["ATR_rel"].rolling(
+            self.cfg.vol_window_bars,
+            min_periods=self.cfg.vol_window_bars,
+        ).quantile(self.cfg.vol_quantile)
+
+        df["VOL_ok"] = df["ATR_rel"] <= df["ATR_rel_q"]
+
+        return df
+
+    def _in_no_trade_window(self, ts: pd.Timestamp) -> bool:
+        """Vérifie si on est dans la fenêtre sans trading."""
+        t = ts.time()
+        start = self.cfg.no_trade_start
+        end = self.cfg.no_trade_end
+
+        if start <= end:
+            return start <= t < end
+        # Fenêtre à cheval sur minuit
+        return t >= start or t < end
+
+    def _indicators_ready(self, row: pd.Series) -> bool:
+        """Vérifie que tous les indicateurs sont calculés."""
+        return not any(
+            np.isnan(row[col])
+            for col in ["ATR", "D_high", "D_low", "ATR_rel_q", "EMA"]
+        )
+
+    def generate_signal(
+        self,
+        df: pd.DataFrame,
+        bar_idx: int,
+        current_position: Position | None,
+        pending_signal: Signal | None,
+    ) -> Signal | None:
+        """Génère un signal de breakout si conditions remplies."""
+        # Pas de nouveau signal si position ouverte ou signal en attente
+        if current_position is not None or pending_signal is not None:
+            return None
+
+        row = df.iloc[bar_idx]
+        ts = df.index[bar_idx]
+
+        # Indicateurs prêts ?
+        if not self._indicators_ready(row):
+            return None
+
+        # Fenêtre sans trading ?
+        if self._in_no_trade_window(ts):
+            return None
+
+        # Filtre volatilité
+        if not bool(row["VOL_ok"]):
+            return None
+
+        close = float(row["Close"])
+        ema = float(row["EMA"])
+        atr = float(row["ATR"])
+        buffer = self.cfg.buffer_atr * atr
+        d_high = float(row["D_high"])
+        d_low = float(row["D_low"])
+
+        # Signal LONG
+        if close > ema and close > (d_high + buffer):
+            return Signal(
+                direction="LONG",
+                entry_level=d_high + buffer,
+                atr_at_signal=atr,
+                timestamp=ts,
+                expiry_bars=self.cfg.order_valid_bars,
+            )
+
+        # Signal SHORT
+        if close < ema and close < (d_low - buffer):
+            return Signal(
+                direction="SHORT",
+                entry_level=d_low - buffer,
+                atr_at_signal=atr,
+                timestamp=ts,
+                expiry_bars=self.cfg.order_valid_bars,
+            )
+
+        return None
+
+    def compute_entry_sl_tp(
+        self,
+        signal: Signal,
+        exec_penalty_atr: float,
+    ) -> tuple[float, float, float]:
+        """Calcule entry, SL, TP avec pénalité d'exécution."""
+        penalty = exec_penalty_atr * signal.atr_at_signal
+
+        if signal.direction == "LONG":
+            entry = signal.entry_level + penalty
+            sl = entry - self.cfg.sl_atr * signal.atr_at_signal
+            risk_points = entry - sl
+            tp = entry + self.cfg.tp_r * risk_points
+        else:
+            entry = signal.entry_level - penalty
+            sl = entry + self.cfg.sl_atr * signal.atr_at_signal
+            risk_points = sl - entry
+            tp = entry - self.cfg.tp_r * risk_points
+
+        return entry, sl, tp
+
+
+
+./envolees/__init__.py
+────────────────────────────────────────────────────────────
+
+"""
+Envolées - Backtest engine for Donchian breakout strategy with prop firm simulation.
+
+Author: Raph
+"""
+
+__version__ = "0.1.0"
+
+from envolees.config import Config, get_penalties, get_tickers
+
+__all__ = ["Config", "get_tickers", "get_penalties", "__version__"]
+
+
+
+./envolees/config.py
+────────────────────────────────────────────────────────────
+
+"""
+Configuration du backtest — chargement .env, secrets et profils.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from datetime import time
+from pathlib import Path
+from typing import Literal
+
+from dotenv import load_dotenv
+
+# Charger .env depuis la racine du projet
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_PROJECT_ROOT / ".env")
+
+# Charger les secrets (après .env, pour override)
+try:
+    from envolees.secrets import load_secrets
+    load_secrets(_PROJECT_ROOT, strict=False)
+except Exception:
+    pass  # Secrets optionnels
+
+
+DailyEquityMode = Literal["close", "worst"]
+SplitMode = Literal["", "none", "time"]
+SplitTarget = Literal["", "is", "oos"]
+ProfileMode = Literal["default", "challenge", "funded", "conservative", "aggressive"]
+
+
+def _parse_time(s: str) -> time:
+    """Parse 'HH:MM' → time."""
+    h, m = map(int, s.split(":"))
+    return time(h, m)
+
+
+def _parse_bool(s: str) -> bool:
+    return s.lower() in ("true", "1", "yes", "on")
+
+
+def _parse_list(s: str) -> list[str]:
+    """Parse 'a,b,c' → ['a', 'b', 'c']."""
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _parse_float_list(s: str) -> list[float]:
+    return [float(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _get_profile_value(profile_name: str, key: str, env_key: str, default: float) -> float:
+    """Récupère une valeur avec fallback sur le profil."""
+    env_val = os.getenv(env_key, "")
+    if env_val:
+        try:
+            return float(env_val)
+        except ValueError:
+            pass
+    
+    try:
+        from envolees.profiles import get_profile
+        profile = get_profile(profile_name)
+        return getattr(profile, key, default)
+    except Exception:
+        return default
+
+
+def _parse_weights(prefix: str = "WEIGHT_") -> dict[str, float]:
+    """
+    Parse les variables WEIGHT_* depuis l'environnement.
+    
+    Supporte les alias (WEIGHT_BTC, WEIGHT_GOLD) qui seront mappés aux tickers réels.
+    Les caractères spéciaux (=, -, ^) sont remplacés par _ dans les noms de variables.
+    
+    Exemples:
+        WEIGHT_BTC=0.8         → {"BTC": 0.8}
+        WEIGHT_EURUSD=1.0      → {"EURUSD": 1.0}
+        WEIGHT_GSPC=0.9        → {"GSPC": 0.9}  (pour ^GSPC)
+    """
+    weights = {}
+    for key, value in os.environ.items():
+        if key.startswith(prefix):
+            # Extraire l'alias (tout après WEIGHT_)
+            alias = key[len(prefix):]
+            try:
+                weights[alias] = float(value)
+            except ValueError:
+                pass
+    return weights
+
+
+@dataclass(frozen=True)
+class Config:
+    """Configuration complète du backtest."""
+
+    # Profil actif
+    profile: ProfileMode = "default"
+
+    # Capital / risque
+    start_balance: float = 100_000.0
+    risk_per_trade: float = 0.0025
+
+    # Indicateurs
+    ema_period: int = 200
+    atr_period: int = 14
+    donchian_n: int = 20
+    buffer_atr: float = 0.10
+
+    # Stops / objectifs
+    sl_atr: float = 1.00
+    tp_r: float = 1.00
+
+    # Filtre volatilité
+    vol_quantile: float = 0.90
+    vol_window_bars: int = 1000
+
+    # Fenêtre sans nouvelles décisions (Paris)
+    no_trade_start: time = field(default_factory=lambda: time(22, 30))
+    no_trade_end: time = field(default_factory=lambda: time(6, 30))
+
+    # Ordre en attente : valable sur N bougies 4H
+    order_valid_bars: int = 1
+
+    # Convention conservative
+    conservative_same_bar: bool = True
+
+    # Prop simulation
+    daily_dd_ftmo: float = 0.05
+    daily_dd_gft: float = 0.04
+    max_loss: float = 0.10
+    stop_after_n_losses: int = 2
+    daily_kill_switch: float = 0.04
+
+    # Estimation daily DD
+    daily_equity_mode: DailyEquityMode = "worst"
+
+    # Split temporel (IS/OOS)
+    split_mode: SplitMode = ""
+    split_ratio: float = 0.70
+    split_target: SplitTarget = ""
+
+    # Yahoo Finance
+    yf_period: str = "730d"
+    yf_interval: str = "1h"
+
+    # Cache
+    cache_enabled: bool = True
+    cache_dir: str = ""
+    cache_max_age_hours: float = 24.0
+
+    # Output
+    output_dir: str = "out"
+
+    # Pondérations par ticker (optionnel)
+    weights: dict[str, float] = field(default_factory=dict)
+    
+    # Paramètres avancés de risque
+    risk_mode: str = ""  # Alias pour profile (rétro-compatibilité)
+    max_concurrent_trades: int = 0  # 0 = illimité
+    daily_risk_budget: float = 0.0  # 0 = pas de limite
+    
+    # Shortlist
+    shortlist_min_score: float = 0.0
+    shortlist_max_tickers: int = 10
+    min_trades_oos: int = 15
+    dd_cap: float = 0.012
+
+    @classmethod
+    def from_env(cls) -> Config:
+        """
+        Charge la config depuis les variables d'environnement.
+        
+        Ordre de priorité :
+        1. Variables d'environnement explicites
+        2. Valeurs par défaut du profil (PROFILE ou RISK_MODE)
+        3. Valeurs par défaut globales
+        """
+        # Déterminer le profil actif
+        profile_name = os.getenv("PROFILE", os.getenv("RISK_MODE", "default")).strip().lower()
+        
+        return cls(
+            profile=profile_name,  # type: ignore[arg-type]
+            start_balance=float(os.getenv("START_BALANCE", "100000")),
+            risk_per_trade=_get_profile_value(profile_name, "risk_per_trade", "RISK_PER_TRADE", 0.0025),
+            ema_period=int(os.getenv("EMA_PERIOD", "200")),
+            atr_period=int(os.getenv("ATR_PERIOD", "14")),
+            donchian_n=int(os.getenv("DONCHIAN_N", "20")),
+            buffer_atr=float(os.getenv("BUFFER_ATR", "0.10")),
+            sl_atr=float(os.getenv("SL_ATR", "1.00")),
+            tp_r=float(os.getenv("TP_R", "1.00")),
+            vol_quantile=float(os.getenv("VOL_QUANTILE", "0.90")),
+            vol_window_bars=int(os.getenv("VOL_WINDOW_BARS", "1000")),
+            no_trade_start=_parse_time(os.getenv("NO_TRADE_START", "22:30")),
+            no_trade_end=_parse_time(os.getenv("NO_TRADE_END", "06:30")),
+            order_valid_bars=int(os.getenv("ORDER_VALID_BARS", "1")),
+            conservative_same_bar=_parse_bool(os.getenv("CONSERVATIVE_SAME_BAR", "true")),
+            daily_dd_ftmo=float(os.getenv("DAILY_DD_FTMO", "0.05")),
+            daily_dd_gft=float(os.getenv("DAILY_DD_GFT", "0.04")),
+            max_loss=float(os.getenv("MAX_LOSS", "0.10")),
+            stop_after_n_losses=int(_get_profile_value(profile_name, "stop_after_n_losses", "STOP_AFTER_N_LOSSES", 2)),
+            daily_kill_switch=float(os.getenv("DAILY_KILL_SWITCH", "0.04")),
+            daily_equity_mode=os.getenv("DAILY_EQUITY_MODE", os.getenv("MODE", "worst")),  # type: ignore[arg-type]
+            split_mode=os.getenv("SPLIT_MODE", "").strip().lower(),  # type: ignore[arg-type]
+            split_ratio=float(os.getenv("SPLIT_RATIO", "0.70")),
+            split_target=os.getenv("SPLIT_TARGET", "").strip().lower(),  # type: ignore[arg-type]
+            yf_period=os.getenv("YF_PERIOD", "730d"),
+            yf_interval=os.getenv("YF_INTERVAL", "1h"),
+            cache_enabled=_parse_bool(os.getenv("CACHE_ENABLED", "true")),
+            cache_dir=os.getenv("CACHE_DIR", ""),
+            cache_max_age_hours=_get_profile_value(profile_name, "cache_max_age_hours", "CACHE_MAX_AGE_HOURS", 24.0),
+            output_dir=os.getenv("OUTPUT_DIR", "out"),
+            weights=_parse_weights(),
+            risk_mode=profile_name,
+            max_concurrent_trades=int(_get_profile_value(profile_name, "max_concurrent_trades", "MAX_CONCURRENT_TRADES", 0)),
+            daily_risk_budget=_get_profile_value(profile_name, "daily_risk_budget", "DAILY_RISK_BUDGET", 0.0),
+            shortlist_min_score=_get_profile_value(profile_name, "shortlist_min_score", "SHORTLIST_MIN_SCORE", 0.0),
+            shortlist_max_tickers=int(_get_profile_value(profile_name, "shortlist_max_tickers", "SHORTLIST_MAX_TICKERS", 10)),
+            min_trades_oos=int(_get_profile_value(profile_name, "min_trades_oos", "MIN_TRADES_OOS", 15)),
+            dd_cap=_get_profile_value(profile_name, "dd_cap", "DD_CAP", 0.012),
+        )
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    """Spécification d'un run de backtest."""
+
+    ticker: str
+    exec_penalty_atr: float
+
+
+def get_tickers() -> list[str]:
+    """Récupère la liste des tickers depuis .env."""
+    raw = os.getenv("TICKERS", "")
+    if not raw:
+        # Fallback : portefeuille par défaut
+        return [
+            "EURUSD=X", "GBPUSD=X", "USDJPY=X",
+            "BTC-USD", "ETH-USD",
+            "^GSPC", "^NDX",
+            "GC=F", "CL=F", "BZ=F",
+        ]
+    return _parse_list(raw)
+
+
+def get_penalties() -> list[float]:
+    """Récupère la liste des pénalités depuis .env."""
+    # Supporter les deux noms : PENALTIES et EXEC_PENALTIES
+    raw = os.getenv("PENALTIES", os.getenv("EXEC_PENALTIES", ""))
+    if not raw:
+        return [0.05, 0.10, 0.15, 0.20, 0.25]
+    return _parse_float_list(raw)
+
+
+def get_ticker_weight(ticker: str, cfg: Config) -> float:
+    """
+    Récupère le poids d'un ticker.
+    
+    Les poids sont définis via WEIGHT_<ALIAS>=<poids> dans .env.
+    L'alias doit correspondre au ticker normalisé (sans =X, -USD, ^, =F).
+    
+    Exemples:
+        WEIGHT_BTC=0.8     → s'applique à BTC-USD
+        WEIGHT_EURUSD=1.0  → s'applique à EURUSD=X
+        WEIGHT_GSPC=0.9    → s'applique à ^GSPC
+        WEIGHT_GC=0.75     → s'applique à GC=F
+    
+    Args:
+        ticker: Ticker Yahoo (ex: BTC-USD, ^GSPC, EURUSD=X)
+        cfg: Configuration avec les poids
+    
+    Returns:
+        Poids (défaut: 1.0)
+    """
+    if not cfg.weights:
+        return 1.0
+    
+    # Normaliser le ticker pour matcher les clés de weights
+    # BTC-USD → BTC, EURUSD=X → EURUSD, ^GSPC → GSPC, GC=F → GC
+    normalized = ticker.replace("=X", "").replace("-USD", "").replace("=F", "").replace("^", "")
+    
+    # Essayer plusieurs variantes
+    variants = [
+        normalized,
+        normalized.upper(),
+        ticker,
+        ticker.upper(),
+    ]
+    
+    for v in variants:
+        if v in cfg.weights:
+            return cfg.weights[v]
+    
+    return 1.0
+
+
+
+./envolees/prefilter.py
+────────────────────────────────────────────────────────────
+
+"""
+Pré-filtrage intelligent des tickers avant backtest complet.
+
+Évite de backtester des instruments avec :
+- Pas assez de données
+- Volatilité nulle
+- Pas assez de signaux potentiels
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+import pandas as pd
+import numpy as np
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+
+
+@dataclass
+class PrefilterConfig:
+    """Configuration du pré-filtre."""
+    
+    # Minimum de barres 4H
+    min_bars_4h: int = 1500
+    
+    # ATR relatif minimum (éviter les tickers sans volatilité)
+    min_atr_ratio: float = 0.001  # 0.1%
+    
+    # Signaux bruts minimum sur IS
+    min_raw_signals_is: int = 30
+    
+    # Spread maximum (si disponible)
+    max_spread_ratio: float = 0.01  # 1%
+    
+    @classmethod
+    def from_env(cls) -> PrefilterConfig:
+        """Charge depuis l'environnement."""
+        return cls(
+            min_bars_4h=int(os.getenv("PREFILTER_MIN_BARS", "1500")),
+            min_atr_ratio=float(os.getenv("PREFILTER_MIN_ATR", "0.001")),
+            min_raw_signals_is=int(os.getenv("PREFILTER_MIN_SIGNALS", "30")),
+            max_spread_ratio=float(os.getenv("PREFILTER_MAX_SPREAD", "0.01")),
+        )
+
+
+@dataclass
+class PrefilterResult:
+    """Résultat du pré-filtre pour un ticker."""
+    
+    ticker: str
+    passed: bool
+    reason: str
+    
+    # Métriques
+    bars_4h: int = 0
+    atr_ratio: float = 0.0
+    raw_signals: int = 0
+    
+    def __str__(self) -> str:
+        status = "✓" if self.passed else "✗"
+        return f"{status} {self.ticker}: {self.reason} (bars={self.bars_4h}, signals={self.raw_signals})"
+
+
+# Blacklist de tickers problématiques
+TICKER_BLACKLIST = {
+    # Yahoo Finance problématiques
+    "XAUUSD",  # Utiliser GC=F
+    "XAGUSD",  # Utiliser SI=F
+    # Tickers douteux
+    "TEST", "DEMO", "SANDBOX",
+}
+
+
+# Whitelist par classe d'actifs (optionnel)
+ASSET_WHITELISTS = {
+    "fx": {
+        "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCAD=X",
+        "USDCHF=X", "NZDUSD=X", "EURGBP=X", "EURJPY=X", "GBPJPY=X",
+        "AUDJPY=X", "AUDNZD=X", "CADJPY=X", "CHFJPY=X", "EURAUD=X",
+        "EURCHF=X", "EURCAD=X", "EURNZD=X", "GBPAUD=X", "GBPCHF=X",
+        "GBPCAD=X", "GBPNZD=X", "NZDJPY=X", "AUDCAD=X", "CADCHF=X",
+    },
+    "crypto": {
+        "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "ADA-USD",
+        "DOGE-USD", "LTC-USD", "DOT-USD", "AVAX-USD", "MATIC-USD",
+    },
+    "index_us": {
+        "^GSPC", "^NDX", "^DJI", "^RUT", "^VIX",
+    },
+    "index_eu": {
+        "^GDAXI", "^FTSE", "^FCHI", "^STOXX50E", "^AEX",
+    },
+    "index_asia": {
+        "^N225", "^HSI", "^SSEC", "^KS11", "^TWII",
+    },
+    "commodity": {
+        "GC=F", "SI=F", "CL=F", "BZ=F", "NG=F",
+        "HG=F", "PL=F", "PA=F", "ZW=F", "ZC=F",
+    },
+}
+
+
+def is_blacklisted(ticker: str) -> bool:
+    """Vérifie si un ticker est blacklisté."""
+    ticker_upper = ticker.upper()
+    
+    for bl in TICKER_BLACKLIST:
+        if bl in ticker_upper:
+            return True
+    
+    return False
+
+
+def count_raw_signals(
+    df: pd.DataFrame,
+    cfg: Config,
+    split_ratio: float = 0.7,
+) -> int:
+    """
+    Compte les signaux bruts potentiels sur l'IS.
+    
+    Signaux bruts = breakouts Donchian sans filtre EMA ni volatilité.
+    C'est une estimation rapide, pas le nombre exact de trades.
+    
+    Args:
+        df: DataFrame 4H avec OHLCV
+        cfg: Configuration
+        split_ratio: Ratio IS
+    
+    Returns:
+        Nombre de signaux bruts
+    """
+    if len(df) < 100:
+        return 0
+    
+    # Prendre uniquement IS
+    cut = int(len(df) * split_ratio)
+    df_is = df.iloc[:cut].copy()
+    
+    if len(df_is) < 50:
+        return 0
+    
+    # Donchian simple
+    n = cfg.donchian_n if hasattr(cfg, "donchian_n") else 20
+    
+    high_max = df_is["High"].rolling(n).max().shift(1)
+    low_min = df_is["Low"].rolling(n).min().shift(1)
+    
+    # Breakouts
+    breakout_up = df_is["Close"] > high_max
+    breakout_down = df_is["Close"] < low_min
+    
+    return int(breakout_up.sum() + breakout_down.sum())
+
+
+def compute_atr_ratio(df: pd.DataFrame, period: int = 14) -> float:
+    """
+    Calcule l'ATR ratio moyen (ATR / Close).
+    
+    Args:
+        df: DataFrame avec OHLCV
+        period: Période ATR
+    
+    Returns:
+        ATR ratio moyen
+    """
+    if len(df) < period + 10:
+        return 0.0
+    
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+    
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    
+    atr = tr.rolling(period).mean()
+    atr_ratio = (atr / close).dropna()
+    
+    return float(atr_ratio.mean()) if len(atr_ratio) > 0 else 0.0
+
+
+def prefilter_ticker(
+    ticker: str,
+    df_4h: pd.DataFrame,
+    cfg: Config,
+    prefilter_cfg: PrefilterConfig | None = None,
+) -> PrefilterResult:
+    """
+    Applique le pré-filtre sur un ticker.
+    
+    Args:
+        ticker: Symbole
+        df_4h: DataFrame 4H
+        cfg: Configuration backtest
+        prefilter_cfg: Configuration pré-filtre
+    
+    Returns:
+        PrefilterResult
+    """
+    if prefilter_cfg is None:
+        prefilter_cfg = PrefilterConfig.from_env()
+    
+    # 1. Blacklist
+    if is_blacklisted(ticker):
+        return PrefilterResult(
+            ticker=ticker,
+            passed=False,
+            reason="blacklisted",
+        )
+    
+    # 2. Données vides
+    if df_4h is None or len(df_4h) == 0:
+        return PrefilterResult(
+            ticker=ticker,
+            passed=False,
+            reason="no data",
+        )
+    
+    bars = len(df_4h)
+    
+    # 3. Minimum de barres
+    if bars < prefilter_cfg.min_bars_4h:
+        return PrefilterResult(
+            ticker=ticker,
+            passed=False,
+            reason=f"insufficient bars ({bars} < {prefilter_cfg.min_bars_4h})",
+            bars_4h=bars,
+        )
+    
+    # 4. ATR ratio
+    atr_ratio = compute_atr_ratio(df_4h)
+    
+    if atr_ratio < prefilter_cfg.min_atr_ratio:
+        return PrefilterResult(
+            ticker=ticker,
+            passed=False,
+            reason=f"low volatility (ATR {atr_ratio*100:.3f}% < {prefilter_cfg.min_atr_ratio*100:.2f}%)",
+            bars_4h=bars,
+            atr_ratio=atr_ratio,
+        )
+    
+    # 5. Signaux bruts
+    raw_signals = count_raw_signals(df_4h, cfg)
+    
+    if raw_signals < prefilter_cfg.min_raw_signals_is:
+        return PrefilterResult(
+            ticker=ticker,
+            passed=False,
+            reason=f"insufficient signals ({raw_signals} < {prefilter_cfg.min_raw_signals_is})",
+            bars_4h=bars,
+            atr_ratio=atr_ratio,
+            raw_signals=raw_signals,
+        )
+    
+    # Passé !
+    return PrefilterResult(
+        ticker=ticker,
+        passed=True,
+        reason="OK",
+        bars_4h=bars,
+        atr_ratio=atr_ratio,
+        raw_signals=raw_signals,
+    )
+
+
+def prefilter_batch(
+    tickers: list[str],
+    data_loader: callable,
+    cfg: Config,
+    prefilter_cfg: PrefilterConfig | None = None,
+    verbose: bool = False,
+) -> tuple[list[str], list[PrefilterResult]]:
+    """
+    Applique le pré-filtre sur une liste de tickers.
+    
+    Args:
+        tickers: Liste de tickers
+        data_loader: Fonction (ticker) -> DataFrame 4H
+        cfg: Configuration
+        prefilter_cfg: Configuration pré-filtre
+        verbose: Afficher les détails
+    
+    Returns:
+        Tuple (tickers_passés, tous_résultats)
+    """
+    if prefilter_cfg is None:
+        prefilter_cfg = PrefilterConfig.from_env()
+    
+    results = []
+    passed = []
+    
+    for ticker in tickers:
+        try:
+            df_4h = data_loader(ticker)
+            result = prefilter_ticker(ticker, df_4h, cfg, prefilter_cfg)
+        except Exception as e:
+            result = PrefilterResult(
+                ticker=ticker,
+                passed=False,
+                reason=f"error: {e}",
+            )
+        
+        results.append(result)
+        
+        if result.passed:
+            passed.append(ticker)
+        
+        if verbose:
+            print(result)
+    
+    return passed, results
+
+
+def export_prefilter_results(
+    results: list[PrefilterResult],
+    output_path: Path | str,
+) -> None:
+    """
+    Exporte les résultats du pré-filtre.
+    
+    Args:
+        results: Liste de PrefilterResult
+        output_path: Chemin de sortie (CSV)
+    """
+    data = [
+        {
+            "ticker": r.ticker,
+            "passed": r.passed,
+            "reason": r.reason,
+            "bars_4h": r.bars_4h,
+            "atr_ratio": r.atr_ratio,
+            "raw_signals": r.raw_signals,
+        }
+        for r in results
+    ]
+    
+    df = pd.DataFrame(data)
+    df.to_csv(output_path, index=False)
+
+
+
+./envolees/profiles.py
+────────────────────────────────────────────────────────────
+
+"""
+Profils de trading (challenge, funded, etc.).
+
+Un profil définit les paramètres de risque et de sélection par défaut.
+Les variables d'environnement peuvent surcharger ces valeurs.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from typing import Literal
+
+
+ProfileName = Literal["challenge", "funded", "conservative", "aggressive", "default"]
+
+
+@dataclass
+class Profile:
+    """Profil de trading avec paramètres de risque."""
+    
+    name: ProfileName
+    description: str
+    
+    # Risque par trade
+    risk_per_trade: float = 0.0025  # 0.25%
+    
+    # Budget risque journalier
+    daily_risk_budget: float = 0.015  # 1.5%
+    
+    # Limites
+    max_concurrent_trades: int = 4
+    stop_after_n_losses: int = 3
+    
+    # Shortlist
+    shortlist_min_score: float = 0.0
+    shortlist_max_tickers: int = 10
+    min_trades_oos: int = 15
+    dd_cap: float = 0.012  # 1.2%
+    
+    # Pénalités préférées
+    preferred_penalties: tuple[float, ...] = (0.15, 0.20, 0.25)
+    
+    # Cache
+    cache_max_age_hours: float = 24.0
+
+
+# Profils prédéfinis
+PROFILES: dict[ProfileName, Profile] = {
+    "challenge": Profile(
+        name="challenge",
+        description="Challenge prop firm (vitesse 5-10%)",
+        risk_per_trade=0.006,  # 0.6%
+        daily_risk_budget=0.015,  # 1.5%
+        max_concurrent_trades=4,
+        stop_after_n_losses=3,
+        shortlist_min_score=0.62,
+        shortlist_max_tickers=5,
+        min_trades_oos=15,
+        dd_cap=0.012,
+        preferred_penalties=(0.15, 0.20, 0.25),
+        cache_max_age_hours=12.0,
+    ),
+    "funded": Profile(
+        name="funded",
+        description="Compte funded (robustesse)",
+        risk_per_trade=0.003,  # 0.3%
+        daily_risk_budget=0.006,  # 0.6%
+        max_concurrent_trades=2,
+        stop_after_n_losses=2,
+        shortlist_min_score=0.66,
+        shortlist_max_tickers=4,
+        min_trades_oos=15,
+        dd_cap=0.010,
+        preferred_penalties=(0.20, 0.25),
+        cache_max_age_hours=24.0,
+    ),
+    "conservative": Profile(
+        name="conservative",
+        description="Ultra-conservateur",
+        risk_per_trade=0.002,  # 0.2%
+        daily_risk_budget=0.004,  # 0.4%
+        max_concurrent_trades=1,
+        stop_after_n_losses=1,
+        shortlist_min_score=0.70,
+        shortlist_max_tickers=3,
+        min_trades_oos=20,
+        dd_cap=0.008,
+        preferred_penalties=(0.25,),
+        cache_max_age_hours=24.0,
+    ),
+    "aggressive": Profile(
+        name="aggressive",
+        description="Agressif (casino)",
+        risk_per_trade=0.010,  # 1%
+        daily_risk_budget=0.030,  # 3%
+        max_concurrent_trades=6,
+        stop_after_n_losses=5,
+        shortlist_min_score=0.50,
+        shortlist_max_tickers=8,
+        min_trades_oos=10,
+        dd_cap=0.020,
+        preferred_penalties=(0.10, 0.15, 0.20),
+        cache_max_age_hours=12.0,
+    ),
+    "default": Profile(
+        name="default",
+        description="Profil par défaut (équilibré)",
+        risk_per_trade=0.0025,
+        daily_risk_budget=0.010,
+        max_concurrent_trades=3,
+        stop_after_n_losses=2,
+        shortlist_min_score=0.0,
+        shortlist_max_tickers=10,
+        min_trades_oos=15,
+        dd_cap=0.012,
+        preferred_penalties=(0.15, 0.20, 0.25),
+        cache_max_age_hours=24.0,
+    ),
+}
+
+
+def get_profile(name: str | None = None) -> Profile:
+    """
+    Retourne un profil par son nom.
+    
+    Args:
+        name: Nom du profil (challenge, funded, etc.)
+              Si None, lit PROFILE depuis l'environnement
+    
+    Returns:
+        Profile correspondant (ou default si non trouvé)
+    """
+    if name is None:
+        name = os.getenv("PROFILE", "default").lower().strip()
+    
+    return PROFILES.get(name, PROFILES["default"])
+
+
+def get_effective_value(
+    env_var: str,
+    profile_attr: str,
+    profile: Profile | None = None,
+    type_cast: type = float,
+) -> float | int | str:
+    """
+    Retourne la valeur effective (env override ou profil).
+    
+    Ordre de priorité :
+    1. Variable d'environnement si définie
+    2. Valeur du profil
+    
+    Args:
+        env_var: Nom de la variable d'environnement
+        profile_attr: Attribut du profil
+        profile: Profil à utiliser (ou auto-détecté)
+        type_cast: Type de la valeur (float, int, str)
+    
+    Returns:
+        Valeur effective
+    """
+    if profile is None:
+        profile = get_profile()
+    
+    env_value = os.getenv(env_var)
+    
+    if env_value is not None:
+        return type_cast(env_value)
+    
+    return getattr(profile, profile_attr, None)
+
+
+def get_profile_summary(profile: Profile | None = None) -> dict:
+    """
+    Retourne un résumé du profil actif avec les valeurs effectives.
+    
+    Utile pour les logs et alertes.
+    """
+    if profile is None:
+        profile = get_profile()
+    
+    return {
+        "name": profile.name,
+        "description": profile.description,
+        "risk_per_trade": get_effective_value("RISK_PER_TRADE", "risk_per_trade", profile),
+        "daily_risk_budget": get_effective_value("DAILY_RISK_BUDGET", "daily_risk_budget", profile),
+        "max_concurrent_trades": get_effective_value("MAX_CONCURRENT_TRADES", "max_concurrent_trades", profile, int),
+        "stop_after_n_losses": get_effective_value("STOP_AFTER_N_LOSSES", "stop_after_n_losses", profile, int),
+        "shortlist_min_score": get_effective_value("SHORTLIST_MIN_SCORE", "shortlist_min_score", profile),
+        "shortlist_max_tickers": get_effective_value("SHORTLIST_MAX_TICKERS", "shortlist_max_tickers", profile, int),
+        "min_trades_oos": get_effective_value("MIN_TRADES_OOS", "min_trades_oos", profile, int),
+        "dd_cap": get_effective_value("DD_CAP", "dd_cap", profile),
+    }
+
+
+def format_profile_for_alert(profile: Profile | None = None) -> str:
+    """Formate le profil pour inclusion dans une alerte."""
+    summary = get_profile_summary(profile)
+    
+    return (
+        f"Profil: {summary['name']} ({summary['description']})\n"
+        f"Risque/trade: {summary['risk_per_trade']*100:.2f}%\n"
+        f"Budget/jour: {summary['daily_risk_budget']*100:.2f}%\n"
+        f"Max trades: {summary['max_concurrent_trades']}\n"
+        f"Stop après: {summary['stop_after_n_losses']} pertes"
+    )
+
+
+
+./envolees/secrets.py
+────────────────────────────────────────────────────────────
+
+"""
+Gestion sécurisée des secrets.
+
+Charge les secrets depuis .env.secret (prioritaire sur .env).
+Vérifie que les variables sensibles ne sont pas dans .env (committé).
+"""
+
+from __future__ import annotations
+
+import os
+import stat
+from pathlib import Path
+from typing import Any
+
+from dotenv import dotenv_values
+
+
+# Variables considérées comme sensibles (ne doivent pas être dans .env)
+SENSITIVE_VARIABLES = {
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID",
+    "NTFY_TOPIC",  # Peut être sensible si public
+    "API_KEY",
+    "API_SECRET",
+    "CTRADER_CLIENT_ID",
+    "CTRADER_CLIENT_SECRET",
+    "CTRADER_ACCESS_TOKEN",
+    "TRADELOCKER_API_KEY",
+    "TRADELOCKER_SECRET",
+    "DATABASE_PASSWORD",
+    "DB_PASSWORD",
+}
+
+# Fichiers de secrets possibles (ordre de priorité)
+SECRET_FILES = [
+    ".env.secret",
+    ".secrets",
+    ".env.local",
+]
+
+
+class SecretsManager:
+    """Gestionnaire de secrets sécurisé."""
+    
+    def __init__(self, project_root: Path | None = None) -> None:
+        """
+        Initialise le gestionnaire.
+        
+        Args:
+            project_root: Racine du projet (détectée auto si None)
+        """
+        if project_root is None:
+            project_root = Path(__file__).resolve().parent.parent
+        
+        self.project_root = project_root
+        self.env_path = project_root / ".env"
+        self.secret_path = self._find_secret_file()
+        self.secrets: dict[str, str] = {}
+        self.warnings: list[str] = []
+        
+        self._load_secrets()
+        self._check_security()
+    
+    def _find_secret_file(self) -> Path | None:
+        """Trouve le fichier de secrets."""
+        for name in SECRET_FILES:
+            path = self.project_root / name
+            if path.exists():
+                return path
+        return None
+    
+    def _load_secrets(self) -> None:
+        """Charge les secrets depuis le fichier."""
+        if self.secret_path and self.secret_path.exists():
+            self.secrets = dotenv_values(self.secret_path)
+    
+    def _check_security(self) -> None:
+        """Vérifie la sécurité de la configuration."""
+        # 1. Vérifier les permissions du fichier secret
+        if self.secret_path and self.secret_path.exists():
+            mode = self.secret_path.stat().st_mode
+            
+            # Devrait être 600 (lecture/écriture uniquement pour le propriétaire)
+            if mode & stat.S_IRWXG or mode & stat.S_IRWXO:
+                self.warnings.append(
+                    f"⚠️ {self.secret_path.name} a des permissions trop permissives. "
+                    f"Exécuter: chmod 600 {self.secret_path.name}"
+                )
+        
+        # 2. Vérifier que les variables sensibles ne sont pas dans .env
+        if self.env_path.exists():
+            env_values = dotenv_values(self.env_path)
+            
+            for var in SENSITIVE_VARIABLES:
+                if var in env_values and env_values[var]:
+                    self.warnings.append(
+                        f"🔴 SÉCURITÉ: {var} est défini dans .env ! "
+                        f"Déplacer vers .env.secret"
+                    )
+    
+    def get(self, key: str, default: str | None = None) -> str | None:
+        """
+        Récupère une valeur (secret > env > default).
+        
+        Args:
+            key: Nom de la variable
+            default: Valeur par défaut
+        
+        Returns:
+            Valeur ou default
+        """
+        # 1. Secret (prioritaire)
+        if key in self.secrets:
+            return self.secrets[key]
+        
+        # 2. Environnement
+        env_value = os.getenv(key)
+        if env_value is not None:
+            return env_value
+        
+        # 3. Default
+        return default
+    
+    def has_warnings(self) -> bool:
+        """Retourne True si des warnings de sécurité existent."""
+        return len(self.warnings) > 0
+    
+    def get_warnings(self) -> list[str]:
+        """Retourne la liste des warnings."""
+        return self.warnings.copy()
+    
+    def print_warnings(self) -> None:
+        """Affiche les warnings."""
+        for w in self.warnings:
+            print(w)
+    
+    def check_critical(self, fail_on_warnings: bool = False) -> bool:
+        """
+        Vérifie les problèmes critiques.
+        
+        Args:
+            fail_on_warnings: Si True, considère les warnings comme critiques
+        
+        Returns:
+            True si OK, False sinon
+        """
+        # Vérifier les variables sensibles dans .env
+        if self.env_path.exists():
+            env_values = dotenv_values(self.env_path)
+            
+            for var in SENSITIVE_VARIABLES:
+                if var in env_values and env_values[var]:
+                    return False
+        
+        if fail_on_warnings and self.has_warnings():
+            return False
+        
+        return True
+
+
+def load_secrets(project_root: Path | None = None) -> SecretsManager:
+    """
+    Charge les secrets et retourne le manager.
+    
+    Usage:
+        secrets = load_secrets()
+        token = secrets.get("TELEGRAM_BOT_TOKEN")
+        
+        if secrets.has_warnings():
+            secrets.print_warnings()
+    """
+    return SecretsManager(project_root)
+
+
+def check_env_security(project_root: Path | None = None, strict: bool = False) -> bool:
+    """
+    Vérifie la sécurité de la configuration.
+    
+    Args:
+        project_root: Racine du projet
+        strict: Si True, échoue sur tout warning
+    
+    Returns:
+        True si OK
+    
+    Raises:
+        SecurityError: Si problème critique en mode strict
+    """
+    secrets = load_secrets(project_root)
+    
+    if not secrets.check_critical(fail_on_warnings=strict):
+        secrets.print_warnings()
+        if strict:
+            raise SecurityError("Configuration non sécurisée")
+        return False
+    
+    if secrets.has_warnings():
+        secrets.print_warnings()
+    
+    return True
+
+
+class SecurityError(Exception):
+    """Erreur de sécurité de configuration."""
+    pass
+
+
+# Template pour .env.secret.example
+ENV_SECRET_TEMPLATE = """# =============================================================================
+# SECRETS - NE PAS COMMITER CE FICHIER
+# =============================================================================
+# Copier vers .env.secret et remplir les valeurs
+# chmod 600 .env.secret
+
+# -----------------------------------------------------------------------------
+# Alertes
+# -----------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+NTFY_TOPIC=
+
+# -----------------------------------------------------------------------------
+# API Trading (pour plus tard)
+# -----------------------------------------------------------------------------
+# CTRADER_CLIENT_ID=
+# CTRADER_CLIENT_SECRET=
+# CTRADER_ACCESS_TOKEN=
+
+# TRADELOCKER_API_KEY=
+# TRADELOCKER_SECRET=
+"""
+
+
+def create_secret_template(project_root: Path | None = None) -> Path:
+    """
+    Crée un template .env.secret.example.
+    
+    Returns:
+        Chemin du fichier créé
+    """
+    if project_root is None:
+        project_root = Path(__file__).resolve().parent.parent
+    
+    path = project_root / ".env.secret.example"
+    path.write_text(ENV_SECRET_TEMPLATE)
+    
+    return path
+
+
+
+./envolees/split.py
+────────────────────────────────────────────────────────────
+
+"""
+Split temporel des données pour validation In-Sample / Out-of-Sample.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Literal
+
+import pandas as pd
+
+if TYPE_CHECKING:
+    from envolees.config import Config
+
+
+SplitMode = Literal["", "none", "time"]
+SplitTarget = Literal["", "is", "oos"]
+
+
+@dataclass
+class SplitInfo:
+    """Information sur le split appliqué."""
+    
+    mode: str
+    target: str
+    ratio: float
+    original_bars: int
+    split_bars: int
+    date_start: str
+    date_end: str
+    
+    def __str__(self) -> str:
+        if self.mode in ("", "none"):
+            return f"No split ({self.original_bars} bars)"
+        return (
+            f"Split {self.mode} {self.ratio:.0%} → {self.target.upper()} "
+            f"({self.split_bars}/{self.original_bars} bars, "
+            f"{self.date_start} → {self.date_end})"
+        )
+
+
+def split_df_time(
+    df: pd.DataFrame,
+    ratio: float,
+    target: SplitTarget,
+) -> tuple[pd.DataFrame, SplitInfo]:
+    """
+    Split temporel sur l'index du DataFrame.
+    
+    Args:
+        df: DataFrame avec index DatetimeIndex (trié croissant)
+        ratio: Proportion pour l'in-sample (ex: 0.7 = 70% IS, 30% OOS)
+        target: "is" pour in-sample, "oos" pour out-of-sample
+    
+    Returns:
+        Tuple (DataFrame splitté, SplitInfo)
+    """
+    if df is None or len(df) == 0:
+        return df, SplitInfo(
+            mode="none",
+            target="",
+            ratio=ratio,
+            original_bars=0,
+            split_bars=0,
+            date_start="",
+            date_end="",
+        )
+    
+    # S'assurer que l'index est trié
+    df = df.sort_index()
+    original_bars = len(df)
+    
+    # Point de coupure
+    cut = int(len(df) * ratio)
+    
+    if cut <= 0 or cut >= len(df):
+        # Ratio trop extrême, retourner tout
+        return df, SplitInfo(
+            mode="time",
+            target=target or "all",
+            ratio=ratio,
+            original_bars=original_bars,
+            split_bars=original_bars,
+            date_start=str(df.index.min()),
+            date_end=str(df.index.max()),
+        )
+    
+    # Appliquer le split
+    if target == "oos":
+        result = df.iloc[cut:].copy()
+    else:  # "is" ou défaut
+        result = df.iloc[:cut].copy()
+    
+    return result, SplitInfo(
+        mode="time",
+        target=target or "is",
+        ratio=ratio,
+        original_bars=original_bars,
+        split_bars=len(result),
+        date_start=str(result.index.min()),
+        date_end=str(result.index.max()),
+    )
+
+
+def apply_split(
+    df: pd.DataFrame,
+    cfg: Config,
+) -> tuple[pd.DataFrame, SplitInfo | None]:
+    """
+    Applique le split selon la configuration.
+    
+    Args:
+        df: DataFrame avec données OHLCV
+        cfg: Configuration contenant split_mode, split_ratio, split_target
+    
+    Returns:
+        Tuple (DataFrame splitté ou original, SplitInfo ou None)
+    """
+    mode = getattr(cfg, "split_mode", "").strip().lower()
+    target = getattr(cfg, "split_target", "").strip().lower()
+    
+    # Si split_target est défini mais pas split_mode, inférer "time"
+    if target in ("is", "oos") and mode in ("", "none"):
+        mode = "time"
+    
+    if mode in ("", "none"):
+        return df, None
+    
+    if mode == "time":
+        ratio = getattr(cfg, "split_ratio", 0.7)
+        
+        # Valider le target
+        if target not in ("is", "oos"):
+            target = "is"
+        
+        return split_df_time(df, ratio, target)
+    
+    # Mode non reconnu
+    return df, None
+
+
+def get_split_boundaries(
+    df: pd.DataFrame,
+    ratio: float,
+) -> dict:
+    """
+    Retourne les frontières du split sans l'appliquer.
+    
+    Utile pour afficher les dates IS/OOS avant de choisir.
+    
+    Args:
+        df: DataFrame avec données
+        ratio: Proportion IS (ex: 0.7)
+    
+    Returns:
+        Dict avec dates de début/fin pour IS et OOS
+    """
+    if df is None or len(df) == 0:
+        return {"is": None, "oos": None}
+    
+    df = df.sort_index()
+    cut = int(len(df) * ratio)
+    
+    return {
+        "is": {
+            "start": str(df.index[0]),
+            "end": str(df.index[cut - 1]) if cut > 0 else None,
+            "bars": cut,
+        },
+        "oos": {
+            "start": str(df.index[cut]) if cut < len(df) else None,
+            "end": str(df.index[-1]),
+            "bars": len(df) - cut,
+        },
+        "total_bars": len(df),
+        "ratio": ratio,
+    }
+
+
+
+./envolees/alerts.py
+────────────────────────────────────────────────────────────
+
+"""
+Système d'alertes pour Envolées.
+
+Trois niveaux :
+- Heartbeat : signal de vie sobre (1x/jour max)
+- Status : infos consultables sur demande
+- Alert : vraies alertes rares mais importantes
+
+Canaux :
+- ntfy : heartbeat + alertes (push léger)
+- Telegram : status + alertes (détaillé)
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+
+@dataclass
+class AlertConfig:
+    """Configuration des alertes."""
+    
+    # ntfy (léger, push)
+    ntfy_enabled: bool = False
+    ntfy_server: str = "https://ntfy.sh"
+    ntfy_topic: str = ""
+    ntfy_token: str = ""  # Optionnel, pour serveurs authentifiés
+    
+    # Telegram (détaillé)
+    telegram_enabled: bool = False
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    
+    # Profil
+    profile: str = "default"
+    
+    # Heartbeat
+    heartbeat_enabled: bool = True
+    
+    @classmethod
+    def from_env(cls) -> AlertConfig:
+        """Charge la config depuis l'environnement."""
+        ntfy_topic = os.getenv("NTFY_TOPIC", "")
+        telegram_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+        
+        return cls(
+            ntfy_enabled=bool(ntfy_topic),
+            ntfy_server=os.getenv("NTFY_SERVER", "https://ntfy.sh"),
+            ntfy_topic=ntfy_topic,
+            ntfy_token=os.getenv("NTFY_TOKEN", ""),
+            telegram_enabled=bool(telegram_token),
+            telegram_bot_token=telegram_token,
+            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID", ""),
+            profile=os.getenv("PROFILE", os.getenv("RISK_MODE", "default")),
+            heartbeat_enabled=os.getenv("HEARTBEAT", "on").lower() not in ("off", "false", "0", "no"),
+        )
+
+
+@dataclass
+class SystemStatus:
+    """État du système pour status/heartbeat."""
+    
+    profile: str = "default"
+    timestamp: datetime = field(default_factory=datetime.now)
+    
+    # État cache
+    cache_ok: bool = True
+    cache_issues: list[str] = field(default_factory=list)
+    last_data_update: str = ""
+    
+    # Shortlist
+    shortlist: list[tuple[str, float]] = field(default_factory=list)  # [(ticker, score), ...]
+    tickers_active: int = 0
+    
+    # Risque
+    daily_budget: float = 0.0
+    daily_consumed: float = 0.0
+    
+    # Performance
+    last_execution_ok: bool = True
+    last_execution_time: str = ""
+
+
+@dataclass
+class TradingStatus:
+    """État courant du trading pour les alertes."""
+    
+    profile: str = "default"
+    timestamp: datetime = field(default_factory=datetime.now)
+    
+    # Budget risque
+    daily_budget: float = 0.0
+    daily_consumed: float = 0.0
+    
+    # Positions
+    open_trades: int = 0
+    total_exposure_r: float = 0.0
+    max_position_r: float = 0.0
+    max_position_ticker: str = ""
+    
+    # Ordres
+    pending_orders: int = 0
+    
+    # Événements session
+    entries: int = 0
+    exits_tp: int = 0
+    exits_sl: int = 0
+    cancellations: int = 0
+    
+    # Performance
+    pnl_day: float = 0.0
+    dd_day: float = 0.0
+    dd_max: float = 0.0
+    
+    # Anomalies
+    anomalies: list[str] = field(default_factory=list)
+    
+    # Shortlist active
+    shortlist: list[tuple[str, float]] = field(default_factory=list)
+
+
+class AlertSender:
+    """Envoi d'alertes multi-canal avec niveaux séparés."""
+    
+    def __init__(self, config: AlertConfig | None = None) -> None:
+        self.config = config or AlertConfig.from_env()
+    
+    def _send_ntfy(
+        self,
+        title: str,
+        message: str,
+        priority: int = 3,
+        tags: list[str] | None = None,
+    ) -> bool:
+        """Envoie via ntfy."""
+        if not HAS_REQUESTS or not self.config.ntfy_enabled:
+            return False
+        
+        try:
+            url = f"{self.config.ntfy_server}/{self.config.ntfy_topic}"
+            headers = {
+                "Title": title,
+                "Priority": str(priority),
+            }
+            
+            if tags:
+                headers["Tags"] = ",".join(tags)
+            
+            if self.config.ntfy_token:
+                headers["Authorization"] = f"Bearer {self.config.ntfy_token}"
+            
+            response = requests.post(
+                url,
+                data=message.encode("utf-8"),
+                headers=headers,
+                timeout=10,
+            )
+            return response.status_code == 200
+        except Exception as e:
+            print(f"[alert] ntfy error: {e}")
+            return False
+    
+    def _send_telegram(self, message: str, parse_mode: str = "Markdown") -> bool:
+        """Envoie via Telegram."""
+        if not HAS_REQUESTS or not self.config.telegram_enabled:
+            return False
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
+            response = requests.post(
+                url,
+                json={
+                    "chat_id": self.config.telegram_chat_id,
+                    "text": message,
+                    "parse_mode": parse_mode,
+                    "disable_notification": True,  # Silencieux par défaut
+                },
+                timeout=10,
+            )
+            return response.status_code == 200
+        except Exception as e:
+            print(f"[alert] telegram error: {e}")
+            return False
+    
+    # =========================================================================
+    # HEARTBEAT (signal de vie)
+    # =========================================================================
+    
+    def send_heartbeat(self, status: SystemStatus) -> dict[str, bool]:
+        """
+        Envoie un heartbeat sobre (1x/jour max).
+        
+        Ne contient PAS de chiffres anxiogènes.
+        """
+        if not self.config.heartbeat_enabled:
+            return {}
+        
+        results = {}
+        
+        # Message court pour ntfy
+        if self.config.ntfy_enabled:
+            message = f"Envolées — tout va bien\nCache OK, dernière exécution OK"
+            if not status.cache_ok:
+                message = f"Envolées — attention cache\n{len(status.cache_issues)} problème(s)"
+            
+            results["ntfy"] = self._send_ntfy(
+                title=f"💚 Envolées {status.profile}",
+                message=message,
+                priority=1,  # Très basse priorité
+                tags=["white_check_mark"] if status.cache_ok else ["warning"],
+            )
+        
+        return results
+    
+    # =========================================================================
+    # STATUS (info consultable)
+    # =========================================================================
+    
+    def send_status(self, status: SystemStatus) -> dict[str, bool]:
+        """
+        Envoie un status détaillé (sur demande ou 1x/jour).
+        
+        Telegram silencieux.
+        """
+        results = {}
+        
+        if self.config.telegram_enabled:
+            lines = [
+                f"📊 *Envolées — état*",
+                f"Mode: {status.profile}",
+                "",
+            ]
+            
+            # Shortlist
+            if status.shortlist:
+                lines.append(f"Tickers actifs: {status.tickers_active}")
+                sl_str = ", ".join(f"{t}" for t, _ in status.shortlist[:5])
+                lines.append(f"Shortlist: {sl_str}")
+            else:
+                lines.append("Aucun ticker actif")
+            
+            lines.append("")
+            
+            # Risque
+            budget_remaining = status.daily_budget - status.daily_consumed
+            lines.append(
+                f"Budget jour: {status.daily_consumed*100:.1f}% / {status.daily_budget*100:.1f}%"
+            )
+            
+            # Cache
+            lines.append("")
+            if status.cache_ok:
+                lines.append("✓ Cache OK")
+            else:
+                lines.append(f"⚠ Cache: {len(status.cache_issues)} problème(s)")
+            
+            if status.last_data_update:
+                lines.append(f"Dernières données: {status.last_data_update}")
+            
+            # Dernière exécution
+            if status.last_execution_time:
+                emoji = "✓" if status.last_execution_ok else "✗"
+                lines.append(f"{emoji} Dernière exécution: {status.last_execution_time}")
+            
+            results["telegram"] = self._send_telegram("\n".join(lines))
+        
+        return results
+    
+    # =========================================================================
+    # ALERTES (vraies alertes, rares)
+    # =========================================================================
+    
+    def send_alert(
+        self,
+        title: str,
+        message: str,
+        level: str = "warning",  # info, warning, critical
+        telegram_message: str | None = None,
+    ) -> dict[str, bool]:
+        """
+        Envoie une vraie alerte (rare mais importante).
+        
+        Args:
+            title: Titre
+            message: Message court (ntfy)
+            level: info, warning, critical
+            telegram_message: Message long (telegram)
+        """
+        results = {}
+        
+        # Priorité ntfy selon level
+        priority_map = {"info": 2, "warning": 4, "critical": 5}
+        priority = priority_map.get(level, 3)
+        
+        # Tags ntfy
+        tags_map = {
+            "info": ["information_source"],
+            "warning": ["warning"],
+            "critical": ["rotating_light", "warning"],
+        }
+        tags = tags_map.get(level, [])
+        
+        if self.config.ntfy_enabled:
+            results["ntfy"] = self._send_ntfy(
+                title=title,
+                message=message,
+                priority=priority,
+                tags=tags,
+            )
+        
+        if self.config.telegram_enabled:
+            # Pour Telegram, activer la notification si critical
+            if level == "critical":
+                # Re-envoyer avec notification activée
+                try:
+                    url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
+                    requests.post(
+                        url,
+                        json={
+                            "chat_id": self.config.telegram_chat_id,
+                            "text": telegram_message or message,
+                            "parse_mode": "Markdown",
+                            "disable_notification": False,
+                        },
+                        timeout=10,
+                    )
+                    results["telegram"] = True
+                except Exception:
+                    results["telegram"] = False
+            else:
+                results["telegram"] = self._send_telegram(telegram_message or message)
+        
+        return results
+    
+    # =========================================================================
+    # ALERTES SPÉCIFIQUES
+    # =========================================================================
+    
+    def alert_dd_warning(self, current_dd: float, limit: float, profile: str) -> dict[str, bool]:
+        """Alerte dépassement DD."""
+        pct_used = (current_dd / limit) * 100 if limit > 0 else 0
+        
+        return self.send_alert(
+            title=f"⚠ Envolées {profile} — DD",
+            message=f"Budget risque {pct_used:.0f}% utilisé ({current_dd*100:.2f}% / {limit*100:.1f}%)",
+            level="warning" if pct_used < 90 else "critical",
+            telegram_message=(
+                f"⚠️ *Envolées — alerte DD*\n\n"
+                f"Profil: {profile}\n"
+                f"Budget jour: {current_dd*100:.2f}% / {limit*100:.1f}%\n"
+                f"Utilisation: {pct_used:.0f}%\n\n"
+                f"{'Trading suspendu pour la journée' if pct_used >= 100 else 'Attention au risque'}"
+            ),
+        )
+    
+    def alert_cache_error(self, issues: list[str], profile: str) -> dict[str, bool]:
+        """Alerte erreur cache."""
+        return self.send_alert(
+            title=f"⚠ Envolées {profile} — Cache",
+            message=f"{len(issues)} problème(s) de données",
+            level="warning",
+            telegram_message=(
+                f"⚠️ *Envolées — alerte cache*\n\n"
+                f"Profil: {profile}\n"
+                f"Problèmes:\n" + "\n".join(f"  • {i}" for i in issues[:5])
+            ),
+        )
+    
+    def alert_shortlist_change(
+        self,
+        removed: list[str],
+        added: list[str],
+        profile: str,
+    ) -> dict[str, bool]:
+        """Alerte changement de shortlist."""
+        if not removed and not added:
+            return {}
+        
+        parts = []
+        if removed:
+            parts.append(f"Retirés: {', '.join(removed)}")
+        if added:
+            parts.append(f"Ajoutés: {', '.join(added)}")
+        
+        return self.send_alert(
+            title=f"📋 Envolées {profile} — Shortlist",
+            message=" | ".join(parts),
+            level="info",
+            telegram_message=(
+                f"📋 *Envolées — shortlist mise à jour*\n\n"
+                f"Profil: {profile}\n"
+                + (f"➖ Retirés: {', '.join(removed)}\n" if removed else "")
+                + (f"➕ Ajoutés: {', '.join(added)}" if added else "")
+            ),
+        )
+    
+    def alert_no_execution(self, hours: int, profile: str) -> dict[str, bool]:
+        """Alerte aucune exécution depuis N heures."""
+        return self.send_alert(
+            title=f"⚠ Envolées {profile} — Inactif",
+            message=f"Aucune exécution depuis {hours}h",
+            level="warning",
+            telegram_message=(
+                f"⚠️ *Envolées — système inactif*\n\n"
+                f"Profil: {profile}\n"
+                f"Aucune exécution depuis {hours} heures\n\n"
+                f"Vérifier : cache, données, état du système"
+            ),
+        )
+
+
+# =============================================================================
+# FONCTIONS UTILITAIRES
+# =============================================================================
+
+def send_heartbeat_simple(profile: str = "default") -> dict[str, bool]:
+    """Envoie un heartbeat simple."""
+    sender = AlertSender()
+    status = SystemStatus(
+        profile=profile,
+        cache_ok=True,
+        last_execution_ok=True,
+        last_execution_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+    return sender.send_heartbeat(status)
+
+
+def send_status_simple(
+    profile: str,
+    shortlist: list[tuple[str, float]],
+    daily_consumed: float = 0.0,
+    daily_budget: float = 0.015,
+) -> dict[str, bool]:
+    """Envoie un status simple."""
+    sender = AlertSender()
+    status = SystemStatus(
+        profile=profile,
+        shortlist=shortlist,
+        tickers_active=len(shortlist),
+        daily_consumed=daily_consumed,
+        daily_budget=daily_budget,
+        cache_ok=True,
+        last_execution_ok=True,
+        last_execution_time=datetime.now().strftime("%Y-%m-%d %H:%M"),
+    )
+    return sender.send_status(status)
+
+
+# Remplacer la fonction send_backtest_summary dans envolees/alerts.py par celle-ci:
+
+def send_backtest_summary(
+    profile: str,
+    n_tickers: int,
+    n_trades: int,
+    best_ticker: str,
+    best_score: float,
+    validated_count: int,
+    excluded_tickers: list[dict] | None = None,
+    rejection_reasons: dict[str, int] | None = None,
+    shortlist: list[tuple[str, float]] | None = None,
+    tier2: list[tuple[str, float]] | None = None,
+) -> dict[str, bool]:
+    """Envoie un résumé de backtest enrichi.
+    
+    Args:
+        profile: Nom du profil
+        n_tickers: Nombre de tickers testés
+        n_trades: Nombre total de trades OOS
+        best_ticker: Meilleur ticker
+        best_score: Score du meilleur ticker
+        validated_count: Nombre de tickers validés OOS
+        excluded_tickers: Liste des tickers exclus (cache) [{"ticker": "X", "reason": "Y"}]
+        rejection_reasons: Compteur des motifs de rejet OOS {"insufficient_trades": 3, ...}
+        shortlist: Liste Tier 1 ordonnée [(ticker, score), ...]
+        tier2: Liste Tier 2 (Challenge bonus) [(ticker, score), ...]
+    """
+    sender = AlertSender()
+    
+    # Calculer le total
+    tier1_count = len(shortlist) if shortlist else 0
+    tier2_count = len(tier2) if tier2 else 0
+    total_tradable = tier1_count + tier2_count
+    
+    # Message court pour ntfy
+    short_msg = f"{total_tradable}/{n_tickers} tradables"
+    if tier1_count > 0 and tier2_count > 0:
+        short_msg += f" (T1:{tier1_count} T2:{tier2_count})"
+    if best_ticker != "N/A":
+        short_msg += f" | best: {best_ticker}"
+    if excluded_tickers:
+        short_msg += f" | {len(excluded_tickers)} exclus cache"
+    
+    # Message détaillé pour Telegram
+    lines = [
+        f"🔬 *Validation terminée — {profile}*",
+        "",
+    ]
+    
+    # Résumé principal
+    lines.append("📊 *Résultats OOS:*")
+    lines.append(f"  ✓ Tradables: {total_tradable}/{n_tickers}")
+    if n_trades > 0:
+        lines.append(f"  📈 Trades OOS: {n_trades}")
+    
+    # Tickers exclus (cache)
+    if excluded_tickers:
+        lines.append("")
+        lines.append(f"⚠️ *Exclus (cache):* {len(excluded_tickers)}")
+        for exc in excluded_tickers[:3]:  # Max 3
+            lines.append(f"  • {exc['ticker']}: {exc['reason']}")
+        if len(excluded_tickers) > 3:
+            lines.append(f"  • ... +{len(excluded_tickers) - 3} autres")
+    
+    # Motifs de rejet OOS
+    if rejection_reasons:
+        lines.append("")
+        lines.append("📋 *Motifs de rejet OOS:*")
+        for reason, count in sorted(rejection_reasons.items(), key=lambda x: -x[1]):
+            if count > 0:
+                # Traduire les raisons
+                reason_fr = {
+                    "insufficient_trades": "Trades insuffisants",
+                    "degraded": "Dégradation IS→OOS",
+                    "failed": "Critères non atteints",
+                    "dd_exceeded": "DD trop élevé",
+                }.get(reason, reason)
+                lines.append(f"  • {reason_fr}: {count}")
+    
+    # Tier 1 (Funded)
+    if shortlist:
+        lines.append("")
+        lines.append(f"🎯 *Tier 1 — Funded ({tier1_count} instr., ≥15 trades):*")
+        for ticker, score in shortlist[:5]:  # Max 5
+            lines.append(f"  • {ticker} (score {score:.3f})")
+        if tier1_count > 5:
+            lines.append(f"  • ... +{tier1_count - 5} autres")
+    elif validated_count == 0 and not tier2:
+        lines.append("")
+        lines.append("⚠️ *Aucun instrument tradable*")
+    
+    # Tier 2 (Challenge bonus)
+    if tier2:
+        lines.append("")
+        lines.append(f"🎯 *Tier 2 — Challenge bonus ({tier2_count} instr., ≥10 trades):*")
+        for ticker, score in tier2[:5]:  # Max 5
+            lines.append(f"  • {ticker} (score {score:.3f})")
+        if tier2_count > 5:
+            lines.append(f"  • ... +{tier2_count - 5} autres")
+    
+    # Résumé final
+    if total_tradable > 0:
+        lines.append("")
+        lines.append("📋 *Utilisation:*")
+        lines.append(f"  • Funded: Tier 1 seul ({tier1_count} instr.)")
+        lines.append(f"  • Challenge: Tier 1 + 2 ({total_tradable} instr.)")
+    
+    # Meilleur ticker
+    if best_ticker != "N/A":
+        lines.append("")
+        lines.append(f"🏆 *Meilleur:* {best_ticker} (score {best_score:.3f})")
+    
+    telegram_msg = "\n".join(lines)
+    
+    return sender.send_alert(
+        title=f"🔬 Envolées {profile}",
+        message=short_msg,
+        level="info" if total_tradable > 0 else "warning",
+        telegram_message=telegram_msg,
+    )
+
+
+def send_pipeline_summary(
+    profile: str,
+    eligible_tickers: list[str],
+    excluded_tickers: list[dict],
+    validated_tickers: list[str],
+    shortlist: list[tuple[str, float]],
+    rejection_reasons: dict[str, int],
+) -> dict[str, bool]:
+    """Envoie un résumé de pipeline complet."""
+    return send_backtest_summary(
+        profile=profile,
+        n_tickers=len(eligible_tickers),
+        n_trades=0,  # Non utilisé dans ce contexte
+        best_ticker=shortlist[0][0] if shortlist else "N/A",
+        best_score=shortlist[0][1] if shortlist else 0.0,
+        validated_count=len(validated_tickers),
+        excluded_tickers=excluded_tickers,
+        rejection_reasons=rejection_reasons,
+        shortlist=shortlist,
+    )
+
+
+def send_error_alert(profile: str, error: str) -> dict[str, bool]:
+    """Envoie une alerte d'erreur."""
+    sender = AlertSender()
+    return sender.send_alert(
+        title=f"❌ Envolées {profile} — Erreur",
+        message=error[:100],
+        level="critical",
+        telegram_message=f"❌ *Envolées — erreur*\n\nProfil: {profile}\n\n```\n{error}\n```",
+    )
+
+
+# Alias pour compatibilité CLI
+send_heartbeat = send_heartbeat_simple
+
+
+
+
+./envolees/cli.py
+────────────────────────────────────────────────────────────
+
+"""
+CLI pour Envolées.
+"""
+
+from __future__ import annotations
+
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import click
+import pandas as pd
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
+
+from envolees import __version__
+from envolees.backtest import BacktestEngine, BacktestResult
+from envolees.config import Config, get_penalties, get_tickers
+from envolees.data import download_1h, resample_to_4h, cache_stats, clear_cache
+from envolees.output import export_batch_summary, export_result, format_summary_line, export_scoring
+from envolees.split import apply_split, SplitInfo
+from envolees.strategy import DonchianBreakoutStrategy
+
+console = Console()
+
+
+def run_single_backtest(
+    ticker: str,
+    penalty: float,
+    cfg: Config,
+    verbose: bool = False,
+) -> tuple[BacktestResult | None, SplitInfo | None]:
+    """Exécute un backtest pour un ticker et une pénalité."""
+    try:
+        # Téléchargement (avec cache)
+        df_1h = download_1h(
+            ticker,
+            cfg,
+            use_cache=cfg.cache_enabled,
+            cache_max_age_hours=cfg.cache_max_age_hours,
+            verbose=verbose,
+        )
+        df_4h = resample_to_4h(df_1h)
+
+        # Split temporel si configuré
+        df_4h, split_info = apply_split(df_4h, cfg)
+        
+        if split_info and verbose:
+            console.print(f"[dim]   {split_info}[/dim]")
+
+        strategy = DonchianBreakoutStrategy(cfg)
+        engine = BacktestEngine(cfg, strategy, ticker, penalty)
+
+        result = engine.run(df_4h)
+        return result, split_info
+        
+    except Exception as e:
+        console.print(f"[red]✗[/red] {ticker} PEN {penalty:.2f}: {e}")
+        return None, None
+
+
+@click.group()
+@click.version_option(__version__, prog_name="envolees")
+def main() -> None:
+    """🚀 Envolées - Backtest engine for Donchian breakout strategy."""
+    pass
+
+
+@main.command()
+@click.option(
+    "--tickers", "-t",
+    help="Tickers (comma-separated). Uses .env if not specified.",
+)
+@click.option(
+    "--penalties", "-p",
+    help="Execution penalties as ATR multiples (comma-separated). Uses .env if not specified.",
+)
+@click.option(
+    "--output", "-o",
+    default=None,
+    help="Output directory (default: from .env or 'out').",
+)
+@click.option(
+    "--mode",
+    type=click.Choice(["close", "worst"]),
+    default=None,
+    help="Daily equity mode (default: from .env or 'worst').",
+)
+@click.option(
+    "--split",
+    type=click.Choice(["is", "oos", "none"]),
+    default=None,
+    help="Split mode: is=in-sample, oos=out-of-sample, none=all data.",
+)
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    help="Disable data cache (force re-download).",
+)
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    help="Verbose output.",
+)
+def run(
+    tickers: str | None,
+    penalties: str | None,
+    output: str | None,
+    mode: str | None,
+    split: str | None,
+    no_cache: bool,
+    verbose: bool,
+) -> None:
+    """Run backtest on tickers with specified penalties."""
+    cfg = Config.from_env()
+
+    # Override depuis CLI
+    overrides = {}
+    if output:
+        overrides["output_dir"] = output
+    if mode:
+        overrides["daily_equity_mode"] = mode
+    if split:
+        if split == "none":
+            overrides["split_mode"] = ""
+        else:
+            overrides["split_mode"] = "time"
+            overrides["split_target"] = split
+    if no_cache:
+        overrides["cache_enabled"] = False
+    
+    if overrides:
+        # Recréer la config avec les overrides
+        cfg_dict = {
+            "start_balance": cfg.start_balance,
+            "risk_per_trade": cfg.risk_per_trade,
+            "ema_period": cfg.ema_period,
+            "atr_period": cfg.atr_period,
+            "donchian_n": cfg.donchian_n,
+            "buffer_atr": cfg.buffer_atr,
+            "sl_atr": cfg.sl_atr,
+            "tp_r": cfg.tp_r,
+            "vol_quantile": cfg.vol_quantile,
+            "vol_window_bars": cfg.vol_window_bars,
+            "no_trade_start": cfg.no_trade_start,
+            "no_trade_end": cfg.no_trade_end,
+            "order_valid_bars": cfg.order_valid_bars,
+            "conservative_same_bar": cfg.conservative_same_bar,
+            "daily_dd_ftmo": cfg.daily_dd_ftmo,
+            "daily_dd_gft": cfg.daily_dd_gft,
+            "max_loss": cfg.max_loss,
+            "stop_after_n_losses": cfg.stop_after_n_losses,
+            "daily_kill_switch": cfg.daily_kill_switch,
+            "daily_equity_mode": cfg.daily_equity_mode,
+            "split_mode": cfg.split_mode,
+            "split_ratio": cfg.split_ratio,
+            "split_target": cfg.split_target,
+            "yf_period": cfg.yf_period,
+            "yf_interval": cfg.yf_interval,
+            "cache_enabled": cfg.cache_enabled,
+            "cache_dir": cfg.cache_dir,
+            "cache_max_age_hours": cfg.cache_max_age_hours,
+            "output_dir": cfg.output_dir,
+            "weights": cfg.weights,
+        }
+        cfg_dict.update(overrides)
+        cfg = Config(**cfg_dict)
+
+    # Tickers
+    ticker_list = (
+        [t.strip() for t in tickers.split(",") if t.strip()]
+        if tickers
+        else get_tickers()
+    )
+
+    # Penalties
+    penalty_list = (
+        [float(p.strip()) for p in penalties.split(",") if p.strip()]
+        if penalties
+        else get_penalties()
+    )
+
+    # Header
+    console.print(f"\n[bold cyan]🚀 Envolées v{__version__}[/bold cyan]")
+    console.print(f"   Tickers: {len(ticker_list)} │ Penalties: {len(penalty_list)}")
+    console.print(f"   Mode: {cfg.daily_equity_mode} │ Output: {cfg.output_dir}")
+    
+    # Afficher le split de manière très visible
+    if cfg.split_mode == "time" or cfg.split_target in ("is", "oos"):
+        target = cfg.split_target or "is"
+        console.print(f"   [bold yellow]Split: {cfg.split_ratio:.0%} → {target.upper()}[/bold yellow]")
+    elif cfg.split_target:
+        console.print(f"   [bold yellow]Split: {cfg.split_target.upper()}[/bold yellow]")
+    
+    if not cfg.cache_enabled:
+        console.print("   [yellow]Cache: disabled[/yellow]")
+    
+    console.print()
+
+    results: list[BacktestResult] = []
+    errors: list[tuple[str, float, str]] = []
+    first_split_logged = False
+
+    total = len(ticker_list) * len(penalty_list)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Running backtests...", total=total)
+
+        for ticker in ticker_list:
+            for penalty in penalty_list:
+                progress.update(task, description=f"{ticker} PEN {penalty:.2f}")
+
+                result, split_info = run_single_backtest(ticker, penalty, cfg, verbose)
+
+                if result is not None:
+                    results.append(result)
+                    export_result(result, cfg.output_dir)
+                    
+                    # Log split info une fois (pour le premier ticker/penalty)
+                    if split_info and not first_split_logged:
+                        console.print(f"[dim]   {split_info}[/dim]")
+                        first_split_logged = True
+                    
+                    console.print(f"[green]✓[/green] {format_summary_line(result)}")
+                else:
+                    errors.append((ticker, penalty, "Download or backtest failed"))
+
+                progress.advance(task)
+
+    # Export summary
+    if results:
+        summary_df = export_batch_summary(results, cfg.output_dir)
+        
+        # Export scores et shortlist
+        scores_df, shortlist_df = export_scoring(summary_df, cfg.output_dir)
+
+        # Affichage synthèse par pénalité
+        console.print("\n[bold]Synthèse par pénalité:[/bold]")
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Penalty")
+        table.add_column("Trades", justify="right")
+        table.add_column("Avg WR", justify="right")
+        table.add_column("Avg PF", justify="right")
+        table.add_column("Avg ExpR", justify="right")
+        table.add_column("Max DD%", justify="right")
+
+        grp = summary_df.groupby("penalty_atr").agg({
+            "n_trades": "sum",
+            "win_rate": "mean",
+            "profit_factor": "mean",
+            "expectancy_r": "mean",
+            "max_daily_dd_pct": "max",
+        }).reset_index()
+
+        for _, row in grp.iterrows():
+            table.add_row(
+                f"{row['penalty_atr']:.2f}",
+                str(int(row["n_trades"])),
+                f"{row['win_rate']:.3f}",
+                f"{row['profit_factor']:.3f}",
+                f"{row['expectancy_r']:+.3f}",
+                f"{row['max_daily_dd_pct']*100:.2f}%",
+            )
+
+        console.print(table)
+        
+        # Afficher la shortlist si non vide
+        if len(shortlist_df) > 0:
+            # Indiquer clairement que c'est IS (pas la shortlist finale)
+            split_label = cfg.split_target.upper() if cfg.split_target else "IS"
+            console.print(f"\n[bold green]Shortlist {split_label} ({len(shortlist_df)} tickers):[/bold green]")
+            if cfg.split_target == "is":
+                console.print(f"[dim]  ⚠ Cette shortlist est basée sur IS. Utiliser 'compare' pour la validation OOS.[/dim]")
+            for _, row in shortlist_df.iterrows():
+                console.print(
+                    f"  [green]•[/green] {row['ticker']:>12} │ "
+                    f"Score {row.get('score', 0):.3f} │ "
+                    f"ExpR {row['expectancy_r']:+.3f} │ "
+                    f"PF {row['profit_factor']:.2f} │ "
+                    f"DD {row['max_daily_dd_pct']*100:.2f}%"
+                )
+
+    # Erreurs
+    if errors:
+        console.print(f"\n[yellow]⚠ {len(errors)} erreur(s)[/yellow]")
+        for t, p, e in errors:
+            console.print(f"  - {t} PEN {p:.2f}: {e}")
+
+    console.print(f"\n[dim]Résultats: {cfg.output_dir}/[/dim]")
+    console.print(f"[dim]  • results.csv   (détails)[/dim]")
+    console.print(f"[dim]  • scores.csv    (scores par ticker)[/dim]")
+    console.print(f"[dim]  • shortlist.csv (candidats {split_label if 'split_label' in dir() else 'IS'})[/dim]")
+
+
+@main.command()
+@click.argument("ticker")
+@click.option("--penalty", "-p", default=0.10, help="Execution penalty (ATR multiple).")
+@click.option("--output", "-o", default=None, help="Output directory.")
+@click.option("--no-cache", is_flag=True, help="Disable data cache.")
+@click.option("--verbose", "-v", is_flag=True, help="Verbose output.")
+def single(ticker: str, penalty: float, output: str | None, no_cache: bool, verbose: bool) -> None:
+    """Run backtest on a single ticker."""
+    cfg = Config.from_env()
+    
+    if output:
+        cfg = Config(**{**_cfg_to_dict(cfg), "output_dir": output})
+    if no_cache:
+        cfg = Config(**{**_cfg_to_dict(cfg), "cache_enabled": False})
+
+    console.print(f"\n[cyan]Running {ticker} with penalty {penalty:.2f}...[/cyan]")
+
+    result, split_info = run_single_backtest(ticker, penalty, cfg, verbose)
+
+    if result is None:
+        console.print("[red]Backtest failed.[/red]")
+        sys.exit(1)
+
+    export_result(result, cfg.output_dir)
+    console.print(f"\n[green]✓[/green] {format_summary_line(result)}")
+    
+    if split_info:
+        console.print(f"[dim]   {split_info}[/dim]")
+
+    # Détail
+    s = result.summary
+    console.print(f"\n[bold]Détails:[/bold]")
+    console.print(f"  Barres 4H: {s['bars_4h']}")
+    console.print(f"  Balance: {s['start_balance']:,.0f} → {s['end_balance']:,.0f}")
+    console.print(f"  Trades: {s['n_trades']}")
+    console.print(f"  Win Rate: {s['win_rate']:.1%}")
+    console.print(f"  Profit Factor: {s['profit_factor']:.2f}")
+    console.print(f"  Expectancy: {s['expectancy_r']:+.3f} R")
+    console.print(f"  Max Daily DD: {s['prop']['max_daily_dd_pct']*100:.2f}%")
+    console.print(f"  P99 Daily DD: {s['prop']['p99_daily_dd_pct']*100:.2f}%")
+
+
+@main.command()
+def config() -> None:
+    """Show current configuration."""
+    cfg = Config.from_env()
+    tickers = get_tickers()
+    penalties = get_penalties()
+
+    console.print("\n[bold cyan]Configuration actuelle:[/bold cyan]\n")
+
+    table = Table(show_header=False, box=None)
+    table.add_column(style="dim")
+    table.add_column()
+
+    table.add_row("Tickers", ", ".join(tickers))
+    table.add_row("Penalties", ", ".join(f"{p:.2f}" for p in penalties))
+    table.add_row("Start Balance", f"{cfg.start_balance:,.0f}")
+    table.add_row("Risk/Trade", f"{cfg.risk_per_trade:.2%}")
+    table.add_row("EMA Period", str(cfg.ema_period))
+    table.add_row("ATR Period", str(cfg.atr_period))
+    table.add_row("Donchian N", str(cfg.donchian_n))
+    table.add_row("Buffer ATR", f"{cfg.buffer_atr:.2f}")
+    table.add_row("SL ATR", f"{cfg.sl_atr:.2f}")
+    table.add_row("TP R", f"{cfg.tp_r:.2f}")
+    table.add_row("Daily Equity Mode", cfg.daily_equity_mode)
+    table.add_row("Daily Kill Switch", f"{cfg.daily_kill_switch:.0%}")
+    table.add_row("Stop After N Losses", str(cfg.stop_after_n_losses))
+    table.add_row("", "")
+    table.add_row("Split Mode", cfg.split_mode or "(none)")
+    if cfg.split_mode:
+        table.add_row("Split Ratio", f"{cfg.split_ratio:.0%}")
+        table.add_row("Split Target", cfg.split_target or "is")
+    table.add_row("", "")
+    table.add_row("Cache Enabled", "Yes" if cfg.cache_enabled else "No")
+    table.add_row("Cache Max Age", f"{cfg.cache_max_age_hours}h")
+    table.add_row("Output Dir", cfg.output_dir)
+    
+    if cfg.weights:
+        table.add_row("", "")
+        table.add_row("Weights", ", ".join(f"{k}={v}" for k, v in cfg.weights.items()))
+
+    console.print(table)
+
+
+@main.command()
+def cache() -> None:
+    """Show cache statistics."""
+    stats = cache_stats()
+    
+    console.print("\n[bold cyan]Cache Statistics:[/bold cyan]\n")
+    console.print(f"  Directory: {stats['cache_dir']}")
+    console.print(f"  Files: {stats['n_files']}")
+    console.print(f"  Size: {stats['total_size_mb']} MB")
+    
+    if stats['tickers']:
+        console.print(f"  Tickers: {', '.join(stats['tickers'])}")
+
+
+@main.command("cache-clear")
+@click.confirmation_option(prompt="Are you sure you want to clear the cache?")
+def cache_clear() -> None:
+    """Clear the data cache."""
+    n = clear_cache()
+    console.print(f"[green]✓[/green] Cleared {n} files from cache.")
+
+
+@main.command("cache-warm")
+@click.option(
+    "--tickers", "-t",
+    default=None,
+    help="Tickers to warm (comma-separated). Uses .env if not specified.",
+)
+def cache_warm(tickers: str | None) -> None:
+    """Pre-fetch data into cache for faster runs."""
+    from envolees.data import download_1h, resample_to_4h
+    
+    cfg = Config.from_env()
+    ticker_list = (
+        [t.strip() for t in tickers.split(",") if t.strip()]
+        if tickers
+        else get_tickers()
+    )
+    
+    console.print(f"\n[cyan]Warming cache for {len(ticker_list)} tickers...[/cyan]\n")
+    
+    success = 0
+    errors = []
+    
+    for ticker in ticker_list:
+        try:
+            # FIX: use_cache=True avec cache_max_age_hours=0 force le téléchargement
+            # tout en permettant la sauvegarde dans le cache
+            df = download_1h(ticker, cfg, use_cache=True, cache_max_age_hours=0, verbose=True)
+            console.print(f"[green]✓[/green] {ticker}: {len(df)} bars 1H")
+            success += 1
+        except Exception as e:
+            console.print(f"[red]✗[/red] {ticker}: {e}")
+            errors.append((ticker, str(e)))
+    
+    console.print(f"\n[bold]Résultat:[/bold] {success}/{len(ticker_list)} tickers mis en cache")
+    
+    if errors:
+        console.print(f"[yellow]⚠ {len(errors)} erreur(s)[/yellow]")
+
+
+@main.command("cache-verify")
+@click.option(
+    "--tickers", "-t",
+    default=None,
+    help="Tickers to verify (comma-separated). Uses .env if not specified.",
+)
+@click.option(
+    "--fail-on-gaps",
+    is_flag=True,
+    help="Exit with error if unexpected gaps are detected.",
+)
+@click.option(
+    "--fail-on-stale",
+    is_flag=True,
+    help="Exit with error if stale data is detected.",
+)
+@click.option(
+    "--export-eligible",
+    type=click.Path(),
+    default=None,
+    help="Export eligible tickers to file (for pipeline use).",
+)
+@click.option(
+    "--verbose", "-v",
+    is_flag=True,
+    help="Show detailed gap analysis.",
+)
+def cache_verify(
+    tickers: str | None,
+    fail_on_gaps: bool,
+    fail_on_stale: bool,
+    export_eligible: str | None,
+    verbose: bool,
+) -> None:
+    """Verify cache integrity and detect data gaps (calendar-aware).
+    
+    Distinguishes between:
+    - gaps: missing data within expected trading hours (blocking)
+    - stale: data not recent enough (warning by default)
+    
+    Use --export-eligible to generate a list of valid tickers for pipeline.
+    """
+    from envolees.data.cache import get_cache_path, is_cache_valid
+    from envolees.data.calendar import analyze_gaps, check_staleness, classify_ticker
+    import pandas as pd
+    import json
+    
+    cfg = Config.from_env()
+    ticker_list = (
+        [t.strip() for t in tickers.split(",") if t.strip()]
+        if tickers
+        else get_tickers()
+    )
+    
+    console.print(f"\n[cyan]Verifying cache for {len(ticker_list)} tickers (calendar-aware)...[/cyan]\n")
+    
+    # Résultats détaillés
+    results = {
+        "eligible": [],      # Tickers OK pour backtest
+        "excluded": [],      # Tickers exclus
+        "gaps": [],          # Tickers avec gaps (bloquant)
+        "stale": [],         # Tickers stale (warning)
+        "missing": [],       # Tickers sans cache
+        "errors": [],        # Erreurs de lecture
+    }
+    
+    for ticker in ticker_list:
+        cache_path = get_cache_path(ticker, cfg.yf_period, cfg.yf_interval, cfg)
+        
+        # Vérifier existence
+        if not cache_path.exists():
+            console.print(f"[yellow]⚠[/yellow] {ticker}: not in cache")
+            results["missing"].append(ticker)
+            results["excluded"].append((ticker, "not_cached"))
+            continue
+        
+        # Vérifier validité TTL
+        if not is_cache_valid(cache_path, cfg.cache_max_age_hours):
+            console.print(f"[yellow]⚠[/yellow] {ticker}: cache expired")
+            results["missing"].append(ticker)
+            results["excluded"].append((ticker, "expired"))
+            continue
+        
+        # Charger et analyser
+        try:
+            df = pd.read_parquet(cache_path)
+            asset_class = classify_ticker(ticker)
+            gap_analysis = analyze_gaps(df, ticker, expected_interval_hours=1.0)
+            staleness = check_staleness(df, ticker)
+            
+            # Construire l'affichage
+            status_parts = [f"{len(df)} bars", f"{asset_class.value}"]
+            has_gaps = gap_analysis.unexpected_gaps > 0
+            is_stale = staleness.is_stale
+            
+            # Affichage de la fraîcheur (calendar-aware)
+            if staleness.trading_hours_missed > 0:
+                status_parts.append(f"{staleness.trading_hours_missed:.0f}h trading manquées")
+            elif staleness.age_hours > 2:
+                # Âge brut pour info, mais pas de trading manqué = marché fermé
+                status_parts.append(f"last {staleness.age_hours:.0f}h ago (marché fermé)")
+            
+            if has_gaps:
+                status_parts.append(f"{gap_analysis.unexpected_gaps} unexpected gaps")
+                results["gaps"].append(ticker)
+            
+            if is_stale:
+                status_parts.append("stale")
+                results["stale"].append(ticker)
+            
+            # Décision d'éligibilité
+            # Gaps = toujours bloquant (données manquantes = backtest faussé)
+            # Stale = bloquant seulement si --fail-on-stale
+            is_eligible = not has_gaps and (not is_stale or not fail_on_stale)
+            
+            if is_eligible:
+                results["eligible"].append(ticker)
+                if is_stale:
+                    # Éligible mais stale = warning
+                    console.print(f"[yellow]~[/yellow] {ticker}: {' │ '.join(status_parts)} [dim](stale but included)[/dim]")
+                else:
+                    console.print(f"[green]✓[/green] {ticker}: {' │ '.join(status_parts)}")
+            else:
+                reason = "gaps" if has_gaps else "stale"
+                results["excluded"].append((ticker, reason))
+                console.print(f"[yellow]⚠[/yellow] {ticker}: {' │ '.join(status_parts)}")
+            
+            # Détails si verbose
+            if verbose:
+                # Infos de debug pour staleness
+                now = datetime.now(staleness.last_bar.tzinfo) if staleness.last_bar and staleness.last_bar.tzinfo else datetime.now()
+                console.print(f"    [dim]now: {now.strftime('%Y-%m-%d %H:%M %Z')}[/dim]")
+                if staleness.last_bar:
+                    console.print(f"    [dim]last_bar: {staleness.last_bar.strftime('%Y-%m-%d %H:%M %Z')}[/dim]")
+                console.print(f"    [dim]age_hours: {staleness.age_hours:.1f}h │ trading_missed: {staleness.trading_hours_missed:.1f}h │ max_age: {staleness.max_age_hours}h[/dim]")
+                
+                # Gaps
+                if gap_analysis.issues:
+                    console.print(f"    [dim]gaps ({len(gap_analysis.issues)}):[/dim]")
+                    for issue in gap_analysis.issues[:3]:
+                        console.print(f"      [dim]{issue}[/dim]")
+            
+        except Exception as e:
+            console.print(f"[red]✗[/red] {ticker}: read error - {e}")
+            results["errors"].append(ticker)
+            results["excluded"].append((ticker, f"error:{e}"))
+    
+    # Résumé
+    n_eligible = len(results["eligible"])
+    n_total = len(ticker_list)
+    n_excluded = len(results["excluded"])
+    
+    console.print(f"\n[bold]Résultat:[/bold] {n_eligible}/{n_total} éligibles")
+    
+    if results["gaps"]:
+        console.print(f"[red]  • Gaps bloquants: {', '.join(results['gaps'])}[/red]")
+    if results["stale"]:
+        stale_in_eligible = [t for t in results["stale"] if t in results["eligible"]]
+        stale_excluded = [t for t in results["stale"] if t not in results["eligible"]]
+        if stale_in_eligible:
+            console.print(f"[yellow]  • Stale (inclus): {', '.join(stale_in_eligible)}[/yellow]")
+        if stale_excluded:
+            console.print(f"[yellow]  • Stale (exclus): {', '.join(stale_excluded)}[/yellow]")
+    if results["missing"]:
+        console.print(f"[dim]  • Manquants: {', '.join(results['missing'])}[/dim]")
+    
+    # Exporter les tickers éligibles
+    if export_eligible:
+        export_path = Path(export_eligible)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        export_data = {
+            "eligible": results["eligible"],
+            "excluded": [{"ticker": t, "reason": r} for t, r in results["excluded"]],
+            "timestamp": datetime.now().isoformat(),
+        }
+        
+        if export_path.suffix == ".json":
+            export_path.write_text(json.dumps(export_data, indent=2))
+        else:
+            # Format simple : un ticker par ligne
+            export_path.write_text("\n".join(results["eligible"]))
+        
+        console.print(f"\n[dim]Tickers éligibles exportés: {export_path}[/dim]")
+    
+    # Code de sortie
+    should_fail = False
+    if fail_on_gaps and results["gaps"]:
+        should_fail = True
+    if fail_on_stale and results["stale"]:
+        should_fail = True
+    
+    if should_fail:
+        console.print(f"\n[red]⚠ Échec de vérification (--fail-on-gaps={fail_on_gaps}, --fail-on-stale={fail_on_stale})[/red]")
+        sys.exit(1)
+    
+    # Retourner le nombre d'éligibles pour usage programmatique
+    return n_eligible
+
+
+@main.command()
+@click.argument("is_dir")
+@click.argument("oos_dir")
+@click.option(
+    "--output", "-o",
+    default="out_compare",
+    help="Output directory for comparison report.",
+)
+@click.option(
+    "--penalty", "-p",
+    default=0.25,
+    type=float,
+    help="Reference penalty for validation (default: 0.25).",
+)
+@click.option(
+    "--min-trades",
+    default=15,
+    type=int,
+    help="Minimum OOS trades for eligibility (default: 15).",
+)
+@click.option(
+    "--dd-cap",
+    default=0.012,
+    type=float,
+    help="Maximum DD for shortlist (default: 0.012 = 1.2%).",
+)
+@click.option(
+    "--max-tickers",
+    default=5,
+    type=int,
+    help="Maximum tickers in shortlist (default: 5).",
+)
+@click.option(
+    "--alert/--no-alert",
+    default=False,
+    help="Send alert with results.",
+)
+def compare(
+    is_dir: str,
+    oos_dir: str,
+    output: str,
+    penalty: float,
+    min_trades: int,
+    dd_cap: float,
+    max_tickers: int,
+    alert: bool,
+) -> None:
+    """Compare IS and OOS results for validation.
+    
+    Generates tiered shortlists:
+    - Tier 1 (Funded): ≥15 trades OOS, strict criteria
+    - Tier 2 (Challenge): ≥10 trades OOS, excludes Tier 1
+    
+    Example:
+        python main.py compare out_is out_oos -o out_compare
+    """
+    from pathlib import Path
+    from envolees.output.compare import (
+        OOSEligibility,
+        TieredShortlistConfig,
+        export_comparison,
+        print_comparison_summary,
+        compare_is_oos,
+        export_tiered_shortlists,
+        print_tiered_shortlists,
+    )
+    
+    is_path = Path(is_dir) / "results.csv"
+    oos_path = Path(oos_dir) / "results.csv"
+    
+    if not is_path.exists():
+        console.print(f"[red]Error:[/red] {is_path} not found")
+        sys.exit(1)
+    if not oos_path.exists():
+        console.print(f"[red]Error:[/red] {oos_path} not found")
+        sys.exit(1)
+    
+    console.print(f"\n[bold cyan]📊 Comparing IS vs OOS[/bold cyan]")
+    console.print(f"   IS:  {is_dir}")
+    console.print(f"   OOS: {oos_dir}")
+    console.print(f"   Reference penalty: {penalty}")
+    console.print(f"   Tier 1 min trades: 15 (Funded)")
+    console.print(f"   Tier 2 min trades: 10 (Challenge)")
+    console.print(f"   DD cap: {dd_cap*100:.1f}%\n")
+    
+    # Utiliser min_trades=10 pour voir tous les candidats potentiels
+    criteria = OOSEligibility(min_trades=10)
+    
+    # Export complet
+    validated = export_comparison(
+        is_path, oos_path, output,
+        criteria=criteria,
+        reference_penalty=penalty,
+    )
+    
+    # Afficher le résumé
+    comparison_df = compare_is_oos(is_path, oos_path, criteria, penalty)
+    print_comparison_summary(comparison_df)
+    
+    # Générer les shortlists par tier
+    tiered_cfg = TieredShortlistConfig(
+        tier1_min_trades=15,
+        tier2_min_trades=10,
+        dd_cap=dd_cap,
+        max_tickers=max_tickers,
+    )
+    
+    comparison_ref_path = Path(output) / "comparison_ref.csv"
+    tier1, tier2 = export_tiered_shortlists(
+        comparison_ref_path,
+        output,
+        tiered_cfg,
+    )
+    
+    # Analyser les motifs de rejet
+    import pandas as pd
+    if comparison_ref_path.exists():
+        all_tickers_df = pd.read_csv(comparison_ref_path)
+        
+        # Tickers dans les shortlists
+        shortlisted = set()
+        if not tier1.empty:
+            shortlisted.update(tier1["ticker"].tolist())
+        if not tier2.empty:
+            shortlisted.update(tier2["ticker"].tolist())
+        
+        rejected = []
+        for _, row in all_tickers_df.iterrows():
+            ticker = row["ticker"]
+            
+            # Si dans une shortlist, pas rejeté
+            if ticker in shortlisted:
+                continue
+            
+            # Déterminer le motif
+            reasons = []
+            
+            oos_trades = row.get("oos_trades", 0)
+            if pd.isna(oos_trades) or oos_trades < 10:
+                reasons.append(f"trades OOS ({int(oos_trades) if not pd.isna(oos_trades) else 0} < 10)")
+            
+            oos_dd = row.get("oos_dd", 0)
+            if not pd.isna(oos_dd) and oos_dd > dd_cap:
+                reasons.append(f"DD OOS ({oos_dd*100:.2f}% > {dd_cap*100:.1f}%)")
+            
+            is_dd = row.get("is_dd", 0)
+            if not pd.isna(is_dd) and is_dd > dd_cap:
+                reasons.append(f"DD IS ({is_dd*100:.2f}% > {dd_cap*100:.1f}%)")
+            
+            oos_pf = row.get("oos_pf", 0)
+            if not pd.isna(oos_pf) and oos_pf < 1.2:
+                reasons.append(f"PF OOS ({oos_pf:.2f} < 1.2)")
+            
+            oos_exp = row.get("oos_expectancy", 0)
+            if not pd.isna(oos_exp) and oos_exp <= 0:
+                reasons.append(f"ExpR OOS ({oos_exp:.3f} ≤ 0)")
+            
+            if not reasons:
+                reasons.append("score insuffisant")
+            
+            rejected.append((ticker, reasons))
+        
+        if rejected:
+            console.print(f"\n[yellow]📋 Motifs de rejet ({len(rejected)} tickers):[/yellow]")
+            for ticker, reasons in rejected:
+                console.print(f"  [dim]• {ticker}: {', '.join(reasons)}[/dim]")
+    
+    # Afficher les shortlists par tier
+    print_tiered_shortlists(tier1, tier2)
+    
+    console.print(f"\n[dim]Rapports exportés dans {output}/[/dim]")
+    console.print(f"[dim]  • comparison_full.csv    (toutes pénalités)[/dim]")
+    console.print(f"[dim]  • comparison_ref.csv     (PEN {penalty})[/dim]")
+    console.print(f"[dim]  • shortlist_tier1.csv    (Funded, ≥15 trades)[/dim]")
+    console.print(f"[dim]  • shortlist_tier2.csv    (Challenge bonus, ≥10 trades)[/dim]")
+    console.print(f"[dim]  • shortlist_tradable.csv (combiné Tier 1 + 2)[/dim]")
+    
+    # Alertes enrichies
+    if alert:
+        try:
+            from envolees.alerts import send_backtest_summary
+            from envolees.profiles import get_profile
+            import json as json_mod
+            
+            profile = get_profile()
+            n_tickers = len(comparison_df["ticker"].unique()) if not comparison_df.empty else 0
+            n_trades = int(comparison_df["oos_trades"].sum()) if not comparison_df.empty else 0
+            
+            # Best ticker from tier1, or tier2 if tier1 empty
+            if not tier1.empty:
+                best_ticker = tier1.iloc[0]["ticker"]
+                best_score = float(tier1.iloc[0]["oos_score"])
+            elif not tier2.empty:
+                best_ticker = tier2.iloc[0]["ticker"]
+                best_score = float(tier2.iloc[0]["oos_score"])
+            else:
+                best_ticker = "N/A"
+                best_score = 0.0
+            
+            validated_count = len(validated) if validated is not None else 0
+            
+            # Collecter les motifs de rejet par catégorie
+            rejection_reasons = {}
+            if not comparison_df.empty and "oos_status" in comparison_df.columns:
+                for status in ["insufficient_trades", "degraded", "failed"]:
+                    count = len(comparison_df[comparison_df["oos_status"] == status])
+                    if count > 0:
+                        rejection_reasons[status] = count
+            
+            # Compter les DD exceeded côté IS
+            if not comparison_df.empty and "is_dd" in comparison_df.columns:
+                dd_exceeded = len(comparison_df[comparison_df["is_dd"] > dd_cap])
+                if dd_exceeded > 0:
+                    rejection_reasons["dd_exceeded"] = dd_exceeded
+            
+            # Préparer les deux tiers pour l'alerte
+            tier1_for_alert = []
+            if not tier1.empty:
+                for _, row in tier1.head(5).iterrows():
+                    tier1_for_alert.append((row["ticker"], float(row["oos_score"])))
+            
+            tier2_for_alert = []
+            if not tier2.empty:
+                for _, row in tier2.head(5).iterrows():
+                    tier2_for_alert.append((row["ticker"], float(row["oos_score"])))
+            
+            # Lire les exclusions cache si disponibles
+            excluded_tickers = []
+            eligible_file = Path("out_pipeline/eligible_tickers.json")
+            if eligible_file.exists():
+                try:
+                    data = json_mod.loads(eligible_file.read_text())
+                    excluded_tickers = data.get("excluded", [])
+                except Exception:
+                    pass
+            
+            results = send_backtest_summary(
+                profile=profile.name,
+                n_tickers=n_tickers,
+                n_trades=n_trades,
+                best_ticker=best_ticker,
+                best_score=best_score,
+                validated_count=validated_count,
+                excluded_tickers=excluded_tickers if excluded_tickers else None,
+                rejection_reasons=rejection_reasons if rejection_reasons else None,
+                shortlist=tier1_for_alert if tier1_for_alert else None,
+                tier2=tier2_for_alert if tier2_for_alert else None,
+            )
+            
+            if any(results.values()):
+                console.print(f"[green]✓[/green] Alerte envoyée")
+            else:
+                console.print(f"[dim]Alertes non configurées[/dim]")
+                
+        except Exception as e:
+            console.print(f"[yellow]⚠[/yellow] Alerte échouée: {e}")
+
+
+@main.command()
+def heartbeat() -> None:
+    """Send a heartbeat (alive signal)."""
+    from envolees.alerts import send_heartbeat
+    from envolees.profiles import get_profile
+    
+    profile = get_profile()
+    console.print(f"\n[cyan]Sending heartbeat for profile: {profile.name}[/cyan]")
+    
+    results = send_heartbeat()
+    
+    if not results:
+        console.print("[yellow]No alert channels configured[/yellow]")
+        console.print("[dim]Set NTFY_TOPIC or TELEGRAM_BOT_TOKEN in .env.secret[/dim]")
+        return
+    
+    for channel, success in results.items():
+        if success:
+            console.print(f"[green]✓[/green] {channel}: sent")
+        else:
+            console.print(f"[red]✗[/red] {channel}: failed")
+
+
+@main.command()
+@click.option(
+    "--skip-cache",
+    is_flag=True,
+    help="Skip cache warm/verify steps.",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    help="Fail if any ticker has gaps OR stale data.",
+)
+@click.option(
+    "--strict-gaps",
+    is_flag=True,
+    help="Fail only if any ticker has gaps (stale = warning but continue).",
+)
+@click.option(
+    "--alert/--no-alert",
+    default=True,
+    help="Send alert after compare (default: yes).",
+)
+@click.pass_context
+def pipeline(ctx, skip_cache: bool, strict: bool, strict_gaps: bool, alert: bool) -> None:
+    """Run the complete validation pipeline.
+    
+    Steps: cache-warm → cache-verify → IS run → OOS run → compare
+    
+    Modes:
+    - Default: continue with eligible tickers (gaps excluded, stale tolerated)
+    - --strict-gaps: fail if ANY ticker has gaps (recommended for prod)
+    - --strict: fail if ANY ticker has gaps OR stale data
+    """
+    import subprocess
+    import json
+    from pathlib import Path
+    import os
+    
+    console.print("\n[bold cyan]🚀 Envolées - Pipeline complet[/bold cyan]\n")
+    
+    # Afficher le mode
+    if strict:
+        console.print("[dim]Mode: strict (gaps + stale bloquants)[/dim]")
+    elif strict_gaps:
+        console.print("[dim]Mode: strict-gaps (gaps bloquants, stale = warning)[/dim]")
+    else:
+        console.print("[dim]Mode: tolérant (gaps exclus, stale tolérés)[/dim]")
+    
+    # Répertoire de travail
+    work_dir = Path("out_pipeline")
+    work_dir.mkdir(exist_ok=True)
+    eligible_file = work_dir / "eligible_tickers.json"
+    
+    original_tickers = get_tickers()
+    eligible_tickers = original_tickers.copy()
+    excluded_tickers = []
+    stale_warning = False
+    
+    # Step 1: Cache warm
+    if not skip_cache:
+        console.print(f"\n[bold]Step 1: Cache warm[/bold]")
+        result = subprocess.run(["python", "main.py", "cache-warm"])
+        if result.returncode != 0:
+            console.print(f"[red]✗ Cache warm failed[/red]")
+            sys.exit(1)
+        
+        # Step 2: Cache verify (avec export des tickers éligibles)
+        console.print(f"\n[bold]Step 2: Cache verify[/bold]")
+        
+        verify_cmd = [
+            "python", "main.py", "cache-verify",
+            "--export-eligible", str(eligible_file),
+        ]
+        
+        # Options selon le mode
+        if strict:
+            verify_cmd.append("--fail-on-gaps")
+            verify_cmd.append("--fail-on-stale")
+        elif strict_gaps:
+            verify_cmd.append("--fail-on-gaps")
+        
+        result = subprocess.run(verify_cmd)
+        
+        # En mode strict ou strict_gaps, vérifier le code de retour
+        if (strict or strict_gaps) and result.returncode != 0:
+            mode_name = "strict" if strict else "strict-gaps"
+            console.print(f"\n[red]✗ Cache verify failed ({mode_name} mode)[/red]")
+            sys.exit(1)
+        
+        # Lire les tickers éligibles (si le fichier existe)
+        if eligible_file.exists():
+            try:
+                data = json.loads(eligible_file.read_text())
+                eligible_tickers = data.get("eligible", [])
+                excluded_tickers = data.get("excluded", [])
+                
+                # Vérifier si des tickers stale sont inclus (pour warning)
+                stale_tickers = [
+                    exc for exc in data.get("excluded", [])
+                    if exc.get("reason") == "stale"
+                ]
+                # Note: les stale sont inclus dans eligible si pas --fail-on-stale
+                # On veut détecter les stale pour le warning même s'ils sont éligibles
+            except Exception as e:
+                console.print(f"[yellow]⚠ Erreur lecture {eligible_file}: {e}[/yellow]")
+        else:
+            # Si le fichier n'existe pas (crash de cache-verify), continuer avec tous les tickers
+            console.print(f"[yellow]⚠ Fichier éligibles non créé, utilisation de tous les tickers[/yellow]")
+        
+        if not eligible_tickers:
+            console.print(f"\n[red]✗ Aucun ticker éligible après vérification du cache[/red]")
+            sys.exit(1)
+        
+        if excluded_tickers:
+            console.print(f"\n[yellow]⚠ {len(excluded_tickers)} ticker(s) exclus:[/yellow]")
+            for exc in excluded_tickers:
+                console.print(f"    [dim]• {exc['ticker']}: {exc['reason']}[/dim]")
+            console.print(f"[cyan]→ Continue avec {len(eligible_tickers)} ticker(s): {', '.join(eligible_tickers)}[/cyan]\n")
+    
+    # Préparer l'environnement avec les tickers éligibles
+    env = os.environ.copy()
+    env["TICKERS"] = ",".join(eligible_tickers)
+    
+    # Step 3: Backtest IS
+    step_n = 3 if not skip_cache else 1
+    console.print(f"\n[bold]Step {step_n}: Backtest IS[/bold]")
+    env_is = env.copy()
+    env_is["SPLIT_TARGET"] = "is"
+    env_is["OUTPUT_DIR"] = "out_is"
+    
+    result = subprocess.run(["python", "main.py", "run"], env=env_is)
+    if result.returncode != 0:
+        console.print(f"[red]✗ Backtest IS failed[/red]")
+        sys.exit(1)
+    
+    # Step 4: Backtest OOS
+    step_n += 1
+    console.print(f"\n[bold]Step {step_n}: Backtest OOS[/bold]")
+    env_oos = env.copy()
+    env_oos["SPLIT_TARGET"] = "oos"
+    env_oos["OUTPUT_DIR"] = "out_oos"
+    
+    result = subprocess.run(["python", "main.py", "run"], env=env_oos)
+    if result.returncode != 0:
+        console.print(f"[red]✗ Backtest OOS failed[/red]")
+        sys.exit(1)
+    
+    # Step 5: Compare
+    step_n += 1
+    console.print(f"\n[bold]Step {step_n}: Compare IS/OOS[/bold]")
+    compare_cmd = ["python", "main.py", "compare", "out_is", "out_oos"]
+    if alert:
+        compare_cmd.append("--alert")
+    
+    result = subprocess.run(compare_cmd, env=env)
+    if result.returncode != 0:
+        console.print(f"[red]✗ Compare failed[/red]")
+        sys.exit(1)
+    
+    # Résumé final
+    console.print(f"\n[bold green]{'─' * 60}[/bold green]")
+    console.print(f"[bold green]✓ Pipeline terminé avec succès[/bold green]")
+    console.print(f"[bold green]{'─' * 60}[/bold green]")
+    
+    console.print(f"\n[dim]Tickers analysés: {len(eligible_tickers)}/{len(original_tickers)}[/dim]")
+    if excluded_tickers:
+        console.print(f"[dim]Tickers exclus: {len(excluded_tickers)} ({', '.join(e['ticker'] for e in excluded_tickers)})[/dim]")
+    console.print(f"[dim]Shortlist finale: out_compare/shortlist_tradable.csv[/dim]")
+
+
+@main.command()
+@click.option(
+    "--output", "-o",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format.",
+)
+def status(output: str) -> None:
+    """Show current trading status (and optionally send to Telegram)."""
+    from envolees.profiles import get_profile, get_profile_summary
+    from envolees.data.cache import cache_stats
+    from pathlib import Path
+    import json as json_module
+    
+    profile = get_profile()
+    summary = get_profile_summary(profile)
+    cache = cache_stats()
+    
+    # Lire la shortlist si elle existe
+    shortlist_path = Path("out_compare/shortlist_tradable.csv")
+    shortlist = []
+    if shortlist_path.exists():
+        import pandas as pd
+        try:
+            df = pd.read_csv(shortlist_path)
+            shortlist = [(row["ticker"], row.get("oos_score", 0)) for _, row in df.head(5).iterrows()]
+        except Exception:
+            pass
+    
+    if output == "json":
+        data = {
+            "profile": summary,
+            "cache": cache,
+            "shortlist": [{"ticker": t, "score": s} for t, s in shortlist],
+        }
+        console.print(json_module.dumps(data, indent=2, default=str))
+    else:
+        console.print(f"\n[bold cyan]📊 Envolées Status[/bold cyan]\n")
+        
+        # Profil
+        console.print(f"[bold]Profil:[/bold] {summary['name']} ({profile.description})")
+        console.print(f"  Risque/trade: {summary['risk_per_trade']*100:.2f}%")
+        console.print(f"  Budget/jour: {summary['daily_risk_budget']*100:.2f}%")
+        console.print(f"  Max trades: {summary['max_concurrent_trades']}")
+        console.print(f"  Stop après: {summary['stop_after_n_losses']} pertes")
+        console.print()
+        
+        # Cache
+        console.print(f"[bold]Cache:[/bold]")
+        console.print(f"  Fichiers: {cache['n_files']}")
+        console.print(f"  Taille: {cache['total_size_mb']} MB")
+        console.print()
+        
+        # Shortlist
+        if shortlist:
+            console.print(f"[bold]Shortlist ({len(shortlist)} tickers):[/bold]")
+            for ticker, score in shortlist:
+                console.print(f"  • {ticker}: score {score:.3f}")
+        else:
+            console.print("[dim]Shortlist: (pas de fichier shortlist_tradable.csv)[/dim]")
+
+
+@main.command()
+@click.argument("message")
+@click.option(
+    "--level", "-l",
+    type=click.Choice(["info", "warning", "critical"]),
+    default="warning",
+    help="Alert level (default: warning).",
+)
+def alert(message: str, level: str) -> None:
+    """Send a manual alert."""
+    from envolees.alerts import AlertSender
+    
+    console.print(f"\n[cyan]Sending alert (level: {level})...[/cyan]")
+    
+    sender = AlertSender()
+    results = sender.send_alert(
+        title="Alerte manuelle",
+        message=message,
+        level=level,
+    )
+    
+    if not results:
+        console.print("[yellow]No alert channels configured[/yellow]")
+        return
+    
+    for channel, success in results.items():
+        if success:
+            console.print(f"[green]✓[/green] {channel}: sent")
+        else:
+            console.print(f"[red]✗[/red] {channel}: failed")
+
+
+def _cfg_to_dict(cfg: Config) -> dict:
+    """Convertit une Config en dict pour recréation."""
+    return {
+        "start_balance": cfg.start_balance,
+        "risk_per_trade": cfg.risk_per_trade,
+        "ema_period": cfg.ema_period,
+        "atr_period": cfg.atr_period,
+        "donchian_n": cfg.donchian_n,
+        "buffer_atr": cfg.buffer_atr,
+        "sl_atr": cfg.sl_atr,
+        "tp_r": cfg.tp_r,
+        "vol_quantile": cfg.vol_quantile,
+        "vol_window_bars": cfg.vol_window_bars,
+        "no_trade_start": cfg.no_trade_start,
+        "no_trade_end": cfg.no_trade_end,
+        "order_valid_bars": cfg.order_valid_bars,
+        "conservative_same_bar": cfg.conservative_same_bar,
+        "daily_dd_ftmo": cfg.daily_dd_ftmo,
+        "daily_dd_gft": cfg.daily_dd_gft,
+        "max_loss": cfg.max_loss,
+        "stop_after_n_losses": cfg.stop_after_n_losses,
+        "daily_kill_switch": cfg.daily_kill_switch,
+        "daily_equity_mode": cfg.daily_equity_mode,
+        "split_mode": cfg.split_mode,
+        "split_ratio": cfg.split_ratio,
+        "split_target": cfg.split_target,
+        "yf_period": cfg.yf_period,
+        "yf_interval": cfg.yf_interval,
+        "cache_enabled": cfg.cache_enabled,
+        "cache_dir": cfg.cache_dir,
+        "cache_max_age_hours": cfg.cache_max_age_hours,
+        "output_dir": cfg.output_dir,
+        "weights": cfg.weights,
+        "risk_mode": cfg.risk_mode,
+        "max_concurrent_trades": cfg.max_concurrent_trades,
+        "daily_risk_budget": cfg.daily_risk_budget,
+    }
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+./envolees/compare.py
+────────────────────────────────────────────────────────────
+
+"""
+Comparaison IS vs OOS et validation croisée.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+import pandas as pd
+
+
+@dataclass
+class OOSEligibility:
+    """Critères d'éligibilité OOS."""
+    
+    min_trades: int = 15
+    min_expectancy: float = 0.0
+    min_pf: float = 1.2
+    max_dd: float = 0.05
+    
+    # Dégradation acceptable IS → OOS
+    max_expectancy_drop: float = 0.50  # 50% de drop max
+    max_pf_drop: float = 0.40  # 40% de drop max
+
+
+@dataclass
+class TickerComparison:
+    """Comparaison IS/OOS pour un ticker."""
+    
+    ticker: str
+    penalty: float
+    
+    # IS metrics
+    is_trades: int
+    is_expectancy: float
+    is_pf: float
+    is_wr: float
+    is_dd: float
+    is_bars: int
+    
+    # OOS metrics
+    oos_trades: int
+    oos_expectancy: float
+    oos_pf: float
+    oos_wr: float
+    oos_dd: float
+    oos_bars: int
+    
+    # Status
+    oos_status: str  # "valid", "insufficient_trades", "degraded", "failed"
+    oos_notes: str
+    
+    def to_dict(self) -> dict:
+        return {
+            "ticker": self.ticker,
+            "penalty": self.penalty,
+            "is_trades": self.is_trades,
+            "is_expectancy": self.is_expectancy,
+            "is_pf": self.is_pf,
+            "is_wr": self.is_wr,
+            "is_dd": self.is_dd,
+            "is_bars": self.is_bars,
+            "oos_trades": self.oos_trades,
+            "oos_expectancy": self.oos_expectancy,
+            "oos_pf": self.oos_pf,
+            "oos_wr": self.oos_wr,
+            "oos_dd": self.oos_dd,
+            "oos_bars": self.oos_bars,
+            "exp_delta": self.oos_expectancy - self.is_expectancy,
+            "pf_delta": self.oos_pf - self.is_pf,
+            "oos_status": self.oos_status,
+            "oos_notes": self.oos_notes,
+        }
+
+
+def evaluate_oos_eligibility(
+    is_row: pd.Series,
+    oos_row: pd.Series,
+    criteria: OOSEligibility | None = None,
+) -> tuple[str, str]:
+    """
+    Évalue l'éligibilité OOS d'un ticker.
+    
+    Args:
+        is_row: Ligne IS de results.csv
+        oos_row: Ligne OOS de results.csv
+        criteria: Critères d'éligibilité
+    
+    Returns:
+        Tuple (status, notes)
+    """
+    if criteria is None:
+        criteria = OOSEligibility()
+    
+    notes = []
+    
+    # 1. Nombre de trades suffisant ?
+    if oos_row["n_trades"] < criteria.min_trades:
+        return "insufficient_trades", f"OOS trades ({oos_row['n_trades']}) < {criteria.min_trades}"
+    
+    # 2. Expectancy positive ?
+    if oos_row["expectancy_r"] < criteria.min_expectancy:
+        notes.append(f"ExpR {oos_row['expectancy_r']:.3f} < {criteria.min_expectancy}")
+    
+    # 3. PF suffisant ?
+    if oos_row["profit_factor"] < criteria.min_pf:
+        notes.append(f"PF {oos_row['profit_factor']:.2f} < {criteria.min_pf}")
+    
+    # 4. DD acceptable ?
+    if oos_row["max_daily_dd_pct"] > criteria.max_dd:
+        notes.append(f"DD {oos_row['max_daily_dd_pct']*100:.1f}% > {criteria.max_dd*100:.0f}%")
+    
+    # 5. Dégradation IS → OOS acceptable ?
+    if is_row["expectancy_r"] > 0:
+        exp_drop = 1 - (oos_row["expectancy_r"] / is_row["expectancy_r"])
+        if exp_drop > criteria.max_expectancy_drop:
+            notes.append(f"ExpR drop {exp_drop*100:.0f}% > {criteria.max_expectancy_drop*100:.0f}%")
+    
+    if is_row["profit_factor"] > 1:
+        pf_drop = 1 - ((oos_row["profit_factor"] - 1) / (is_row["profit_factor"] - 1))
+        if pf_drop > criteria.max_pf_drop and oos_row["profit_factor"] < is_row["profit_factor"]:
+            notes.append(f"PF drop significant")
+    
+    # Verdict
+    if not notes:
+        return "valid", "OOS validation passed"
+    
+    # Distinguer "degraded" (partiel) de "failed" (critique)
+    critical = any(
+        "ExpR" in n and "< 0" in n or
+        "PF" in n and "< 1" in n
+        for n in notes
+    )
+    
+    if critical or len(notes) >= 3:
+        return "failed", "; ".join(notes)
+    
+    return "degraded", "; ".join(notes)
+
+
+def compare_is_oos(
+    is_results_path: str | Path,
+    oos_results_path: str | Path,
+    criteria: OOSEligibility | None = None,
+    penalty_filter: float | None = None,
+) -> pd.DataFrame:
+    """
+    Compare les résultats IS et OOS.
+    
+    Args:
+        is_results_path: Chemin vers results.csv IS
+        oos_results_path: Chemin vers results.csv OOS
+        criteria: Critères d'éligibilité OOS
+        penalty_filter: Filtrer sur une pénalité spécifique
+    
+    Returns:
+        DataFrame de comparaison
+    """
+    if criteria is None:
+        criteria = OOSEligibility()
+    
+    is_df = pd.read_csv(is_results_path)
+    oos_df = pd.read_csv(oos_results_path)
+    
+    # Filtrer les erreurs
+    is_df = is_df[is_df["status"] == "ok"].copy()
+    oos_df = oos_df[oos_df["status"] == "ok"].copy()
+    
+    # Filtrer par pénalité si demandé
+    if penalty_filter is not None:
+        is_df = is_df[is_df["penalty_atr"] == penalty_filter]
+        oos_df = oos_df[oos_df["penalty_atr"] == penalty_filter]
+    
+    comparisons = []
+    
+    # Merger sur ticker + penalty
+    for _, is_row in is_df.iterrows():
+        ticker = is_row["ticker"]
+        penalty = is_row["penalty_atr"]
+        
+        oos_match = oos_df[
+            (oos_df["ticker"] == ticker) & 
+            (oos_df["penalty_atr"] == penalty)
+        ]
+        
+        if oos_match.empty:
+            continue
+        
+        oos_row = oos_match.iloc[0]
+        
+        status, notes = evaluate_oos_eligibility(is_row, oos_row, criteria)
+        
+        comp = TickerComparison(
+            ticker=ticker,
+            penalty=penalty,
+            is_trades=int(is_row["n_trades"]),
+            is_expectancy=float(is_row["expectancy_r"]),
+            is_pf=float(is_row["profit_factor"]),
+            is_wr=float(is_row["win_rate"]),
+            is_dd=float(is_row["max_daily_dd_pct"]),
+            is_bars=int(is_row["bars_4h"]),
+            oos_trades=int(oos_row["n_trades"]),
+            oos_expectancy=float(oos_row["expectancy_r"]),
+            oos_pf=float(oos_row["profit_factor"]),
+            oos_wr=float(oos_row["win_rate"]),
+            oos_dd=float(oos_row["max_daily_dd_pct"]),
+            oos_bars=int(oos_row["bars_4h"]),
+            oos_status=status,
+            oos_notes=notes,
+        )
+        comparisons.append(comp.to_dict())
+    
+    return pd.DataFrame(comparisons)
+
+
+def export_comparison(
+    is_results_path: str | Path,
+    oos_results_path: str | Path,
+    output_path: str | Path,
+    criteria: OOSEligibility | None = None,
+    reference_penalty: float = 0.25,
+) -> pd.DataFrame:
+    """
+    Exporte un rapport de comparaison IS/OOS.
+    
+    Crée:
+    - comparison_full.csv : Toutes les pénalités
+    - comparison_ref.csv : Pénalité de référence uniquement
+    - validated.csv : Tickers validés OOS
+    
+    Args:
+        is_results_path: Chemin vers results.csv IS
+        oos_results_path: Chemin vers results.csv OOS
+        output_path: Répertoire de sortie
+        criteria: Critères d'éligibilité
+        reference_penalty: Pénalité de référence
+    
+    Returns:
+        DataFrame des tickers validés
+    """
+    output_path = Path(output_path)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Comparaison complète
+    full_df = compare_is_oos(is_results_path, oos_results_path, criteria)
+    full_df.to_csv(output_path / "comparison_full.csv", index=False)
+    
+    # Comparaison à la pénalité de référence
+    ref_df = compare_is_oos(is_results_path, oos_results_path, criteria, reference_penalty)
+    ref_df.to_csv(output_path / "comparison_ref.csv", index=False)
+    
+    # Tickers validés
+    validated = ref_df[ref_df["oos_status"] == "valid"].copy()
+    validated.to_csv(output_path / "validated.csv", index=False)
+    
+    return validated
+
+
+def print_comparison_summary(comparison_df: pd.DataFrame) -> None:
+    """Affiche un résumé de la comparaison."""
+    if comparison_df.empty:
+        print("Aucune comparaison disponible.")
+        return
+    
+    total = len(comparison_df)
+    valid = len(comparison_df[comparison_df["oos_status"] == "valid"])
+    insufficient = len(comparison_df[comparison_df["oos_status"] == "insufficient_trades"])
+    degraded = len(comparison_df[comparison_df["oos_status"] == "degraded"])
+    failed = len(comparison_df[comparison_df["oos_status"] == "failed"])
+    
+    print(f"\n{'='*60}")
+    print(f"COMPARAISON IS/OOS - {total} ticker×penalty")
+    print(f"{'='*60}")
+    print(f"  ✓ Valid:              {valid:>3} ({valid/total*100:.0f}%)")
+    print(f"  ⚠ Insufficient trades: {insufficient:>3} ({insufficient/total*100:.0f}%)")
+    print(f"  ~ Degraded:           {degraded:>3} ({degraded/total*100:.0f}%)")
+    print(f"  ✗ Failed:             {failed:>3} ({failed/total*100:.0f}%)")
+    print(f"{'='*60}")
+    
+    if valid > 0:
+        print("\nTickers validés OOS:")
+        for _, row in comparison_df[comparison_df["oos_status"] == "valid"].iterrows():
+            print(
+                f"  • {row['ticker']:>12} PEN {row['penalty']:.2f} │ "
+                f"IS: {row['is_trades']:>3}t ExpR {row['is_expectancy']:+.3f} │ "
+                f"OOS: {row['oos_trades']:>3}t ExpR {row['oos_expectancy']:+.3f}"
+            )
+
+
+@dataclass
+class ShortlistConfig:
+    """Configuration pour la génération de shortlist."""
+    
+    min_trades_oos: int = 15
+    min_pf_oos: float = 1.2
+    min_expectancy_oos: float = 0.0
+    dd_cap: float = 0.012  # 1.2%
+    
+    # Poids du scoring
+    weight_expectancy: float = 0.55
+    weight_pf: float = 0.30
+    weight_dd: float = 0.15
+    
+    # Limites
+    min_score: float = 0.0
+    max_tickers: int = 20
+    
+    @classmethod
+    def from_env(cls) -> ShortlistConfig:
+        """Charge depuis l'environnement."""
+        import os
+        return cls(
+            min_trades_oos=int(os.getenv("MIN_TRADES_OOS", "15")),
+            dd_cap=float(os.getenv("DD_CAP", "0.012")),
+            min_score=float(os.getenv("SHORTLIST_MIN_SCORE", "0.0")),
+            max_tickers=int(os.getenv("SHORTLIST_MAX_TICKERS", "20")),
+        )
+
+
+@dataclass
+class TieredShortlistConfig:
+    """Configuration pour la génération de shortlists par tier."""
+    
+    # Tier 1 (Funded) - critères stricts
+    tier1_min_trades: int = 15
+    
+    # Tier 2 (Challenge) - critères assouplis
+    tier2_min_trades: int = 10
+    
+    # Critères communs
+    min_pf_oos: float = 1.2
+    min_expectancy_oos: float = 0.0
+    dd_cap: float = 0.012  # 1.2%
+    
+    # Poids du scoring
+    weight_expectancy: float = 0.55
+    weight_pf: float = 0.30
+    weight_dd: float = 0.15
+    
+    # Limites
+    min_score: float = 0.0
+    max_tickers: int = 20
+    
+    @classmethod
+    def from_env(cls) -> TieredShortlistConfig:
+        """Charge depuis l'environnement."""
+        import os
+        return cls(
+            tier1_min_trades=int(os.getenv("MIN_TRADES_TIER1", "15")),
+            tier2_min_trades=int(os.getenv("MIN_TRADES_TIER2", "10")),
+            dd_cap=float(os.getenv("DD_CAP", "0.012")),
+            min_score=float(os.getenv("SHORTLIST_MIN_SCORE", "0.0")),
+            max_tickers=int(os.getenv("SHORTLIST_MAX_TICKERS", "20")),
+        )
+
+
+def compute_oos_score(row: pd.Series, cfg: ShortlistConfig | TieredShortlistConfig) -> float:
+    """
+    Calcule le score OOS d'un ticker.
+    
+    score = w_exp * oos_expectancy + w_pf * log(oos_pf) - w_dd * oos_dd
+    """
+    import math
+    
+    exp_score = cfg.weight_expectancy * row["oos_expectancy"]
+    pf_score = cfg.weight_pf * math.log(max(row["oos_pf"], 1e-9))
+    dd_penalty = cfg.weight_dd * row["oos_dd"]
+    
+    return exp_score + pf_score - dd_penalty
+
+
+def shortlist_from_compare(
+    comparison_path: str | Path,
+    cfg: ShortlistConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Génère une shortlist tradable depuis les résultats de comparaison.
+    
+    Règle (OOS-first, robuste) :
+    1. filter: oos_trades >= min_trades
+    2. filter: oos_pf >= 1.2 et oos_expectancy > 0
+    3. filter: oos_dd <= dd_cap
+    4. score: 0.55*exp + 0.30*log(pf) - 0.15*dd
+    5. tri décroissant, top N
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        cfg: Configuration de shortlist
+    
+    Returns:
+        DataFrame trié par score décroissant
+    """
+    if cfg is None:
+        cfg = ShortlistConfig.from_env()
+    
+    df = pd.read_csv(comparison_path)
+    
+    # Filtres
+    df = df[df["oos_trades"] >= cfg.min_trades_oos].copy()
+    df = df[df["oos_pf"] >= cfg.min_pf_oos].copy()
+    df = df[df["oos_expectancy"] > cfg.min_expectancy_oos].copy()
+    df = df[df["oos_dd"] <= cfg.dd_cap].copy()
+    
+    if df.empty:
+        return pd.DataFrame()
+    
+    # Scoring
+    df["oos_score"] = df.apply(lambda r: compute_oos_score(r, cfg), axis=1)
+    
+    # Filtre score minimum
+    if cfg.min_score > 0:
+        df = df[df["oos_score"] >= cfg.min_score].copy()
+    
+    # Tri et limite
+    df = df.sort_values("oos_score", ascending=False)
+    df = df.head(cfg.max_tickers)
+    
+    return df.reset_index(drop=True)
+
+
+def export_shortlist(
+    comparison_path: str | Path,
+    output_path: str | Path,
+    cfg: ShortlistConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Exporte la shortlist tradable.
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        output_path: Chemin de sortie
+        cfg: Configuration
+    
+    Returns:
+        DataFrame de la shortlist
+    """
+    shortlist = shortlist_from_compare(comparison_path, cfg)
+    
+    if not shortlist.empty:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Colonnes à exporter
+        cols = [
+            "ticker", "penalty", "oos_score",
+            "oos_trades", "oos_expectancy", "oos_pf", "oos_wr", "oos_dd",
+            "is_trades", "is_expectancy", "is_pf",
+        ]
+        shortlist[[c for c in cols if c in shortlist.columns]].to_csv(output_path, index=False)
+    
+    return shortlist
+
+
+def _generate_shortlist_for_tier(
+    df: pd.DataFrame,
+    min_trades: int,
+    cfg: TieredShortlistConfig,
+    exclude_tickers: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Génère une shortlist pour un tier spécifique.
+    
+    Args:
+        df: DataFrame de comparaison
+        min_trades: Minimum de trades OOS requis
+        cfg: Configuration
+        exclude_tickers: Tickers à exclure (déjà dans un tier supérieur)
+    
+    Returns:
+        DataFrame trié par score décroissant
+    """
+    filtered = df.copy()
+    
+    # Exclure les tickers déjà sélectionnés
+    if exclude_tickers:
+        filtered = filtered[~filtered["ticker"].isin(exclude_tickers)]
+    
+    # Filtres
+    filtered = filtered[filtered["oos_trades"] >= min_trades]
+    filtered = filtered[filtered["oos_pf"] >= cfg.min_pf_oos]
+    filtered = filtered[filtered["oos_expectancy"] > cfg.min_expectancy_oos]
+    filtered = filtered[filtered["oos_dd"] <= cfg.dd_cap]
+    
+    # Aussi vérifier le DD sur IS (sinon on risque l'overfitting)
+    filtered = filtered[filtered["is_dd"] <= cfg.dd_cap]
+    
+    if filtered.empty:
+        return pd.DataFrame()
+    
+    # Scoring
+    filtered["oos_score"] = filtered.apply(lambda r: compute_oos_score(r, cfg), axis=1)
+    
+    # Filtre score minimum
+    if cfg.min_score > 0:
+        filtered = filtered[filtered["oos_score"] >= cfg.min_score]
+    
+    # Tri
+    filtered = filtered.sort_values("oos_score", ascending=False)
+    filtered = filtered.head(cfg.max_tickers)
+    
+    return filtered.reset_index(drop=True)
+
+
+def export_tiered_shortlists(
+    comparison_path: str | Path,
+    output_dir: str | Path,
+    cfg: TieredShortlistConfig | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Exporte les shortlists par tier.
+    
+    Tier 1 (Funded): MIN_TRADES=15, critères stricts
+    Tier 2 (Challenge): MIN_TRADES=10, HORS Tier 1
+    
+    Args:
+        comparison_path: Chemin vers comparison_ref.csv
+        output_dir: Répertoire de sortie
+        cfg: Configuration
+    
+    Returns:
+        Tuple (tier1_df, tier2_df)
+    """
+    if cfg is None:
+        cfg = TieredShortlistConfig.from_env()
+    
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    df = pd.read_csv(comparison_path)
+    
+    # Colonnes à exporter
+    export_cols = [
+        "ticker", "penalty", "oos_score",
+        "oos_trades", "oos_expectancy", "oos_pf", "oos_wr", "oos_dd",
+        "is_trades", "is_expectancy", "is_pf",
+    ]
+    
+    # Tier 1: critères stricts (≥15 trades)
+    tier1 = _generate_shortlist_for_tier(df, cfg.tier1_min_trades, cfg)
+    tier1_tickers = tier1["ticker"].tolist() if not tier1.empty else []
+    
+    if not tier1.empty:
+        tier1[[c for c in export_cols if c in tier1.columns]].to_csv(
+            output_dir / "shortlist_tier1.csv", index=False
+        )
+    else:
+        # Créer fichier vide avec headers
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tier1.csv", index=False
+        )
+    
+    # Tier 2: critères assouplis (≥10 trades), HORS tier 1
+    tier2 = _generate_shortlist_for_tier(df, cfg.tier2_min_trades, cfg, exclude_tickers=tier1_tickers)
+    
+    if not tier2.empty:
+        tier2[[c for c in export_cols if c in tier2.columns]].to_csv(
+            output_dir / "shortlist_tier2.csv", index=False
+        )
+    else:
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tier2.csv", index=False
+        )
+    
+    # Shortlist combinée pour rétrocompatibilité (tier1 + tier2)
+    combined = pd.concat([tier1, tier2], ignore_index=True) if not tier1.empty or not tier2.empty else pd.DataFrame()
+    if not combined.empty:
+        combined[[c for c in export_cols if c in combined.columns]].to_csv(
+            output_dir / "shortlist_tradable.csv", index=False
+        )
+    else:
+        pd.DataFrame(columns=export_cols).to_csv(
+            output_dir / "shortlist_tradable.csv", index=False
+        )
+    
+    return tier1, tier2
+
+
+def print_tiered_shortlists(tier1: pd.DataFrame, tier2: pd.DataFrame) -> None:
+    """Affiche les shortlists par tier."""
+    from rich.console import Console
+    console = Console()
+    
+    if not tier1.empty:
+        console.print(f"\n[bold green]🎯 Tier 1 - Funded ({len(tier1)} tickers, ≥15 trades):[/bold green]")
+        for _, row in tier1.iterrows():
+            console.print(
+                f"  • {row['ticker']:>12} │ "
+                f"score {row['oos_score']:.3f} │ "
+                f"OOS: {row['oos_trades']:>2}t ExpR {row['oos_expectancy']:+.3f} "
+                f"PF {row['oos_pf']:.2f} DD {row['oos_dd']*100:.2f}%"
+            )
+    else:
+        console.print(f"\n[yellow]⚠ Tier 1 - Funded: aucun ticker[/yellow]")
+    
+    if not tier2.empty:
+        console.print(f"\n[bold cyan]🎯 Tier 2 - Challenge bonus ({len(tier2)} tickers, ≥10 trades):[/bold cyan]")
+        for _, row in tier2.iterrows():
+            console.print(
+                f"  • {row['ticker']:>12} │ "
+                f"score {row['oos_score']:.3f} │ "
+                f"OOS: {row['oos_trades']:>2}t ExpR {row['oos_expectancy']:+.3f} "
+                f"PF {row['oos_pf']:.2f} DD {row['oos_dd']*100:.2f}%"
+            )
+    else:
+        console.print(f"\n[dim]Tier 2 - Challenge bonus: aucun ticker additionnel[/dim]")
+    
+    # Résumé
+    total = len(tier1) + len(tier2)
+    if total > 0:
+        console.print(f"\n[bold]Résumé:[/bold]")
+        console.print(f"  • Funded (Tier 1 seul): {len(tier1)} instruments")
+        console.print(f"  • Challenge (Tier 1 + 2): {total} instruments")
+
+
+
+./tests/__init__.py
+────────────────────────────────────────────────────────────
+
+"""Test suite for Envolées."""
+
+
+
+./tests/test_envolees.py
+────────────────────────────────────────────────────────────
+
+"""Tests for Envolées."""
+
+import pytest
+
+
+class TestConfig:
+    """Tests for configuration module."""
+
+    def test_config_defaults(self):
+        """Test default configuration values."""
+        from envolees.config import Config
+
+        cfg = Config()
+
+        assert cfg.start_balance == 100_000.0
+        assert cfg.risk_per_trade == 0.0025
+        assert cfg.ema_period == 200
+        assert cfg.atr_period == 14
+        assert cfg.donchian_n == 20
+        assert cfg.sl_atr == 1.0
+        assert cfg.tp_r == 1.0
+
+    def test_config_from_env(self):
+        """Test loading config from environment."""
+        from envolees.config import Config
+
+        cfg = Config.from_env()
+        assert cfg.start_balance > 0
+
+
+class TestIndicators:
+    """Tests for technical indicators."""
+
+    def test_compute_ema(self):
+        """Test EMA calculation."""
+        import pandas as pd
+
+        from envolees.indicators import compute_ema
+
+        series = pd.Series([1.0, 2.0, 3.0, 4.0, 5.0])
+        ema = compute_ema(series, period=3)
+
+        assert len(ema) == 5
+        assert not ema.isna().all()
+
+    def test_compute_atr(self):
+        """Test ATR calculation."""
+        import pandas as pd
+
+        from envolees.indicators import compute_atr
+
+        df = pd.DataFrame({
+            "High": [10.0, 11.0, 12.0, 11.5, 13.0],
+            "Low": [9.0, 9.5, 10.0, 10.0, 11.0],
+            "Close": [9.5, 10.5, 11.0, 10.5, 12.0],
+        })
+        atr = compute_atr(df, period=3)
+
+        assert len(atr) == 5
+        # First 2 values should be NaN (min_periods=3)
+        assert atr.isna().sum() == 2
+
+    def test_compute_donchian(self):
+        """Test Donchian channel calculation."""
+        import pandas as pd
+
+        from envolees.indicators import compute_donchian
+
+        df = pd.DataFrame({
+            "High": [10.0, 11.0, 12.0, 11.5, 13.0, 14.0],
+            "Low": [9.0, 9.5, 10.0, 10.0, 11.0, 12.0],
+        })
+        d_high, d_low = compute_donchian(df, period=3, shift=1)
+
+        assert len(d_high) == 6
+        assert len(d_low) == 6
+
+
+class TestStrategy:
+    """Tests for trading strategy."""
+
+    def test_donchian_strategy_init(self):
+        """Test strategy initialization."""
+        from envolees.config import Config
+        from envolees.strategy import DonchianBreakoutStrategy
+
+        cfg = Config()
+        strategy = DonchianBreakoutStrategy(cfg)
+
+        assert strategy.cfg == cfg
+
+    def test_compute_entry_sl_tp_long(self):
+        """Test entry/SL/TP calculation for long."""
+        from envolees.config import Config
+        from envolees.strategy import DonchianBreakoutStrategy
+        from envolees.strategy.base import Signal
+        import pandas as pd
+
+        cfg = Config(sl_atr=1.0, tp_r=1.0)
+        strategy = DonchianBreakoutStrategy(cfg)
+
+        signal = Signal(
+            direction="LONG",
+            entry_level=100.0,
+            atr_at_signal=2.0,
+            timestamp=pd.Timestamp.now(),
+        )
+
+        entry, sl, tp = strategy.compute_entry_sl_tp(signal, exec_penalty_atr=0.10)
+
+        # Entry = 100 + 0.10 * 2 = 100.2
+        assert entry == pytest.approx(100.2)
+        # SL = 100.2 - 1.0 * 2 = 98.2
+        assert sl == pytest.approx(98.2)
+        # Risk = 2.0, TP = 100.2 + 2.0 = 102.2
+        assert tp == pytest.approx(102.2)
+
+
+class TestPosition:
+    """Tests for position management."""
+
+    def test_open_position_pnl(self):
+        """Test P&L calculation."""
+        import pandas as pd
+
+        from envolees.backtest.position import OpenPosition
+
+        pos = OpenPosition(
+            direction="LONG",
+            entry=100.0,
+            sl=98.0,
+            tp=102.0,
+            ts_signal=pd.Timestamp.now(),
+            ts_entry=pd.Timestamp.now(),
+            atr_signal=2.0,
+            entry_bar_idx=0,
+            risk_cash=250.0,
+        )
+
+        # Win: exit at TP
+        pnl_r = pos.compute_pnl_r(102.0)
+        assert pnl_r == pytest.approx(1.0)
+
+        # Loss: exit at SL
+        pnl_r = pos.compute_pnl_r(98.0)
+        assert pnl_r == pytest.approx(-1.0)
+
+    def test_check_exit_long(self):
+        """Test exit detection for long position."""
+        import pandas as pd
+
+        from envolees.backtest.position import OpenPosition
+
+        pos = OpenPosition(
+            direction="LONG",
+            entry=100.0,
+            sl=98.0,
+            tp=102.0,
+            ts_signal=pd.Timestamp.now(),
+            ts_entry=pd.Timestamp.now(),
+            atr_signal=2.0,
+            entry_bar_idx=0,
+            risk_cash=250.0,
+        )
+
+        # No exit
+        reason, price = pos.check_exit(high=101.0, low=99.0)
+        assert reason is None
+
+        # SL hit
+        reason, price = pos.check_exit(high=101.0, low=97.0)
+        assert reason == "SL"
+        assert price == 98.0
+
+        # TP hit
+        reason, price = pos.check_exit(high=103.0, low=99.0)
+        assert reason == "TP"
+        assert price == 102.0
+
+        # Both hit (conservative = SL)
+        reason, price = pos.check_exit(high=103.0, low=97.0, conservative_same_bar=True)
+        assert reason == "SL"
+
+
+
+./systemd/envolees-research.service
+────────────────────────────────────────────────────────────
+
+# Envolées Research Service
+# Copier vers ~/.config/systemd/user/envolees-research.service
+#
+# Usage:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now envolees-research.timer
+#   journalctl --user -u envolees-research.service -f
+
+[Unit]
+Description=Envolées research (backtests + compare)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+
+# Répertoire de travail
+WorkingDirectory=%h/dev/envolees
+
+# Charger l'environnement virtuel et le fichier .env
+# Adapter le chemin selon votre installation
+ExecStart=/usr/bin/bash -lc '\
+    source %h/dev/envolees/.venv/bin/activate && \
+    set -a && source %h/dev/envolees/.env.challenge.example && set +a && \
+    python main.py cache-warm && \
+    SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run && \
+    SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run && \
+    python main.py compare out_is out_oos --alert \
+'
+
+# Timeout généreux pour le téléchargement des données
+TimeoutStartSec=1800
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+
+# Pas de restart automatique (oneshot)
+Restart=no
+
+[Install]
+WantedBy=default.target
+
+
+
+./systemd/envolees-research.timer
+────────────────────────────────────────────────────────────
+
+# Envolées Research Timer
+# Copier vers ~/.config/systemd/user/envolees-research.timer
+#
+# Déclenche la recherche 2x/jour : 07:30 et 19:30 (heure locale)
+
+[Unit]
+Description=Envolées research timer
+
+[Timer]
+# Déclenchement 2x/jour
+OnCalendar=*-*-* 07:30:00
+OnCalendar=*-*-* 19:30:00
+
+# Rattraper les exécutions manquées (machine éteinte)
+Persistent=true
+
+# Délai aléatoire pour éviter les pics (optionnel)
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+
+
+
+./systemd/README.md
+────────────────────────────────────────────────────────────
+
+# Envolées - Automatisation systemd
+
+## Architecture
+
+Trois timers indépendants :
+
+| Timer | Fréquence | Fonction |
+|-------|-----------|----------|
+| `envolees-cache` | 6h | Maintient le cache à jour |
+| `envolees-validation` | 1x/jour (07:00) | Pipeline complet IS/OOS |
+| `envolees-heartbeat` | 1x/jour (08:30) | Signal de vie "tout va bien" |
+
+## Installation rapide
+
+```bash
+# 1. Copier les fichiers
+mkdir -p ~/.config/systemd/user
+cp systemd/*.service systemd/*.timer ~/.config/systemd/user/
+
+# 2. Recharger systemd
+systemctl --user daemon-reload
+
+# 3. Activer les timers
+systemctl --user enable --now envolees-cache.timer
+systemctl --user enable --now envolees-validation.timer
+systemctl --user enable --now envolees-heartbeat.timer
+```
+
+## Vérification
+
+```bash
+# Voir les timers actifs
+systemctl --user list-timers
+
+# Statut d'un timer
+systemctl --user status envolees-validation.timer
+
+# Logs d'un service
+journalctl --user -u envolees-validation.service -f
+
+# Exécuter manuellement
+systemctl --user start envolees-validation.service
+```
+
+## Comportement du pipeline
+
+### Mode tolérant (par défaut)
+
+Le pipeline est **tolérant par ticker** :
+
+1. **Cache verify** identifie les tickers avec problèmes (gaps, stale)
+2. Les tickers KO sont **exclus** mais le pipeline **continue**
+3. Les backtests IS/OOS tournent sur les tickers éligibles
+4. L'alerte finale liste les exclusions et motifs de rejet
+
+Exemple :
+```
+Tickers: NZDUSD=X, GBPUSD=X, BTC-USD
+BTC-USD a des gaps → exclu
+Pipeline continue avec NZDUSD=X, GBPUSD=X
+Alerte: "2/3 analysés, 1 exclu (BTC-USD: gaps)"
+```
+
+### Mode strict (optionnel)
+
+Pour forcer l'échec si un ticker a des problèmes :
+
+```bash
+python main.py pipeline --strict
+```
+
+### Séparation gaps vs stale
+
+- **gaps** : données manquantes = ticker exclu (backtest faussé)
+- **stale** : données pas récentes = warning mais éligible (backtest historique OK)
+
+## Workflow détaillé
+
+### Cache (toutes les 6h)
+1. `cache-warm` : télécharge/rafraîchit les données
+2. `cache-verify` : vérifie l'intégrité, envoie alerte si problème
+
+### Validation (1x/jour à 07:00)
+Le service appelle `python main.py pipeline` qui :
+1. `cache-warm` : données fraîches
+2. `cache-verify --export-eligible` : liste les tickers OK
+3. `run` IS : backtest in-sample (tickers éligibles uniquement)
+4. `run` OOS : backtest out-of-sample
+5. `compare --alert` : validation + shortlist + alerte enrichie
+
+### Heartbeat (1x/jour à 08:30)
+- Envoie un signal de vie après la validation
+- Contenu minimal : "ok", cache status, shortlist size
+
+## Alertes
+
+Le pipeline envoie une alerte enrichie avec :
+- Profil actif (challenge/funded)
+- Tickers analysés vs exclus (avec raisons)
+- Motifs de rejet OOS (trades insuffisants, DD trop élevé, etc.)
+- Shortlist finale (top 5)
+- Meilleur ticker et score
+
+## Personnalisation
+
+### Changer les horaires
+
+Éditer les fichiers `.timer` :
+
+```ini
+# Validation à 19:00 au lieu de 07:00
+OnCalendar=*-*-* 19:00:00
+```
+
+Puis recharger :
+```bash
+systemctl --user daemon-reload
+```
+
+### Désactiver un timer
+
+```bash
+systemctl --user disable envolees-heartbeat.timer
+systemctl --user stop envolees-heartbeat.timer
+```
+
+## Dépannage
+
+### Le service ne démarre pas
+
+```bash
+# Vérifier les erreurs
+journalctl --user -u envolees-validation.service --no-pager -n 50
+
+# Vérifier que .env et .env.secret existent
+ls -la ~/dev/envolees/.env*
+```
+
+### Permission denied sur .env.secret
+
+```bash
+chmod 600 ~/dev/envolees/.env.secret
+```
+
+### Le timer ne se déclenche pas
+
+```bash
+# Vérifier que le timer est actif
+systemctl --user is-enabled envolees-validation.timer
+
+# Vérifier l'heure du prochain déclenchement
+systemctl --user list-timers --all | grep envolees
+```
+
+### Alertes non reçues
+
+```bash
+# Vérifier la config
+cat ~/dev/envolees/.env.secret
+
+# Tester manuellement
+python main.py alert "Test" --level info
+```
+
+
+
+./systemd/envolees-cache.service
+────────────────────────────────────────────────────────────
+
+# Envolées - Rafraîchissement du cache
+#
+# Maintient le cache à jour toutes les 6h
+# Envoie une alerte si le cache est en erreur
+
+[Unit]
+Description=Envolées - Rafraîchissement cache
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/envolees
+
+ExecStart=/usr/bin/bash -lc '\
+    cd %h/dev/envolees && \
+    source .venv/bin/activate && \
+    set -a && source .env && source .env.secret 2>/dev/null || true && set +a && \
+    python main.py cache-warm && \
+    python main.py cache-verify || python main.py alert "Cache verify failed" --level warning \
+'
+
+# Timeout 10 min
+TimeoutStartSec=600
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+
+
+
+./systemd/envolees-cache.timer
+────────────────────────────────────────────────────────────
+
+# Envolées - Timer de rafraîchissement cache
+# Exécute toutes les 6h pour garder le cache frais
+
+[Unit]
+Description=Envolées - Rafraîchissement cache (timer)
+
+[Timer]
+# Exécuter toutes les 6h
+OnCalendar=*-*-* 00,06,12,18:00:00
+
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+
+
+
+./systemd/envolees-heartbeat.service
+────────────────────────────────────────────────────────────
+
+# Envolées - Heartbeat quotidien
+#
+# Envoie un signal de vie "tout va bien" 1x/jour
+# Très simple, très rapide, très stable
+
+[Unit]
+Description=Envolées - Heartbeat quotidien
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/envolees
+
+ExecStart=/usr/bin/bash -lc '\
+    cd %h/dev/envolees && \
+    source .venv/bin/activate && \
+    set -a && source .env && source .env.secret 2>/dev/null || true && set +a && \
+    python main.py heartbeat \
+'
+
+# Timeout court (30s max)
+TimeoutStartSec=30
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+
+
+
+./systemd/envolees-heartbeat.timer
+────────────────────────────────────────────────────────────
+
+# Envolées - Timer heartbeat quotidien
+# Envoie un "tout va bien" 1x/jour à 08:30 (après la validation)
+
+[Unit]
+Description=Envolées - Heartbeat quotidien (timer)
+
+[Timer]
+# Exécuter tous les jours à 08:30 (après validation de 07:00)
+OnCalendar=*-*-* 08:30:00
+
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+
+
+
+./systemd/envolees-validation.service
+────────────────────────────────────────────────────────────
+
+# Envolées - Validation quotidienne IS/OOS
+#
+# Pipeline complet avec tolérance par ticker :
+# - Les tickers avec des problèmes de cache sont exclus
+# - Le pipeline continue avec les tickers éligibles
+# - Une alerte est envoyée avec les exclusions
+#
+# Installation :
+#   mkdir -p ~/.config/systemd/user
+#   cp systemd/*.service systemd/*.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now envolees-validation.timer
+#
+# Logs :
+#   journalctl --user -u envolees-validation.service -f
+
+[Unit]
+Description=Envolées - Validation quotidienne IS/OOS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/envolees
+
+# Pipeline complet avec tolérance par ticker
+ExecStart=/usr/bin/bash -lc '\
+    cd %h/dev/envolees && \
+    source .venv/bin/activate && \
+    set -a && source .env && source .env.secret 2>/dev/null || true && set +a && \
+    python main.py pipeline --alert \
+'
+
+# Timeout 30 min (backtests peuvent être longs)
+TimeoutStartSec=1800
+
+# Logs vers journal
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
+
+
+
+./systemd/envolees-validation.timer
+────────────────────────────────────────────────────────────
+
+# Envolées - Timer de validation quotidienne
+# Exécute la validation 1x/jour à 07:00
+
+[Unit]
+Description=Envolées - Validation quotidienne (timer)
+
+[Timer]
+# Exécuter tous les jours à 07:00 (heure locale)
+OnCalendar=*-*-* 07:00:00
+
+# Rattraper les exécutions manquées (ex: machine éteinte)
+Persistent=true
+
+# Délai aléatoire pour éviter les pics (0-5 min)
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+
+
+
+./README.md
+────────────────────────────────────────────────────────────
+
+# 🚀 Envolées
+
+**Backtest engine for Donchian breakout strategy with prop firm simulation**
+
+## Features
+
+- **Stratégie Donchian Breakout** : EMA200 + Donchian(20) + buffer ATR
+- **Simulation Prop Firm** : Daily DD (FTMO/GFT), kill-switch, limite de pertes
+- **Modèle de coûts** : Pénalité d'exécution en multiples d'ATR
+- **Multi-assets** : FX, Crypto, Indices, Commodities
+- **Split temporel IS/OOS** : Validation croisée in-sample / out-of-sample
+- **Cache local** : Évite de retélécharger les données Yahoo
+- **Alias tickers** : Utilise `GOLD` au lieu de `GC=F`, `BTC` au lieu de `BTC-USD`
+- **Scoring automatique** : Score agrégé par ticker + génération shortlist
+- **Export complet** : CSV trades, equity curve, stats journalières, scores, shortlist
+
+## Installation
+
+```bash
+# Clone
+git clone git@github.com:ashledombos/envolees.git && cd envolees
+
+# Environnement virtuel (recommandé)
+python -m venv .venv
+source .venv/bin/activate  # Linux/Mac
+
+# Installation
+pip install -e .
+
+# Ou avec dépendances dev
+pip install -e ".[dev]"
+```
+
+## Configuration
+
+```bash
+# Copier le template
+cp .env.example .env
+
+# Ou utiliser une config spécialisée
+cp .env.challenge.example .env   # Pour challenge prop firm
+cp .env.funded.example .env      # Pour compte funded
+```
+
+### Fichiers de configuration
+
+| Fichier | Usage |
+|---------|-------|
+| `.env.example` | Template de base |
+| `.env.full.example` | Validation complète avec split IS/OOS |
+| `.env.best.example` | Production candidate (panier validé) |
+| `.env.challenge.example` | Challenge prop firm (risque modéré) |
+| `.env.funded.example` | Compte funded (ultra-conservateur) |
+
+### Variables principales
+
+| Variable | Description | Défaut |
+|----------|-------------|--------|
+| `TICKERS` | Liste des tickers | Portfolio multi-asset |
+| `PENALTIES` | Pénalités ATR | 0.05 à 0.25 |
+| `RISK_PER_TRADE` | Risque par trade | 0.25% |
+| `MODE` | Daily DD mode | worst |
+| `SPLIT_MODE` | Split temporel | (désactivé) |
+| `SPLIT_TARGET` | is ou oos | is |
+
+## Usage
+
+### CLI
+
+```bash
+# Backtest complet
+python main.py run
+
+# Tickers spécifiques (supporte les alias)
+python main.py run -t BTC,ETH,GOLD,SP500
+
+# Split out-of-sample
+python main.py run --split oos -o out_oos
+
+# Un seul ticker
+python main.py single BTC-USD --penalty 0.10
+
+# Comparer IS vs OOS (avec shortlist)
+python main.py compare out_is out_oos -o out_compare --alert
+
+# Gestion du cache
+python main.py cache           # Stats cache
+python main.py cache-warm      # Pré-charger les données
+python main.py cache-verify    # Vérifier intégrité
+python main.py cache-clear     # Vider le cache
+
+# Configuration
+python main.py config
+```
+
+### Workflow complet (recherche)
+
+```bash
+# 1. Pré-charger le cache
+python main.py cache-warm
+
+# 2. Vérifier les données
+python main.py cache-verify --fail-on-gaps
+
+# 3. In-sample
+SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
+
+# 4. Out-of-sample
+SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
+
+# 5. Comparer et générer shortlist
+python main.py compare out_is out_oos --dd-cap 0.012 --max-tickers 5 --alert
+```
+
+### Workflow validation IS/OOS
+
+```bash
+# 1. In-sample (70% des données)
+SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
+
+# 2. Out-of-sample (30% des données)
+SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
+
+# 3. Comparer les résultats
+head out_is/results.csv
+head out_oos/results.csv
+```
+
+### Alias de tickers
+
+Plus besoin de retenir les symboles Yahoo. Les alias sont définis dans `envolees/data/aliases.py`.
+
+| Alias | Yahoo Symbol | Classe |
+|-------|-------------|--------|
+| `GOLD`, `XAUUSD` | `GC=F` | Metals |
+| `SILVER`, `XAGUSD` | `SI=F` | Metals |
+| `WTI`, `CRUDE` | `CL=F` | Energy |
+| `BRENT`, `BCO` | `BZ=F` | Energy |
+| `BTC` | `BTC-USD` | Crypto |
+| `ETH` | `ETH-USD` | Crypto |
+| `SOL` | `SOL-USD` | Crypto |
+| `SP500`, `SPX` | `^GSPC` | Index |
+| `NASDAQ`, `NDX` | `^NDX` | Index |
+| `DOW`, `DJI` | `^DJI` | Index |
+| `DAX` | `^GDAXI` | Index |
+| `FTSE` | `^FTSE` | Index |
+| `NIKKEI`, `N225`, `JAP225` | `^N225` | Index |
+| `CAC40` | `^FCHI` | Index |
+| `EURUSD` | `EURUSD=X` | FX |
+| `GBPUSD` | `GBPUSD=X` | FX |
+| `USDJPY` | `USDJPY=X` | FX |
+| `AUDUSD` | `AUDUSD=X` | FX |
+| `NZDUSD` | `NZDUSD=X` | FX |
+
+### Syntaxe WEIGHT_*
+
+Les pondérations utilisent des **alias normalisés** (sans caractères spéciaux) :
+
+```bash
+# ✅ Correct
+WEIGHT_BTC=0.8       # pour BTC-USD
+WEIGHT_EURUSD=1.0    # pour EURUSD=X
+WEIGHT_GSPC=0.9      # pour ^GSPC
+WEIGHT_GC=0.75       # pour GC=F
+WEIGHT_USDJPY=0.5    # pour USDJPY=X
+
+# ❌ Incorrect (caractères spéciaux non supportés dans les noms de variables)
+WEIGHT_BTC-USD=0.8
+WEIGHT_^GSPC=0.9
+WEIGHT_GC=F=0.75
+```
+
+## Validation IS/OOS
+
+### Workflow complet
+
+```bash
+# 1. In-sample (70% des données)
+SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
+
+# 2. Out-of-sample (30% des données)
+SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
+
+# 3. Comparer et valider
+python main.py compare out_is out_oos -o out_compare
+```
+
+### Critères d'éligibilité OOS
+
+Un ticker est validé si (à la pénalité de référence, défaut 0.25) :
+
+| Critère | Seuil | Description |
+|---------|-------|-------------|
+| `n_trades` | ≥ 15 | Assez de trades pour être significatif |
+| `expectancy_r` | > 0 | Expectancy positive |
+| `profit_factor` | ≥ 1.2 | PF minimum |
+| `max_daily_dd` | < 5% | Drawdown journalier acceptable |
+| `exp_drop` | < 50% | Dégradation IS→OOS limitée |
+
+### Rapports générés
+
+```
+out_compare/
+├── comparison_full.csv   # Toutes les pénalités
+├── comparison_ref.csv    # Pénalité de référence uniquement
+└── validated.csv         # Tickers validés OOS
+```
+
+## Output
+
+```
+out/
+├── results.csv              # Détails tous backtests
+├── scores.csv               # Score agrégé par ticker
+├── shortlist.csv            # Candidats production
+├── BTC-USD/
+│   ├── PEN_0.05/
+│   │   ├── trades.csv
+│   │   ├── equity_curve.csv
+│   │   ├── daily_stats.csv
+│   │   └── summary.json
+│   └── ...
+└── ...
+```
+
+### Shortlist automatique
+
+Le fichier `shortlist.csv` contient les tickers qui passent les critères :
+- Expectancy > 0.10 à PEN 0.25
+- Profit Factor > 1.2
+- Max Daily DD < 4.5%
+- Minimum 30 trades
+
+## Stratégie
+
+### Règles d'entrée
+
+1. **Filtre tendance** : Close > EMA200 (long) ou Close < EMA200 (short)
+2. **Signal** : Breakout Donchian(20) + buffer 0.10×ATR
+3. **Filtre volatilité** : ATR relatif < quantile 90%
+4. **Fenêtre** : Pas de signaux 22:30 - 06:30 Paris
+
+### Exécution
+
+- Ordre stop valable 1 bougie 4H
+- Pénalité d'exécution appliquée à l'entrée
+- SL = Entry - 1×ATR
+- TP = Entry + 1×ATR (RR 1:1)
+
+### Convention conservative
+
+Si SL et TP touchés même bougie → SL prioritaire
+
+## Simulation Prop Firm
+
+- **Daily DD mode "worst"** : Mark-to-market sur Low (long) / High (short)
+- **Kill-switch** : Trading arrêté si daily DD ≥ 4%
+- **Limite pertes** : Trading arrêté après 2 pertes clôturées/jour
+- **Métriques** : Max daily DD, P99, violations FTMO/GFT
+
+## Alertes
+
+### Configuration
+
+```bash
+# .env
+# ntfy (notifications push légères)
+NTFY_TOPIC=envolees-trading
+NTFY_SERVER=https://ntfy.sh
+
+# Telegram (notifications détaillées)
+TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+TELEGRAM_CHAT_ID=123456789
+```
+
+### Usage
+
+```bash
+# Envoyer une alerte après compare
+python main.py compare out_is out_oos --alert
+```
+
+### Format des alertes
+
+**ntfy** (une ligne) :
+```
+CHALLENGE │ open:2 │ exp:0.9R │ budget:0.7% │ E1/TP1/SL0
+```
+
+**Telegram** (détaillé) :
+```
+🚀 Envolées — challenge
+📅 2026-01-11 19:00
+
+💰 Budget jour: 1.5% │ consommé: 0.8% │ restant: 0.7%
+📊 Ouverts: 2 │ exposition: 0.9R │ max: 0.5R (NZDUSD)
+📝 Événements: 1 entrée │ 1 TP
+
+🎯 Shortlist: NZDUSD(1.2), GBPUSD(1.1), USDJPY(0.8)
+```
+
+## Services Systemd
+
+Pour automatiser la recherche 2x/jour :
+
+```bash
+# Copier les fichiers
+cp systemd/envolees-research.service ~/.config/systemd/user/
+cp systemd/envolees-research.timer ~/.config/systemd/user/
+
+# Activer
+systemctl --user daemon-reload
+systemctl --user enable --now envolees-research.timer
+
+# Logs
+journalctl --user -u envolees-research.service -f
+```
+
+Voir `systemd/README.md` pour plus de détails.
+
+## Development
+
+```bash
+# Tests
+pytest
+
+# Lint
+ruff check envolees/
+
+# Type check
+mypy envolees/
+```
+
+## License
+
+MIT
+
+
+
+./pyproject.toml
+────────────────────────────────────────────────────────────
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "envolees"
+version = "0.1.0"
+description = "Backtest engine for Donchian breakout strategy with prop firm simulation"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Raph" }
+]
+keywords = ["trading", "backtest", "prop-firm", "donchian", "ftmo", "gft"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "yfinance>=0.2.40",
+    "pandas>=2.2.0",
+    "numpy>=1.26.0",
+    "python-dotenv>=1.0.0",
+    "click>=8.1.0",
+    "rich>=13.7.0",
+    "pyarrow>=15.0.0",
+    "requests>=2.31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
+    "pandas-stubs>=2.2.0",
+]
+
+[project.scripts]
+envolees = "envolees.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["envolees"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+plugins = ["numpy.typing.mypy_plugin"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --cov=envolees --cov-report=term-missing"
+
+
+
+./main.py
+────────────────────────────────────────────────────────────
+
+#!/usr/bin/env python3
+"""
+Envolées - Point d'entrée principal.
+
+Usage:
+    python main.py run                      # Backtest tous les tickers/.env
+    python main.py run -t BTC-USD,ETH-USD   # Tickers spécifiques
+    python main.py single BTC-USD           # Un seul ticker
+    python main.py config                   # Afficher la config
+
+Voir `python main.py --help` pour plus d'options.
+"""
+
+from envolees.cli import main
+
+if __name__ == "__main__":
+    main()
+
+
+
+./.gitignore
+────────────────────────────────────────────────────────────
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Environments
+.env
+.env.secret
+.env.local
+.secrets
+.secrets*
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Keys and tokens (safety)
+*.key
+*.pem
+*.p12
+tokens.json
+credentials.json
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ruff
+.ruff_cache/
+
+# Output
+out/
+*.csv
+*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+
+
+./.env.secret.example
+────────────────────────────────────────────────────────────
+
+# =============================================================================
+# SECRETS - NE PAS COMMITER CE FICHIER
+# =============================================================================
+# Copier vers .env.secret et remplir les valeurs
+# chmod 600 .env.secret
+
+# -----------------------------------------------------------------------------
+# Alertes
+# -----------------------------------------------------------------------------
+NTFY_TOPIC=
+NTFY_SERVER=https://ntfy.sh
+
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+# -----------------------------------------------------------------------------
+# API Trading (pour plus tard)
+# -----------------------------------------------------------------------------
+# cTrader
+# CTRADER_CLIENT_ID=
+# CTRADER_CLIENT_SECRET=
+# CTRADER_ACCESS_TOKEN=
+
+# TradeLocker
+# TRADELOCKER_API_KEY=
+# TRADELOCKER_SECRET=
+
+
+
+./.env.funded.example
+────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ENVOLÉES - ENV FUNDED (Compte Financé)
+# =============================================================================
+# Objectif : robustesse et préservation du capital
+
+# -----------------------------------------------------------------------------
+# UNIVERS
+# -----------------------------------------------------------------------------
+TICKERS=NZDUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,GC=F
+PENALTIES=0.20,0.25
+
+# -----------------------------------------------------------------------------
+# MODE & SCORING
+# -----------------------------------------------------------------------------
+MODE=worst
+SHORTLIST_MIN_SCORE=0.66
+SHORTLIST_MAX_TICKERS=4
+MIN_TRADES_OOS=15
+DD_CAP=0.010
+
+# -----------------------------------------------------------------------------
+# SPLIT (validation OOS)
+# -----------------------------------------------------------------------------
+SPLIT_TARGET=oos
+SPLIT_RATIO=0.70
+
+# -----------------------------------------------------------------------------
+# PONDÉRATIONS (alias normalisés)
+# -----------------------------------------------------------------------------
+WEIGHT_NZDUSD=1.10
+WEIGHT_GBPUSD=0.90
+WEIGHT_USDJPY=0.60
+WEIGHT_BTC=0.60
+WEIGHT_GC=0.70
+
+# -----------------------------------------------------------------------------
+# RISQUE (mode funded - conservateur)
+# -----------------------------------------------------------------------------
+RISK_MODE=funded
+RISK_PER_TRADE=0.003
+DAILY_RISK_BUDGET=0.006
+MAX_CONCURRENT_TRADES=2
+STOP_AFTER_N_LOSSES=2
+
+# -----------------------------------------------------------------------------
+# CACHE
+# -----------------------------------------------------------------------------
+CACHE_ENABLED=true
+CACHE_MAX_AGE_HOURS=24
+
+# -----------------------------------------------------------------------------
+# ALERTES (optionnel)
+# -----------------------------------------------------------------------------
+# NTFY_TOPIC=envolees-funded
+# NTFY_SERVER=https://ntfy.sh
+# TELEGRAM_BOT_TOKEN=
+# TELEGRAM_CHAT_ID=
+
+# -----------------------------------------------------------------------------
+# OUTPUT
+# -----------------------------------------------------------------------------
+OUTPUT_DIR=out_funded
+
+
+
+./.env.full.example
+────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ENVOLÉES - ENV FULL (Validation complète)
+# =============================================================================
+# Configuration pour la validation multi-pénalités sur l'univers complet.
+# Copier vers .env pour utiliser.
+
+# -----------------------------------------------------------------------------
+# UNIVERS DE TICKERS
+# -----------------------------------------------------------------------------
+# Universe complet validé (8 instruments, bonne décorrélation)
+TICKERS=GBPUSD=X,NZDUSD=X,USDJPY=X,BTC-USD,ETH-USD,^GSPC,^NDX,GC=F
+
+# Alias par classe (pour référence, non utilisés directement)
+# FX:      GBPUSD, NZDUSD, USDJPY
+# Crypto:  BTC, ETH
+# Indices: SP500, NASDAQ
+# Metals:  GOLD
+
+# -----------------------------------------------------------------------------
+# PÉNALITÉS D'EXÉCUTION
+# -----------------------------------------------------------------------------
+# Batterie complète pour trouver le sweet spot
+PENALTIES=0.05,0.10,0.15,0.20,0.25
+
+# -----------------------------------------------------------------------------
+# SPLIT TEMPOREL (IS/OOS)
+# -----------------------------------------------------------------------------
+# Activer pour la validation croisée
+SPLIT_MODE=time
+SPLIT_RATIO=0.70
+# is = in-sample (70% données), oos = out-of-sample (30% données)
+# Lancer 2 fois : SPLIT_TARGET=is puis SPLIT_TARGET=oos
+SPLIT_TARGET=is
+
+# -----------------------------------------------------------------------------
+# CAPITAL & RISQUE
+# -----------------------------------------------------------------------------
+START_BALANCE=100000
+RISK_PER_TRADE=0.0025
+
+# -----------------------------------------------------------------------------
+# MODE DAILY DD
+# -----------------------------------------------------------------------------
+# worst = mark-to-market sur Low/High intrabar (recommandé pour prop)
+# close = mark-to-market sur Close (moins conservateur)
+MODE=worst
+
+# -----------------------------------------------------------------------------
+# PONDÉRATIONS PAR TICKER (optionnel)
+# -----------------------------------------------------------------------------
+# Format: WEIGHT_<ALIAS>=<poids>
+# L'alias est le ticker normalisé : BTC (pas BTC-USD), EURUSD (pas EURUSD=X), GSPC (pas ^GSPC)
+WEIGHT_GBPUSD=1.0
+WEIGHT_NZDUSD=1.0
+WEIGHT_USDJPY=0.5
+WEIGHT_BTC=1.0
+WEIGHT_ETH=1.0
+WEIGHT_GSPC=1.0
+WEIGHT_NDX=1.0
+WEIGHT_GC=0.75
+
+# -----------------------------------------------------------------------------
+# CACHE
+# -----------------------------------------------------------------------------
+CACHE_ENABLED=true
+CACHE_MAX_AGE_HOURS=24
+
+# -----------------------------------------------------------------------------
+# OUTPUT
+# -----------------------------------------------------------------------------
+# Utiliser des dossiers séparés pour IS et OOS
+OUTPUT_DIR=out_is
+# OUTPUT_DIR=out_oos
+
+
+
+./.env.example
+────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ENVOLÉES - Configuration
+# =============================================================================
+# Fichier principal de configuration (committé).
+# Les secrets (tokens, clés) vont dans .env.secret (non committé).
+#
+# PROFILS DISPONIBLES :
+#   challenge    - Vitesse 5-10%, risque modéré
+#   funded       - Robustesse, risque faible
+#   conservative - Ultra-conservateur
+#   aggressive   - Casino (déconseillé)
+#   default      - Équilibré
+
+# -----------------------------------------------------------------------------
+# PROFIL ACTIF
+# -----------------------------------------------------------------------------
+# Le profil définit les paramètres de risque par défaut.
+# Les variables ci-dessous surchargent le profil si définies.
+PROFILE=challenge
+
+# -----------------------------------------------------------------------------
+# TICKERS
+# -----------------------------------------------------------------------------
+# Liste des tickers à backtester (séparés par des virgules)
+# Supporte les alias : GOLD, BTC, SP500, etc. (voir data/aliases.py)
+TICKERS=NZDUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,GC=F
+
+# Exemples par classe :
+# FX:          EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, NZDUSD=X
+# Crypto:      BTC-USD, ETH-USD, SOL-USD
+# Indices:     ^GSPC (SP500), ^NDX (Nasdaq), ^DJI (Dow), ^GDAXI (DAX)
+# Commodities: GC=F (Gold), SI=F (Silver), CL=F (WTI), BZ=F (Brent)
+
+# -----------------------------------------------------------------------------
+# PÉNALITÉS D'EXÉCUTION
+# -----------------------------------------------------------------------------
+# Multiples de ATR appliqués à l'entrée (slippage simulé)
+PENALTIES=0.05,0.10,0.15,0.20,0.25
+
+# -----------------------------------------------------------------------------
+# CAPITAL & RISQUE
+# -----------------------------------------------------------------------------
+START_BALANCE=100000
+# RISK_PER_TRADE est défini par le profil (PROFILE=challenge → 0.6%)
+# Décommenter pour surcharger le profil :
+# RISK_PER_TRADE=0.0025
+
+# -----------------------------------------------------------------------------
+# MODE DAILY DD
+# -----------------------------------------------------------------------------
+# worst = mark-to-market sur Low/High intrabar (recommandé)
+# close = mark-to-market sur Close uniquement
+MODE=worst
+
+# -----------------------------------------------------------------------------
+# SPLIT TEMPOREL (IS/OOS)
+# -----------------------------------------------------------------------------
+# Activer pour validation croisée
+# SPLIT_MODE : "" ou "none" = pas de split, "time" = split temporel
+SPLIT_MODE=
+SPLIT_RATIO=0.70
+# SPLIT_TARGET : "is" = in-sample, "oos" = out-of-sample
+SPLIT_TARGET=
+
+# -----------------------------------------------------------------------------
+# INDICATEURS
+# -----------------------------------------------------------------------------
+EMA_PERIOD=200
+ATR_PERIOD=14
+DONCHIAN_N=20
+BUFFER_ATR=0.10
+
+# -----------------------------------------------------------------------------
+# STOPS & OBJECTIFS
+# -----------------------------------------------------------------------------
+SL_ATR=1.00
+TP_R=1.00
+
+# -----------------------------------------------------------------------------
+# FILTRE VOLATILITÉ
+# -----------------------------------------------------------------------------
+VOL_QUANTILE=0.90
+VOL_WINDOW_BARS=1000
+
+# -----------------------------------------------------------------------------
+# FENÊTRE SANS TRADING (Europe/Paris)
+# -----------------------------------------------------------------------------
+NO_TRADE_START=22:30
+NO_TRADE_END=06:30
+
+# -----------------------------------------------------------------------------
+# ORDRE EN ATTENTE
+# -----------------------------------------------------------------------------
+ORDER_VALID_BARS=1
+
+# -----------------------------------------------------------------------------
+# CONVENTION CONSERVATIVE
+# -----------------------------------------------------------------------------
+# Si SL et TP touchés même bougie → SL prioritaire
+CONSERVATIVE_SAME_BAR=true
+
+# -----------------------------------------------------------------------------
+# PROP FIRM SIMULATION
+# -----------------------------------------------------------------------------
+DAILY_DD_FTMO=0.05
+DAILY_DD_GFT=0.04
+MAX_LOSS=0.10
+DAILY_KILL_SWITCH=0.04
+STOP_AFTER_N_LOSSES=2
+
+# -----------------------------------------------------------------------------
+# YAHOO FINANCE
+# -----------------------------------------------------------------------------
+YF_PERIOD=730d
+YF_INTERVAL=1h
+
+# -----------------------------------------------------------------------------
+# CACHE
+# -----------------------------------------------------------------------------
+CACHE_ENABLED=true
+CACHE_MAX_AGE_HOURS=24
+# CACHE_DIR=  # Laisser vide pour utiliser ~/.cache/envolees
+
+# -----------------------------------------------------------------------------
+# SHORTLIST (génération automatique)
+# -----------------------------------------------------------------------------
+# Seuils pour inclusion dans shortlist_tradable.csv
+SHORTLIST_MIN_SCORE=0.0
+SHORTLIST_MAX_TICKERS=10
+MIN_TRADES_OOS=15
+DD_CAP=0.012
+
+# -----------------------------------------------------------------------------
+# ALERTES (optionnel)
+# -----------------------------------------------------------------------------
+# ntfy (notifications push légères)
+# NTFY_TOPIC=envolees-trading
+# NTFY_SERVER=https://ntfy.sh
+
+# Telegram (notifications détaillées)
+# TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
+# TELEGRAM_CHAT_ID=123456789
+
+# -----------------------------------------------------------------------------
+# OUTPUT
+# -----------------------------------------------------------------------------
+OUTPUT_DIR=out
+
+# -----------------------------------------------------------------------------
+# PONDÉRATIONS PAR TICKER (optionnel)
+# -----------------------------------------------------------------------------
+# Format : WEIGHT_<TICKER_ALIAS>=<poids>
+# Exemple : WEIGHT_USDJPY=0.5 réduit l'exposition de 50%
+# WEIGHT_GBPUSD=1.0
+# WEIGHT_USDJPY=0.5
+# WEIGHT_BTC=1.0
+
+
+
+./.env.challenge.example
+────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ENVOLÉES - ENV CHALLENGE (Prop Firm Challenge)
+# =============================================================================
+# Objectif : vitesse de passage 5-10% en restant pilotable
+
+# -----------------------------------------------------------------------------
+# UNIVERS
+# -----------------------------------------------------------------------------
+TICKERS=NZDUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,GC=F
+PENALTIES=0.15,0.20,0.25
+
+# -----------------------------------------------------------------------------
+# MODE & SCORING
+# -----------------------------------------------------------------------------
+MODE=worst
+SHORTLIST_MIN_SCORE=0.62
+SHORTLIST_MAX_TICKERS=5
+MIN_TRADES_OOS=15
+DD_CAP=0.012
+
+# -----------------------------------------------------------------------------
+# SPLIT (validation OOS)
+# -----------------------------------------------------------------------------
+SPLIT_TARGET=oos
+SPLIT_RATIO=0.70
+
+# -----------------------------------------------------------------------------
+# PONDÉRATIONS (alias normalisés)
+# -----------------------------------------------------------------------------
+WEIGHT_NZDUSD=1.20
+WEIGHT_GBPUSD=1.10
+WEIGHT_USDJPY=0.80
+WEIGHT_BTC=0.70
+WEIGHT_GC=0.60
+
+# -----------------------------------------------------------------------------
+# RISQUE (mode challenge)
+# -----------------------------------------------------------------------------
+RISK_MODE=challenge
+RISK_PER_TRADE=0.006
+DAILY_RISK_BUDGET=0.015
+MAX_CONCURRENT_TRADES=4
+STOP_AFTER_N_LOSSES=3
+
+# -----------------------------------------------------------------------------
+# CACHE
+# -----------------------------------------------------------------------------
+CACHE_ENABLED=true
+CACHE_MAX_AGE_HOURS=12
+
+# -----------------------------------------------------------------------------
+# ALERTES (optionnel)
+# -----------------------------------------------------------------------------
+# NTFY_TOPIC=envolees-challenge
+# NTFY_SERVER=https://ntfy.sh
+# TELEGRAM_BOT_TOKEN=
+# TELEGRAM_CHAT_ID=
+
+# -----------------------------------------------------------------------------
+# OUTPUT
+# -----------------------------------------------------------------------------
+OUTPUT_DIR=out_challenge
+
+
+
+./.env.best.example
+────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ENVOLÉES - ENV BEST (Prod Candidate)
+# =============================================================================
+# Configuration pour le panier validé, prêt pour la production.
+# À utiliser après validation IS/OOS réussie.
+
+# -----------------------------------------------------------------------------
+# UNIVERS DE TICKERS - PANIER RESSERRÉ
+# -----------------------------------------------------------------------------
+# Uniquement les instruments validés avec ExpR > 0.15 à PEN 0.25
+# et DDmax < 4.5%
+TICKERS=GBPUSD=X,NZDUSD=X,BTC-USD,ETH-USD,^GSPC,^NDX,GC=F
+
+# -----------------------------------------------------------------------------
+# PÉNALITÉ UNIQUE
+# -----------------------------------------------------------------------------
+# Pénalité de production (la plus conservative validée)
+PENALTIES=0.25
+
+# -----------------------------------------------------------------------------
+# PAS DE SPLIT
+# -----------------------------------------------------------------------------
+# On suppose la validation faite, backtest sur toutes les données
+SPLIT_MODE=none
+
+# -----------------------------------------------------------------------------
+# CAPITAL & RISQUE
+# -----------------------------------------------------------------------------
+START_BALANCE=100000
+RISK_PER_TRADE=0.0025
+
+# -----------------------------------------------------------------------------
+# MODE
+# -----------------------------------------------------------------------------
+MODE=worst
+
+# -----------------------------------------------------------------------------
+# OUTPUT
+# -----------------------------------------------------------------------------
+OUTPUT_DIR=out_best
+
+
+
+./.env
+────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ENVOLÉES - Configuration
+# =============================================================================
+# Copier ce fichier vers .env et adapter les valeurs
+
+# -----------------------------------------------------------------------------
+# Tickers (séparés par des virgules)
+# -----------------------------------------------------------------------------
+# FX
+TICKERS_FX=EURUSD=X,GBPUSD=X,USDJPY=X,AUDUSD=X,USDCAD=X,USDCHF=X,NZDUSD=X
+
+# Crypto
+TICKERS_CRYPTO=BTC-USD,ETH-USD,SOL-USD
+
+# Indices
+TICKERS_INDICES=^GSPC,^NDX,^DJI,^FTSE,^GDAXI,^N225
+
+# Commodities
+TICKERS_COMMODITIES=GC=F,SI=F,CL=F,BZ=F
+
+# Portfolio actif (tous les tickers à backtester)
+TICKERS=EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,ETH-USD,^GSPC,^NDX,GC=F,CL=F,BZ=F
+
+# -----------------------------------------------------------------------------
+# Pénalités d'exécution (multiples de ATR, séparées par des virgules)
+# -----------------------------------------------------------------------------
+EXEC_PENALTIES=0.05,0.10,0.15,0.20,0.25
+
+# -----------------------------------------------------------------------------
+# Capital & Risque
+# -----------------------------------------------------------------------------
+START_BALANCE=100000
+RISK_PER_TRADE=0.0025
+
+# -----------------------------------------------------------------------------
+# Indicateurs
+# -----------------------------------------------------------------------------
+EMA_PERIOD=200
+ATR_PERIOD=14
+DONCHIAN_N=20
+BUFFER_ATR=0.10
+
+# -----------------------------------------------------------------------------
+# Stops & Objectifs
+# -----------------------------------------------------------------------------
+SL_ATR=1.00
+TP_R=1.00
+
+# -----------------------------------------------------------------------------
+# Filtre Volatilité
+# -----------------------------------------------------------------------------
+VOL_QUANTILE=0.90
+VOL_WINDOW_BARS=1000
+
+# -----------------------------------------------------------------------------
+# Fenêtre sans trading (Europe/Paris)
+# -----------------------------------------------------------------------------
+NO_TRADE_START=22:30
+NO_TRADE_END=06:30
+
+# -----------------------------------------------------------------------------
+# Ordre en attente
+# -----------------------------------------------------------------------------
+ORDER_VALID_BARS=1
+
+# -----------------------------------------------------------------------------
+# Convention conservative (SL prioritaire si SL+TP même bougie)
+# -----------------------------------------------------------------------------
+CONSERVATIVE_SAME_BAR=true
+
+# -----------------------------------------------------------------------------
+# Prop Firm Simulation
+# -----------------------------------------------------------------------------
+# Seuils de violation (informatif)
+DAILY_DD_FTMO=0.05
+DAILY_DD_GFT=0.04
+MAX_LOSS=0.10
+
+# Kill-switch interne (halt trading si atteint)
+DAILY_KILL_SWITCH=0.04
+STOP_AFTER_N_LOSSES=2
+
+# Mode estimation daily DD : "close" ou "worst"
+DAILY_EQUITY_MODE=worst
+
+# -----------------------------------------------------------------------------
+# Yahoo Finance
+# -----------------------------------------------------------------------------
+YF_PERIOD=730d
+YF_INTERVAL=1h
+
+# -----------------------------------------------------------------------------
+# Output
+# -----------------------------------------------------------------------------
+OUTPUT_DIR=out
+
+
+
+./.env.universe.example
+────────────────────────────────────────────────────────────
+
+# =============================================================================
+# ENVOLÉES — ENV UNIVERSE (scan large)
+# Objectif : tester TOUS les instruments tradables, puis filtrer
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# TIMEFRAME & DATA
+# -----------------------------------------------------------------------------
+TIMEFRAME=4h
+TIMEZONE=Europe/Paris
+YF_PERIOD=730d
+YF_INTERVAL=1h
+
+# -----------------------------------------------------------------------------
+# UNIVERS COMPLET DE TICKERS
+# -----------------------------------------------------------------------------
+# Forex : USD, EUR, GBP, JPY, CHF, CAD, NZD, AUD
+# Crypto : BTC, ETH, SOL, BNB, BCH, LTC
+# Métaux : XAU, XAG
+# Énergies : Brent, WTI
+# Indices : US, Europe, Asie
+# Remplace la section TICKERS par une seule ligne :
+TICKERS=EURUSD=X,GBPUSD=X,USDJPY=X,USDCHF=X,USDCAD=X,AUDUSD=X,NZDUSD=X,EURGBP=X,EURJPY=X,EURCHF=X,EURCAD=X,EURAUD=X,EURNZD=X,GBPJPY=X,GBPCHF=X,GBPCAD=X,GBPAUD=X,GBPNZD=X,AUDJPY=X,NZDJPY=X,CADJPY=X,CHFJPY=X,BTC-USD,ETH-USD,SOL-USD,BNB-USD,BCH-USD,LTC-USD,GC=F,SI=F,CL=F,BZ=F,^GSPC,^NDX,^DJI,^GDAXI,^FTSE,^N225,^AXJO
+
+# -----------------------------------------------------------------------------
+# STRATÉGIE
+# -----------------------------------------------------------------------------
+EMA_PERIOD=200
+ATR_PERIOD=14
+DONCHIAN_N=20
+BUFFER_ATR=0.10
+
+SL_ATR=1.00
+TP_R=1.00
+ORDER_VALID_BARS=1
+
+# -----------------------------------------------------------------------------
+# STRESS TEST — PÉNALITÉS
+# -----------------------------------------------------------------------------
+# Test de robustesse (le live utilisera penalty=0)
+PENALTIES=0.00,0.10,0.20,0.25
+
+# -----------------------------------------------------------------------------
+# FILTRES
+# -----------------------------------------------------------------------------
+VOL_QUANTILE=0.90
+VOL_WINDOW_BARS=1000
+
+NO_TRADE_START=22:30
+NO_TRADE_END=06:30
+
+# -----------------------------------------------------------------------------
+# BACKTEST / SCORING
+# -----------------------------------------------------------------------------
+MIN_TRADES=80
+MIN_TRADES_OOS=15
+MAX_DRAWDOWN_PCT=25
+MIN_PROFIT_FACTOR=1.3
+
+# -----------------------------------------------------------------------------
+# MODE CONSERVATEUR
+# -----------------------------------------------------------------------------
+MODE=worst
+CONSERVATIVE_SAME_BAR=true
+
+# -----------------------------------------------------------------------------
+# CAPITAL (neutre pour le scan)
+# -----------------------------------------------------------------------------
+START_BALANCE=100000
+RISK_PER_TRADE=0.0025
+
+# -----------------------------------------------------------------------------
+# CACHE & OUTPUT
+# -----------------------------------------------------------------------------
+CACHE_ENABLED=true
+CACHE_MAX_AGE_HOURS=24
+OUTPUT_DIR=out_universe
+
+
+
+./codebase.sh
+────────────────────────────────────────────────────────────
+
+find . -type d \( -name .git -o -name __pycache__ \) -prune -o \
+     -type f ! -path '*/.git/*' ! -path '*/__pycache__/*' \
+            ! -name '.envi.secret*' ! -name '*.pyc' ! -name '*.pyo' \
+            ! -name '*.txt' ! -name '*codebase.md' ! -name 'tous_*.txt' \
+     -exec sh -c 'printf "\n%s\n────────────────────────────────────────────────────────────\n\n" "{}" && cat "{}" && printf "\n\n"' \; \
+     > codebase.md
+
+
