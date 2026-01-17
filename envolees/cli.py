@@ -673,7 +673,7 @@ def cache_verify(
     "--max-tickers",
     default=5,
     type=int,
-    help="Maximum tickers in shortlist (default: 5).",
+    help="Maximum tickers in shortlist (default: 20).",
 )
 @click.option(
     "--alert/--no-alert",
@@ -861,12 +861,12 @@ def compare(
             # Préparer les deux tiers pour l'alerte
             tier1_for_alert = []
             if not tier1.empty:
-                for _, row in tier1.head(5).iterrows():
+                for _, row in tier1.iterrows():
                     tier1_for_alert.append((row["ticker"], float(row["oos_score"])))
             
             tier2_for_alert = []
             if not tier2.empty:
-                for _, row in tier2.head(5).iterrows():
+                for _, row in tier2.iterrows():
                     tier2_for_alert.append((row["ticker"], float(row["oos_score"])))
             
             # Lire les exclusions cache si disponibles
@@ -1118,7 +1118,7 @@ def status(output: str) -> None:
         import pandas as pd
         try:
             df = pd.read_csv(shortlist_path)
-            shortlist = [(row["ticker"], row.get("oos_score", 0)) for _, row in df.head(5).iterrows()]
+            shortlist = [(row["ticker"], row.get("oos_score", 0)) for _, row in df.iterrows()]
         except Exception:
             pass
     

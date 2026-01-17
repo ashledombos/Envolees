@@ -92,3 +92,12 @@ Thumbs.db
 
 # Codebase
 codebase.*
+
+# Backups de patch
+*.bak
+*.orig
+*.backup
+
+# Scripts de patch temporaires
+apply_patch.sh
+patch_*.txt
