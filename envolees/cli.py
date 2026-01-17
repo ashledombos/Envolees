@@ -410,8 +410,17 @@ def cache_clear() -> None:
     default=None,
     help="Tickers to warm (comma-separated). Uses .env if not specified.",
 )
-def cache_warm(tickers: str | None) -> None:
-    """Pre-fetch data into cache for faster runs."""
+@click.option(
+    "--force", "-f",
+    is_flag=True,
+    help="Force refresh even if cache is valid (ignore CACHE_MAX_AGE_HOURS).",
+)
+def cache_warm(tickers: str | None, force: bool) -> None:
+    """Pre-fetch data into cache for faster runs.
+    
+    By default, respects CACHE_MAX_AGE_HOURS from .env (skips valid cache).
+    Use --force to re-download everything.
+    """
     from envolees.data import download_1h, resample_to_4h
     
     cfg = Config.from_env()
@@ -421,26 +430,32 @@ def cache_warm(tickers: str | None) -> None:
         else get_tickers()
     )
     
-    console.print(f"\n[cyan]Warming cache for {len(ticker_list)} tickers...[/cyan]\n")
+    # Déterminer l'âge max du cache
+    max_age = 0 if force else cfg.cache_max_age_hours
+    mode = "FORCE refresh" if force else f"respecting cache ({cfg.cache_max_age_hours}h max age)"
+    
+    console.print(f"\n[cyan]Warming cache for {len(ticker_list)} tickers — {mode}[/cyan]\n")
     
     success = 0
     errors = []
     
     for ticker in ticker_list:
         try:
-            # FIX: use_cache=True avec cache_max_age_hours=0 force le téléchargement
-            # tout en permettant la sauvegarde dans le cache
-            df = download_1h(ticker, cfg, use_cache=True, cache_max_age_hours=0, verbose=True)
+            df = download_1h(ticker, cfg, use_cache=True, cache_max_age_hours=max_age, verbose=True)
             console.print(f"[green]✓[/green] {ticker}: {len(df)} bars 1H")
             success += 1
         except Exception as e:
             console.print(f"[red]✗[/red] {ticker}: {e}")
             errors.append((ticker, str(e)))
     
-    console.print(f"\n[bold]Résultat:[/bold] {success}/{len(ticker_list)} tickers mis en cache")
+    console.print(f"\n[bold]Résultat:[/bold] {success}/{len(ticker_list)} tickers OK")
     
     if errors:
-        console.print(f"[yellow]⚠ {len(errors)} erreur(s)[/yellow]")
+        console.print(f"[yellow]⚠ {len(errors)} erreur(s):[/yellow]")
+        for ticker, err in errors[:5]:
+            console.print(f"  • {ticker}: {err}")
+        if len(errors) > 5:
+            console.print(f"  • ... et {len(errors) - 5} autres")
 
 
 @main.command("cache-verify")
