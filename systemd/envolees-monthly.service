@@ -1,0 +1,34 @@
+# Envolées - Réévaluation mensuelle complète
+#
+# Force le refresh du cache + pipeline complet
+# À utiliser 1x/mois pour la réévaluation de la liste d'instruments
+
+[Unit]
+Description=Envolées - Réévaluation mensuelle complète
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dev/envolees
+
+# Pipeline avec cache forcé
+ExecStart=/usr/bin/bash -lc '\
+    cd %h/dev/envolees && \
+    source .venv/bin/activate && \
+    set -a && source .env && source .env.secret 2>/dev/null || true && set +a && \
+    echo "=== Réévaluation mensuelle ===" && \
+    echo "1. Refresh cache (force)..." && \
+    python main.py cache-warm --force && \
+    echo "2. Pipeline complet..." && \
+    python main.py pipeline --alert \
+'
+
+# Timeout 45 min (cache force + backtests)
+TimeoutStartSec=2700
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

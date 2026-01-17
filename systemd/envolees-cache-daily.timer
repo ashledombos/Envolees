@@ -1,0 +1,18 @@
+# Envolées - Timer de vérification cache QUOTIDIEN
+# Vérifie le cache 1x/jour (au lieu de toutes les 6h)
+#
+# Avec le fix cache_warm (respecte CACHE_MAX_AGE_HOURS=24h),
+# ce timer ne télécharge que si le cache a expiré.
+
+[Unit]
+Description=Envolées - Vérification cache quotidienne (timer)
+
+[Timer]
+# Exécuter tous les jours à 06:00 (avant les marchés EU)
+OnCalendar=*-*-* 06:00:00
+
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
