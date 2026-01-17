@@ -686,7 +686,7 @@ def cache_verify(
 )
 @click.option(
     "--max-tickers",
-    default=5,
+    default=50,
     type=int,
     help="Maximum tickers in shortlist (default: 20).",
 )
