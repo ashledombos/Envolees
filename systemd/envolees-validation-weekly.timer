@@ -1,23 +1,16 @@
 # Envolées - Timer de validation HEBDOMADAIRE
-# Exécute la validation 1x/semaine le dimanche à 20:00
-#
-# Pourquoi hebdo et pas quotidien ?
-# - Avec 10-15 trades OOS sur 7 mois, un nouveau trade = ~15-20 jours
-# - Validation quotidienne = même résultat 95% du temps
-# - Économise les appels Yahoo Finance
 
 [Unit]
 Description=Envolées - Validation hebdomadaire (timer)
 
 [Timer]
-# Exécuter chaque dimanche à 20:00 (heure locale)
+# Chaque dimanche à 20:00
 OnCalendar=Sun *-*-* 20:00:00
-
-# Rattraper les exécutions manquées
 Persistent=true
-
-# Délai aléatoire 0-5 min
 RandomizedDelaySec=300
+
+# Pointer vers le service existant
+Unit=envolees-validation.service
 
 [Install]
 WantedBy=timers.target
