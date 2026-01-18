@@ -156,6 +156,14 @@ class BacktestEngine:
 
         # Calcul P&L
         result_r = self.open_position.compute_pnl_r(exit_price)
+        ## ajouut pànalité supplémentaire, à commmenter si problèmatique
+        SLIP_PENALTY = 0.05  # 5% du R
+        
+        if exit_reason == "SL":
+            result_r = result_r * (1 + SLIP_PENALTY)  # Perte aggravée
+        elif exit_reason == "TP":
+            result_r = result_r * (1 - SLIP_PENALTY)  # Gain réduit
+        ## fin de la pénalité supplémentaire
         result_cash = result_r * self.open_position.risk_cash
         self.balance += result_cash
 
