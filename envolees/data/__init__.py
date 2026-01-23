@@ -20,24 +20,54 @@ from envolees.data.calendar import (
     get_market_hours,
     get_max_staleness_hours,
     is_gap_expected,
+    is_us_holiday,
+    is_eu_holiday,
+    get_us_holidays,
+)
+from envolees.data.ftmo_instruments import (
+    FTMOInstrument,
+    AssetType,
+    ALL_INSTRUMENTS,
+    get_instrument_by_ftmo,
+    get_instrument_by_yahoo,
+    get_yahoo_symbols,
+    get_max_extra_gaps,
+    get_recommended_instruments,
+    get_yahoo_ticker_list,
+    FOREX_MAJORS,
+    FOREX_MINORS,
+    FOREX_EXOTICS,
+    CRYPTO_MAJORS,
+    CRYPTO_ALTCOINS,
+    METALS,
+    ENERGY,
+    AGRI,
+    INDICES_US,
+    INDICES_EU,
+    INDICES_ASIA,
 )
 from envolees.data.resample import resample_to_4h, resample_to_timeframe
 from envolees.data.yahoo import download_1h, download_1h_no_cache
 
 __all__ = [
+    # Yahoo
     "download_1h",
     "download_1h_no_cache",
+    # Resample
     "resample_to_4h",
     "resample_to_timeframe",
+    # Aliases
     "resolve_ticker",
     "get_canonical_name",
     "TICKER_ALIASES",
+    # Cache
     "cache_stats",
     "clear_cache",
     "get_cache_dir",
     "is_cache_valid",
     "load_from_cache",
     "save_to_cache",
+    # Calendar
     "AssetClass",
     "GapAnalysis",
     "MarketHours",
@@ -48,4 +78,28 @@ __all__ = [
     "get_market_hours",
     "get_max_staleness_hours",
     "is_gap_expected",
+    "is_us_holiday",
+    "is_eu_holiday",
+    "get_us_holidays",
+    # FTMO Instruments
+    "FTMOInstrument",
+    "AssetType",
+    "ALL_INSTRUMENTS",
+    "get_instrument_by_ftmo",
+    "get_instrument_by_yahoo",
+    "get_yahoo_symbols",
+    "get_max_extra_gaps",
+    "get_recommended_instruments",
+    "get_yahoo_ticker_list",
+    "FOREX_MAJORS",
+    "FOREX_MINORS",
+    "FOREX_EXOTICS",
+    "CRYPTO_MAJORS",
+    "CRYPTO_ALTCOINS",
+    "METALS",
+    "ENERGY",
+    "AGRI",
+    "INDICES_US",
+    "INDICES_EU",
+    "INDICES_ASIA",
 ]

@@ -16,6 +16,163 @@ if TYPE_CHECKING:
     import pandas as pd
 
 
+# =============================================================================
+# JOURS FÉRIÉS (marchés fermés)
+# =============================================================================
+
+# Jours fériés US - NYSE/CME fermés
+# Format: (mois, jour) ou fonction pour dates mobiles
+US_HOLIDAYS_FIXED = {
+    (1, 1),   # New Year's Day
+    (7, 4),   # Independence Day
+    (12, 25), # Christmas
+}
+
+# Jours fériés US à dates variables (calculés par année)
+def get_us_holidays(year: int) -> set[tuple[int, int, int]]:
+    """
+    Retourne les jours fériés US pour une année donnée.
+    
+    Returns:
+        Set de tuples (année, mois, jour)
+    """
+    from datetime import date
+    
+    holidays = set()
+    
+    # Fériés fixes
+    for month, day in US_HOLIDAYS_FIXED:
+        holidays.add((year, month, day))
+    
+    # MLK Day - 3ème lundi de janvier
+    holidays.add(_nth_weekday(year, 1, 0, 3))  # 3ème lundi
+    
+    # Presidents Day - 3ème lundi de février
+    holidays.add(_nth_weekday(year, 2, 0, 3))
+    
+    # Good Friday - vendredi avant Pâques (NYSE fermé)
+    easter = _easter_sunday(year)
+    good_friday = date(year, easter[1], easter[2]) - timedelta(days=2)
+    holidays.add((good_friday.year, good_friday.month, good_friday.day))
+    
+    # Memorial Day - dernier lundi de mai
+    holidays.add(_last_weekday(year, 5, 0))
+    
+    # Juneteenth - 19 juin (depuis 2021)
+    if year >= 2021:
+        holidays.add((year, 6, 19))
+    
+    # Labor Day - 1er lundi de septembre
+    holidays.add(_nth_weekday(year, 9, 0, 1))
+    
+    # Thanksgiving - 4ème jeudi de novembre
+    holidays.add(_nth_weekday(year, 11, 3, 4))  # 4ème jeudi
+    
+    return holidays
+
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> tuple[int, int, int]:
+    """
+    Retourne le n-ième jour de la semaine d'un mois.
+    
+    Args:
+        year: Année
+        month: Mois (1-12)
+        weekday: Jour de la semaine (0=lundi, 6=dimanche)
+        n: Occurrence (1=premier, 2=deuxième, etc.)
+    
+    Returns:
+        Tuple (année, mois, jour)
+    """
+    from datetime import date
+    
+    first_day = date(year, month, 1)
+    first_weekday = first_day.weekday()
+    
+    # Jours jusqu'au premier weekday voulu
+    days_until = (weekday - first_weekday) % 7
+    
+    # n-ième occurrence
+    day = 1 + days_until + (n - 1) * 7
+    
+    return (year, month, day)
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> tuple[int, int, int]:
+    """Retourne le dernier jour de la semaine d'un mois."""
+    from datetime import date
+    import calendar
+    
+    last_day = calendar.monthrange(year, month)[1]
+    last_date = date(year, month, last_day)
+    
+    # Reculer jusqu'au weekday voulu
+    days_back = (last_date.weekday() - weekday) % 7
+    target = last_day - days_back
+    
+    return (year, month, target)
+
+
+def _easter_sunday(year: int) -> tuple[int, int, int]:
+    """
+    Calcule la date de Pâques (algorithme de Meeus/Jones/Butcher).
+    
+    Returns:
+        Tuple (année, mois, jour)
+    """
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    
+    return (year, month, day)
+
+
+def is_us_holiday(dt: datetime) -> bool:
+    """Vérifie si une date est un jour férié US."""
+    holidays = get_us_holidays(dt.year)
+    return (dt.year, dt.month, dt.day) in holidays
+
+
+# Jours fériés EU (simplifiés - principaux)
+EU_HOLIDAYS_FIXED = {
+    (1, 1),   # New Year
+    (5, 1),   # Labour Day
+    (12, 25), # Christmas
+    (12, 26), # Boxing Day (UK, DE)
+}
+
+
+def is_eu_holiday(dt: datetime) -> bool:
+    """Vérifie si une date est un jour férié EU majeur."""
+    if (dt.month, dt.day) in EU_HOLIDAYS_FIXED:
+        return True
+    
+    # Good Friday et Easter Monday
+    easter = _easter_sunday(dt.year)
+    from datetime import date
+    easter_date = date(dt.year, easter[1], easter[2])
+    good_friday = easter_date - timedelta(days=2)
+    easter_monday = easter_date + timedelta(days=1)
+    
+    if (dt.month, dt.day) == (good_friday.month, good_friday.day):
+        return True
+    if (dt.month, dt.day) == (easter_monday.month, easter_monday.day):
+        return True
+    
+    return False
+
+
 class AssetClass(Enum):
     """Classes d'actifs avec leurs règles de trading."""
     
@@ -122,10 +279,27 @@ def classify_ticker(ticker: str) -> AssetClass:
     """
     ticker_upper = ticker.upper()
     
-    # Crypto
+    # Crypto - Liste complète des crypto FTMO
+    # Toutes les crypto ont -USD ou -EUR suffix sur Yahoo
+    CRYPTO_SYMBOLS = {
+        # Majeures
+        "BTC", "ETH", "LTC", "SOL", "XRP", "ADA", "DOGE", "BNB",
+        # Altcoins FTMO
+        "XMR", "DASH", "NEO", "DOT", "UNI", "XLM", "AAVE", "MANA",
+        "IMX", "GRT", "ETC", "ALGO", "NEAR", "LINK", "AVAX", "XTZ",
+        "FET", "ICP", "SAND", "GAL", "VET", "BCH", "BAR", "SAN",
+        # Variantes de symboles
+        "UNI1",  # UNI peut être UNI1-USD sur Yahoo
+    }
+    
     if "-USD" in ticker_upper or "-EUR" in ticker_upper:
-        if any(c in ticker_upper for c in ["BTC", "ETH", "SOL", "XRP", "ADA", "DOGE", "LTC"]):
+        # Extraire le symbole de base
+        base = ticker_upper.replace("-USD", "").replace("-EUR", "")
+        if base in CRYPTO_SYMBOLS:
             return AssetClass.CRYPTO
+        # Même si pas dans la liste, si c'est -USD c'est probablement crypto
+        # (plus tolérant)
+        return AssetClass.CRYPTO
     
     # FX (forex)
     if "=X" in ticker_upper:
@@ -136,16 +310,30 @@ def classify_ticker(ticker: str) -> AssetClass:
         return AssetClass.INDEX_US
     
     # Indices EU
-    if ticker_upper in ("^GDAXI", "^FTSE", "^FCHI", "^STOXX50E", "^AEX"):
+    if ticker_upper in ("^GDAXI", "^FTSE", "^FCHI", "^STOXX50E", "^AEX", "^IBEX"):
         return AssetClass.INDEX_EU
     
     # Indices Asie
-    if ticker_upper in ("^N225", "^HSI", "^SSEC", "^KS11", "^TWII"):
+    if ticker_upper in ("^N225", "^HSI", "^SSEC", "^KS11", "^TWII", "^AXJO"):
         return AssetClass.INDEX_ASIA
     
     # Commodities (futures)
     if "=F" in ticker_upper:
         return AssetClass.COMMODITY
+    
+    # Dollar Index
+    if "DX-Y" in ticker_upper or "DX=" in ticker_upper:
+        return AssetClass.COMMODITY  # Traité comme commodity (sessions similaires)
+    
+    # Actions US connues
+    US_STOCKS = {"AAPL", "AMZN", "GOOG", "MSFT", "NFLX", "NVDA", "META", "TSLA",
+                 "BAC", "V", "WMT", "PFE", "T", "ZM", "BABA", "RACE"}
+    if ticker_upper in US_STOCKS:
+        return AssetClass.INDEX_US  # Mêmes horaires que les indices US
+    
+    # Actions EU (suffixe .PA, .DE, .MC)
+    if any(ticker_upper.endswith(s) for s in [".PA", ".DE", ".MC", ".AS", ".L"]):
+        return AssetClass.INDEX_EU  # Mêmes horaires que les indices EU
     
     # Par défaut : inconnu (tolérant)
     return AssetClass.UNKNOWN
@@ -166,6 +354,11 @@ def is_gap_expected(
     """
     Détermine si un gap est attendu (normal) ou anormal.
     
+    Prend en compte:
+    - Les week-ends
+    - Les jours fériés (US/EU selon la classe d'actif)
+    - Les horaires de marché
+    
     Args:
         ticker: Symbole
         gap_start: Début du gap
@@ -183,11 +376,27 @@ def is_gap_expected(
             return False, f"crypto gap {gap_hours:.0f}h > {market.max_expected_gap_hours}h"
         return True, "crypto normal"
     
-    # Vérifier si le gap chevauche un jour de fermeture
+    # Vérifier si le gap chevauche un jour de fermeture (week-end ou férié)
     current = gap_start
     while current < gap_end:
-        if current.weekday() in market.closed_days:
-            return True, "market closed (weekend/holiday)"
+        weekday = current.weekday()
+        
+        # Week-end
+        if weekday in market.closed_days:
+            return True, "market closed (weekend)"
+        
+        # Jours fériés selon la classe d'actif
+        if market.asset_class == AssetClass.INDEX_US:
+            if is_us_holiday(current):
+                return True, "market closed (US holiday)"
+        elif market.asset_class == AssetClass.INDEX_EU:
+            if is_eu_holiday(current):
+                return True, "market closed (EU holiday)"
+        elif market.asset_class == AssetClass.COMMODITY:
+            # Commodities US suivent les fériés US
+            if is_us_holiday(current):
+                return True, "market closed (US holiday)"
+        
         current += timedelta(hours=1)
     
     # Gap pendant les heures de marché ?
@@ -244,6 +453,26 @@ class GapAnalysis:
     @property
     def has_issues(self) -> bool:
         return self.unexpected_gaps > 0
+    
+    def is_acceptable(self, max_unexpected: int | None = None) -> bool:
+        """
+        Vérifie si le nombre de gaps inattendus est acceptable.
+        
+        Args:
+            max_unexpected: Nombre max de gaps tolérés (None = utiliser FTMO default)
+        
+        Returns:
+            True si acceptable
+        """
+        if max_unexpected is None:
+            # Utiliser le seuil de l'instrument FTMO
+            try:
+                from envolees.data.ftmo_instruments import get_max_extra_gaps
+                max_unexpected = get_max_extra_gaps(self.ticker)
+            except ImportError:
+                max_unexpected = 0
+        
+        return self.unexpected_gaps <= max_unexpected
 
 
 @dataclass
@@ -270,6 +499,7 @@ def analyze_gaps(
     df: "pd.DataFrame",
     ticker: str,
     expected_interval_hours: float = 1.0,
+    max_unexpected_gaps: int | None = None,
 ) -> GapAnalysis:
     """
     Analyse les gaps dans les données en tenant compte du calendrier.
@@ -278,11 +508,22 @@ def analyze_gaps(
         df: DataFrame avec index DatetimeIndex
         ticker: Symbole pour le calendrier
         expected_interval_hours: Intervalle attendu entre les barres
+        max_unexpected_gaps: Nombre max de gaps inattendus tolérés (None = utiliser FTMO default)
     
     Returns:
         GapAnalysis avec les détails
     """
     import pandas as pd
+    
+    # Import conditionnel pour éviter les imports circulaires
+    try:
+        from envolees.data.ftmo_instruments import get_max_extra_gaps
+        default_max_gaps = get_max_extra_gaps(ticker)
+    except ImportError:
+        default_max_gaps = 0
+    
+    if max_unexpected_gaps is None:
+        max_unexpected_gaps = default_max_gaps
     
     if df is None or len(df) < 2:
         return GapAnalysis(

@@ -550,7 +550,9 @@ def cache_verify(
             
             # Construire l'affichage
             status_parts = [f"{len(df)} bars", f"{asset_class.value}"]
-            has_gaps = gap_analysis.unexpected_gaps > 0
+            
+            # Utiliser is_acceptable() qui tient compte du max_extra_gaps par instrument
+            has_unacceptable_gaps = not gap_analysis.is_acceptable()
             is_stale = staleness.is_stale
             
             # Affichage de la fraîcheur (calendar-aware)
@@ -560,18 +562,23 @@ def cache_verify(
                 # Âge brut pour info, mais pas de trading manqué = marché fermé
                 status_parts.append(f"last {staleness.age_hours:.0f}h ago (marché fermé)")
             
-            if has_gaps:
-                status_parts.append(f"{gap_analysis.unexpected_gaps} unexpected gaps")
-                results["gaps"].append(ticker)
+            if gap_analysis.unexpected_gaps > 0:
+                # Toujours afficher les gaps, même s'ils sont tolérés
+                if has_unacceptable_gaps:
+                    status_parts.append(f"{gap_analysis.unexpected_gaps} unexpected gaps")
+                    results["gaps"].append(ticker)
+                else:
+                    # Gaps tolérés pour cet instrument
+                    status_parts.append(f"{gap_analysis.unexpected_gaps} gaps (tolérés)")
             
             if is_stale:
                 status_parts.append("stale")
                 results["stale"].append(ticker)
             
             # Décision d'éligibilité
-            # Gaps = toujours bloquant (données manquantes = backtest faussé)
+            # Gaps = bloquant seulement si au-dessus du seuil toléré
             # Stale = bloquant seulement si --fail-on-stale
-            is_eligible = not has_gaps and (not is_stale or not fail_on_stale)
+            is_eligible = not has_unacceptable_gaps and (not is_stale or not fail_on_stale)
             
             if is_eligible:
                 results["eligible"].append(ticker)
@@ -581,7 +588,7 @@ def cache_verify(
                 else:
                     console.print(f"[green]✓[/green] {ticker}: {' │ '.join(status_parts)}")
             else:
-                reason = "gaps" if has_gaps else "stale"
+                reason = "gaps" if has_unacceptable_gaps else "stale"
                 results["excluded"].append((ticker, reason))
                 console.print(f"[yellow]⚠[/yellow] {ticker}: {' │ '.join(status_parts)}")
             
@@ -594,9 +601,16 @@ def cache_verify(
                     console.print(f"    [dim]last_bar: {staleness.last_bar.strftime('%Y-%m-%d %H:%M %Z')}[/dim]")
                 console.print(f"    [dim]age_hours: {staleness.age_hours:.1f}h │ trading_missed: {staleness.trading_hours_missed:.1f}h │ max_age: {staleness.max_age_hours}h[/dim]")
                 
-                # Gaps
+                # Gaps (avec info sur le seuil)
+                try:
+                    from envolees.data.ftmo_instruments import get_max_extra_gaps
+                    max_gaps = get_max_extra_gaps(ticker)
+                    console.print(f"    [dim]gaps: {gap_analysis.unexpected_gaps} unexpected (max tolérés: {max_gaps})[/dim]")
+                except ImportError:
+                    pass
+                
                 if gap_analysis.issues:
-                    console.print(f"    [dim]gaps ({len(gap_analysis.issues)}):[/dim]")
+                    console.print(f"    [dim]gap issues ({len(gap_analysis.issues)}):[/dim]")
                     for issue in gap_analysis.issues[:3]:
                         console.print(f"      [dim]{issue}[/dim]")
             
@@ -1200,6 +1214,136 @@ def alert(message: str, level: str) -> None:
             console.print(f"[green]✓[/green] {channel}: sent")
         else:
             console.print(f"[red]✗[/red] {channel}: failed")
+
+
+@main.command()
+@click.option("--crypto/--no-crypto", default=True, help="Inclure les crypto")
+@click.option("--indices/--no-indices", default=True, help="Inclure les indices")
+@click.option("--stocks/--no-stocks", default=False, help="Inclure les actions")
+@click.option("--max-priority", "-p", default=3, help="Priorité max (1=core, 5=marginal)")
+@click.option("--gft-only", is_flag=True, help="Uniquement les instruments GFT")
+@click.option("--output", "-o", default="", help="Fichier de sortie (vide = stdout)")
+@click.option("--format", "-f", type=click.Choice(["list", "env", "json", "table"]), default="list", help="Format de sortie")
+def instruments(
+    crypto: bool,
+    indices: bool,
+    stocks: bool,
+    max_priority: int,
+    gft_only: bool,
+    output: str,
+    format: str,
+) -> None:
+    """
+    Liste les instruments FTMO recommandés avec leur mapping Yahoo.
+    
+    Génère une liste de tickers compatible avec TICKERS= dans .env.
+    
+    Exemples:
+    
+        envolees instruments                     # Liste par défaut (forex + crypto + métaux)
+        
+        envolees instruments --no-crypto         # Sans crypto
+        
+        envolees instruments --format env        # Format TICKERS=... pour .env
+        
+        envolees instruments -p 2                # Seulement priorité 1-2 (core instruments)
+    """
+    from envolees.data.ftmo_instruments import (
+        get_recommended_instruments,
+        AssetType,
+    )
+    
+    instruments_list = get_recommended_instruments(
+        include_crypto=crypto,
+        include_indices=indices,
+        include_stocks=stocks,
+        max_priority=max_priority,
+        gft_compatible=gft_only,
+    )
+    
+    # Grouper par type d'actif pour l'affichage
+    by_type: dict[AssetType, list] = {}
+    for inst in instruments_list:
+        if inst.asset_type not in by_type:
+            by_type[inst.asset_type] = []
+        by_type[inst.asset_type].append(inst)
+    
+    # Générer la sortie selon le format
+    if format == "table":
+        table = Table(title="Instruments FTMO recommandés")
+        table.add_column("Type", style="cyan")
+        table.add_column("FTMO", style="green")
+        table.add_column("Yahoo", style="yellow")
+        table.add_column("Pri", justify="center")
+        table.add_column("Gaps", justify="center")
+        table.add_column("Notes", style="dim")
+        
+        for asset_type, insts in sorted(by_type.items(), key=lambda x: x[0].value):
+            for inst in insts:
+                table.add_row(
+                    asset_type.value,
+                    inst.ftmo_symbol,
+                    inst.yahoo_symbols[0] if inst.yahoo_symbols else "-",
+                    str(inst.priority),
+                    str(inst.max_extra_gaps) if inst.max_extra_gaps else "-",
+                    inst.notes or "",
+                )
+        
+        console.print(table)
+        console.print(f"\n[green]{len(instruments_list)}[/green] instruments")
+        
+    elif format == "env":
+        # Format pour .env
+        yahoo_tickers = [inst.yahoo_symbols[0] for inst in instruments_list if inst.yahoo_symbols]
+        env_line = f"TICKERS={','.join(yahoo_tickers)}"
+        
+        if output:
+            Path(output).write_text(env_line + "\n")
+            console.print(f"[green]✓[/green] Écrit dans {output}")
+        else:
+            console.print(env_line)
+    
+    elif format == "json":
+        import json
+        
+        data = [
+            {
+                "ftmo": inst.ftmo_symbol,
+                "yahoo": inst.yahoo_symbols,
+                "type": inst.asset_type.value,
+                "priority": inst.priority,
+                "max_gaps": inst.max_extra_gaps,
+                "is_24_7": inst.is_24_7,
+            }
+            for inst in instruments_list
+        ]
+        
+        json_str = json.dumps(data, indent=2)
+        
+        if output:
+            Path(output).write_text(json_str)
+            console.print(f"[green]✓[/green] Écrit dans {output}")
+        else:
+            console.print(json_str)
+    
+    else:  # list (défaut)
+        yahoo_tickers = [inst.yahoo_symbols[0] for inst in instruments_list if inst.yahoo_symbols]
+        
+        if output:
+            Path(output).write_text("\n".join(yahoo_tickers) + "\n")
+            console.print(f"[green]✓[/green] {len(yahoo_tickers)} tickers écrits dans {output}")
+        else:
+            # Afficher par catégorie
+            for asset_type, insts in sorted(by_type.items(), key=lambda x: x[0].value):
+                console.print(f"\n[cyan]{asset_type.value}[/cyan] ({len(insts)}):")
+                for inst in insts:
+                    yahoo = inst.yahoo_symbols[0] if inst.yahoo_symbols else "?"
+                    gaps_info = f" [dim](gaps tolérés: {inst.max_extra_gaps})[/dim]" if inst.max_extra_gaps else ""
+                    console.print(f"  {inst.ftmo_symbol:15} → {yahoo:15}{gaps_info}")
+            
+            console.print(f"\n[green]Total: {len(instruments_list)} instruments[/green]")
+            console.print("\n[dim]Pour générer un .env:[/dim]")
+            console.print("[dim]  envolees instruments --format env > .env.tickers[/dim]")
 
 
 def _cfg_to_dict(cfg: Config) -> dict:
