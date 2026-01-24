@@ -1,17 +1,14 @@
 """
 Mapping des instruments FTMO/GFT vers Yahoo Finance.
 
+IMPORTANT: Cette liste est basée sur les captures d'écran FTMO du 28/12/2024.
+Ne pas ajouter d'instruments sans vérifier qu'ils existent réellement sur FTMO.
+
 Ce fichier centralise :
-- La liste complète des instruments tradables chez FTMO et Goat Funded Trader
+- La liste complète des instruments tradables chez FTMO
 - Le mapping vers les symboles Yahoo Finance équivalents
 - La classification par classe d'actifs
-- Les caractéristiques spécifiques (horaires, gaps tolérés, etc.)
-
-Priorité d'usage :
-1. Forex → Yahoo (qualité OK)
-2. Crypto → Yahoo ou Binance (Yahoo a des gaps)
-3. Métaux/Énergie → Yahoo futures (GC=F, CL=F)
-4. Indices → Yahoo indices (^GSPC) - attention aux jours fériés
+- Les caractéristiques spécifiques (gaps tolérés, etc.)
 """
 
 from __future__ import annotations
@@ -31,7 +28,7 @@ class AssetType(Enum):
     CRYPTO_ALTCOIN = "crypto_altcoin"
     METAL = "metal"
     ENERGY = "energy"
-    AGRI = "agri"  # Commodités agricoles
+    AGRI = "agri"
     INDEX_US = "index_us"
     INDEX_EU = "index_eu"
     INDEX_ASIA = "index_asia"
@@ -44,34 +41,19 @@ class AssetType(Enum):
 class FTMOInstrument:
     """Définition d'un instrument FTMO."""
     
-    # Nom FTMO (tel qu'affiché dans cTrader/MT5)
     ftmo_symbol: str
-    
-    # Symbole(s) Yahoo Finance à essayer (dans l'ordre de priorité)
     yahoo_symbols: list[str]
-    
-    # Classification
     asset_type: AssetType
-    
-    # Disponibilité
     available_ftmo: bool = True
     available_gft: bool = True
-    
-    # Trading 24/7 ? (crypto)
     is_24_7: bool = False
-    
-    # Gaps tolérés (au-delà du calendrier standard)
     max_extra_gaps: int = 0
-    
-    # Priorité pour la sélection (1=haute, 5=basse)
     priority: int = 3
-    
-    # Notes
     notes: str = ""
 
 
 # =============================================================================
-# FOREX - Paires majeures
+# FOREX - Paires majeures (d'après captures: image 12)
 # =============================================================================
 FOREX_MAJORS: list[FTMOInstrument] = [
     FTMOInstrument("EURUSD", ["EURUSD=X"], AssetType.FOREX_MAJOR, priority=1),
@@ -84,7 +66,7 @@ FOREX_MAJORS: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# FOREX - Paires mineures (crosses)
+# FOREX - Paires mineures (d'après captures: images 10, 12)
 # =============================================================================
 FOREX_MINORS: list[FTMOInstrument] = [
     # EUR crosses
@@ -94,20 +76,17 @@ FOREX_MINORS: list[FTMOInstrument] = [
     FTMOInstrument("EURCAD", ["EURCAD=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("EURAUD", ["EURAUD=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("EURNZD", ["EURNZD=X"], AssetType.FOREX_MINOR, priority=2),
-    
     # GBP crosses
     FTMOInstrument("GBPJPY", ["GBPJPY=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("GBPCHF", ["GBPCHF=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("GBPCAD", ["GBPCAD=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("GBPAUD", ["GBPAUD=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("GBPNZD", ["GBPNZD=X"], AssetType.FOREX_MINOR, priority=2),
-    
     # JPY crosses
     FTMOInstrument("AUDJPY", ["AUDJPY=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("NZDJPY", ["NZDJPY=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("CADJPY", ["CADJPY=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("CHFJPY", ["CHFJPY=X"], AssetType.FOREX_MINOR, priority=2),
-    
     # Autres crosses
     FTMOInstrument("AUDCAD", ["AUDCAD=X"], AssetType.FOREX_MINOR, priority=2),
     FTMOInstrument("AUDCHF", ["AUDCHF=X"], AssetType.FOREX_MINOR, priority=2),
@@ -118,13 +97,12 @@ FOREX_MINORS: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# FOREX - Paires exotiques
+# FOREX - Paires exotiques (d'après captures: images 4, 10, 12)
 # =============================================================================
 FOREX_EXOTICS: list[FTMOInstrument] = [
     FTMOInstrument("USDCNH", ["USDCNH=X", "CNH=X"], AssetType.FOREX_EXOTIC, priority=3),
     FTMOInstrument("USDCZK", ["USDCZK=X", "CZK=X"], AssetType.FOREX_EXOTIC, priority=3),
     FTMOInstrument("USDHKD", ["USDHKD=X", "HKD=X"], AssetType.FOREX_EXOTIC, priority=3),
-    FTMOInstrument("USDHUF", ["USDHUF=X", "HUF=X"], AssetType.FOREX_EXOTIC, priority=3),
     FTMOInstrument("USDMXN", ["USDMXN=X", "MXN=X"], AssetType.FOREX_EXOTIC, priority=3),
     FTMOInstrument("USDNOK", ["USDNOK=X", "NOK=X"], AssetType.FOREX_EXOTIC, priority=3),
     FTMOInstrument("USDPLN", ["USDPLN=X", "PLN=X"], AssetType.FOREX_EXOTIC, priority=3),
@@ -132,7 +110,6 @@ FOREX_EXOTICS: list[FTMOInstrument] = [
     FTMOInstrument("USDSGD", ["USDSGD=X", "SGD=X"], AssetType.FOREX_EXOTIC, priority=3),
     FTMOInstrument("USDZAR", ["USDZAR=X", "ZAR=X"], AssetType.FOREX_EXOTIC, priority=3),
     FTMOInstrument("USDILS", ["USDILS=X", "ILS=X"], AssetType.FOREX_EXOTIC, priority=4),
-    
     # EUR exotiques
     FTMOInstrument("EURCZK", ["EURCZK=X"], AssetType.FOREX_EXOTIC, priority=3),
     FTMOInstrument("EURHUF", ["EURHUF=X"], AssetType.FOREX_EXOTIC, priority=3),
@@ -141,7 +118,7 @@ FOREX_EXOTICS: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# CRYPTO - Majeures
+# CRYPTO - Majeures (d'après captures: images 3, 11)
 # =============================================================================
 CRYPTO_MAJORS: list[FTMOInstrument] = [
     FTMOInstrument("BTCUSD", ["BTC-USD"], AssetType.CRYPTO_MAJOR, is_24_7=True, priority=1, max_extra_gaps=3),
@@ -155,36 +132,51 @@ CRYPTO_MAJORS: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# CRYPTO - Altcoins
+# CRYPTO - Altcoins (d'après captures: images 3, 11)
+# Liste exacte FTMO: XMRUSD, DASHUSD, NEOUSD, DOTUSD, UNIUSD, XLMUSD, VECUSD,
+# MANAUSD, IMXUSD, GRTUSD, GALUSD, AAVUSD, FETUSD, ICPUSD, ALGOUSD, NERUSD,
+# LNKUSD, AVAUSD, BARUSD, XTZUSD, SANUSD, BCHUSD, ETCUSD, SANDUSD
 # =============================================================================
 CRYPTO_ALTCOINS: list[FTMOInstrument] = [
     FTMOInstrument("XMRUSD", ["XMR-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
     FTMOInstrument("DASHUSD", ["DASH-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
     FTMOInstrument("NEOUSD", ["NEO-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
     FTMOInstrument("DOTUSD", ["DOT-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    FTMOInstrument("UNIUSD", ["UNI-USD", "UNI1-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
+    FTMOInstrument("UNIUSD", ["UNI7083-USD", "UNI-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3,
+                   notes="Uniswap - peut être delisted sur Yahoo"),
     FTMOInstrument("XLMUSD", ["XLM-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    FTMOInstrument("AAVEUSD", ["AAVE-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
+    FTMOInstrument("VECUSD", ["VGX-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=5, max_extra_gaps=3,
+                   notes="Voyager Token? - Yahoo mapping incertain, probablement indisponible"),
     FTMOInstrument("MANAUSD", ["MANA-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    FTMOInstrument("IMXUSD", ["IMX-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=4, max_extra_gaps=3),
-    FTMOInstrument("GRTUSD", ["GRT-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=4, max_extra_gaps=3),
-    FTMOInstrument("ETCUSD", ["ETC-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    FTMOInstrument("ALGOUSD", ["ALGO-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    FTMOInstrument("NEARUSD", ["NEAR-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    FTMOInstrument("LNKUSD", ["LINK-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=2, max_extra_gaps=3),
-    FTMOInstrument("AVAUSD", ["AVAX-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=2, max_extra_gaps=3),
-    FTMOInstrument("XTZUSD", ["XTZ-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
+    FTMOInstrument("IMXUSD", ["IMX-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=4, max_extra_gaps=3,
+                   notes="Immutable X - peut être delisted sur Yahoo"),
+    FTMOInstrument("GRTUSD", ["GRT-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=4, max_extra_gaps=3,
+                   notes="The Graph - peut être delisted sur Yahoo"),
+    FTMOInstrument("GALUSD", ["GAL-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=4, max_extra_gaps=3),
+    FTMOInstrument("AAVUSD", ["AAVE-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3,
+                   notes="FTMO = AAVUSD, Yahoo = AAVE-USD"),
     FTMOInstrument("FETUSD", ["FET-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
     FTMOInstrument("ICPUSD", ["ICP-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    FTMOInstrument("SANDUSD", ["SAND-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    FTMOInstrument("GALUSD", ["GAL-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=4, max_extra_gaps=3),
-    FTMOInstrument("VETUSD", ["VET-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
+    FTMOInstrument("ALGOUSD", ["ALGO-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
+    FTMOInstrument("NERUSD", ["NEAR-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3,
+                   notes="FTMO = NERUSD, Yahoo = NEAR-USD"),
+    FTMOInstrument("LNKUSD", ["LINK-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=2, max_extra_gaps=3,
+                   notes="FTMO = LNKUSD, Yahoo = LINK-USD"),
+    FTMOInstrument("AVAUSD", ["AVAX-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=2, max_extra_gaps=3,
+                   notes="FTMO = AVAUSD, Yahoo = AVAX-USD"),
+    FTMOInstrument("BARUSD", ["BAR-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=5, max_extra_gaps=3,
+                   notes="FC Barcelona Fan Token - Yahoo mapping incertain"),
+    FTMOInstrument("XTZUSD", ["XTZ-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
+    FTMOInstrument("SANUSD", ["SAN-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=5, max_extra_gaps=3,
+                   notes="Santiment - Yahoo mapping incertain"),
     FTMOInstrument("BCHUSD", ["BCH-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
-    # Note: BARUSD et SANUSD pas sur Yahoo
+    FTMOInstrument("ETCUSD", ["ETC-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3),
+    FTMOInstrument("SANDUSD", ["SAND-USD"], AssetType.CRYPTO_ALTCOIN, is_24_7=True, priority=3, max_extra_gaps=3,
+                   notes="The Sandbox"),
 ]
 
 # =============================================================================
-# MÉTAUX PRÉCIEUX
+# MÉTAUX PRÉCIEUX (d'après capture: image 6)
 # =============================================================================
 METALS: list[FTMOInstrument] = [
     FTMOInstrument("XAUUSD", ["GC=F", "XAUUSD=X"], AssetType.METAL, priority=1, notes="Gold - utiliser GC=F"),
@@ -192,14 +184,14 @@ METALS: list[FTMOInstrument] = [
     FTMOInstrument("XPDUSD", ["PA=F"], AssetType.METAL, priority=3, notes="Palladium"),
     FTMOInstrument("XPTUSD", ["PL=F"], AssetType.METAL, priority=3, notes="Platinum"),
     FTMOInstrument("XCUUSD", ["HG=F"], AssetType.METAL, priority=3, notes="Copper"),
-    # Métaux en EUR - pas d'équivalent Yahoo direct
+    # Métaux en EUR/AUD - pas d'équivalent Yahoo direct
     FTMOInstrument("XAUEUR", ["GC=F"], AssetType.METAL, priority=4, notes="Gold EUR - approximation via GC=F"),
     FTMOInstrument("XAGEUR", ["SI=F"], AssetType.METAL, priority=4, notes="Silver EUR - approximation"),
     FTMOInstrument("XAGAUD", ["SI=F"], AssetType.METAL, priority=5, notes="Silver AUD - approximation"),
 ]
 
 # =============================================================================
-# ÉNERGIE
+# ÉNERGIE (d'après captures: images 1, 2)
 # =============================================================================
 ENERGY: list[FTMOInstrument] = [
     FTMOInstrument("USOIL.cash", ["CL=F"], AssetType.ENERGY, priority=1, notes="WTI Crude"),
@@ -209,7 +201,7 @@ ENERGY: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# COMMODITÉS AGRICOLES
+# COMMODITÉS AGRICOLES (d'après capture: image 9)
 # =============================================================================
 AGRI: list[FTMOInstrument] = [
     FTMOInstrument("COCOA.c", ["CC=F"], AssetType.AGRI, priority=3),
@@ -222,7 +214,7 @@ AGRI: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# INDICES US
+# INDICES US (d'après capture: image 2)
 # =============================================================================
 INDICES_US: list[FTMOInstrument] = [
     FTMOInstrument("US500.cash", ["^GSPC", "ES=F"], AssetType.INDEX_US, priority=2, max_extra_gaps=15, 
@@ -236,7 +228,7 @@ INDICES_US: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# INDICES EU
+# INDICES EU (d'après capture: image 2)
 # =============================================================================
 INDICES_EU: list[FTMOInstrument] = [
     FTMOInstrument("GER40.cash", ["^GDAXI"], AssetType.INDEX_EU, priority=2, max_extra_gaps=10),
@@ -248,7 +240,7 @@ INDICES_EU: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# INDICES ASIE
+# INDICES ASIE (d'après capture: image 2)
 # =============================================================================
 INDICES_ASIA: list[FTMOInstrument] = [
     FTMOInstrument("JP225.cash", ["^N225"], AssetType.INDEX_ASIA, priority=2, max_extra_gaps=8),
@@ -257,14 +249,14 @@ INDICES_ASIA: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# DOLLAR INDEX
+# DOLLAR INDEX (d'après capture: image 8)
 # =============================================================================
 OTHER: list[FTMOInstrument] = [
     FTMOInstrument("DXY.cash", ["DX-Y.NYB", "DX=F"], AssetType.OTHER, priority=2, notes="Dollar Index"),
 ]
 
 # =============================================================================
-# ACTIONS US (pour info - pas recommandé pour les prop firms)
+# ACTIONS US (d'après captures: images 5, 7)
 # =============================================================================
 STOCKS_US: list[FTMOInstrument] = [
     FTMOInstrument("AAPL", ["AAPL"], AssetType.STOCK_US, priority=4, max_extra_gaps=20,
@@ -287,16 +279,16 @@ STOCKS_US: list[FTMOInstrument] = [
 ]
 
 # =============================================================================
-# ACTIONS EU (pour info - pas recommandé)
+# ACTIONS EU (d'après capture: image 7)
 # =============================================================================
 STOCKS_EU: list[FTMOInstrument] = [
     FTMOInstrument("LVMH", ["MC.PA"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20),
-    FTMOInstrument("AIRF", ["AF.PA"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20),
-    FTMOInstrument("ALVG", ["ALV.DE"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20),
-    FTMOInstrument("BAYGn", ["BAYN.DE"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20),
-    FTMOInstrument("DBKGn", ["DBK.DE"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20),
-    FTMOInstrument("VOWG_p", ["VOW3.DE"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20),
-    FTMOInstrument("IBE", ["IBE.MC"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20),
+    FTMOInstrument("AIRF", ["AF.PA"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20, notes="Air France"),
+    FTMOInstrument("ALVG", ["ALV.DE"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20, notes="Allianz"),
+    FTMOInstrument("BAYGn", ["BAYN.DE"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20, notes="Bayer"),
+    FTMOInstrument("DBKGn", ["DBK.DE"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20, notes="Deutsche Bank"),
+    FTMOInstrument("VOWG_p", ["VOW3.DE"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20, notes="Volkswagen"),
+    FTMOInstrument("IBE", ["IBE.MC"], AssetType.STOCK_EU, priority=5, max_extra_gaps=20, notes="Iberdrola"),
 ]
 
 
