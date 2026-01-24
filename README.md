@@ -1,336 +1,492 @@
 # 🚀 Envolées
 
-**Backtest engine for Donchian breakout strategy with prop firm simulation**
-
-## Features
-
-- **Stratégie Donchian Breakout** : EMA200 + Donchian(20) + buffer ATR
-- **Simulation Prop Firm** : Daily DD (FTMO/GFT), kill-switch, limite de pertes
-- **Modèle de coûts** : Pénalité d'exécution en multiples d'ATR
-- **Multi-assets** : FX, Crypto, Indices, Commodities
-- **Split temporel IS/OOS** : Validation croisée in-sample / out-of-sample
-- **Cache local** : Évite de retélécharger les données Yahoo
-- **Alias tickers** : Utilise `GOLD` au lieu de `GC=F`, `BTC` au lieu de `BTC-USD`
-- **Scoring automatique** : Score agrégé par ticker + génération shortlist
-- **Export complet** : CSV trades, equity curve, stats journalières, scores, shortlist
+Moteur de backtest pour stratégie Donchian Breakout, optimisé pour les challenges FTMO et Goat Funded Trader.
 
 ## Installation
 
 ```bash
-# Clone
-git clone git@github.com:ashledombos/envolees.git && cd envolees
+# Cloner le repo
+git clone <repo_url>
+cd envolees
 
-# Environnement virtuel (recommandé)
+# Créer l'environnement virtuel
 python -m venv .venv
 source .venv/bin/activate  # Linux/Mac
+# ou .venv\Scripts\activate  # Windows
 
-# Installation
+# Installer
 pip install -e .
-
-# Ou avec dépendances dev
-pip install -e ".[dev]"
 ```
 
 ## Configuration
 
-```bash
-# Copier le template
-cp .env.example .env
-
-# Ou utiliser une config spécialisée
-cp .env.challenge.example .env   # Pour challenge prop firm
-cp .env.funded.example .env      # Pour compte funded
-```
-
-### Fichiers de configuration
-
-| Fichier | Usage |
-|---------|-------|
-| `.env.example` | Template de base |
-| `.env.full.example` | Validation complète avec split IS/OOS |
-| `.env.best.example` | Production candidate (panier validé) |
-| `.env.challenge.example` | Challenge prop firm (risque modéré) |
-| `.env.funded.example` | Compte funded (ultra-conservateur) |
-
-### Variables principales
-
-| Variable | Description | Défaut |
-|----------|-------------|--------|
-| `TICKERS` | Liste des tickers | Portfolio multi-asset |
-| `PENALTIES` | Pénalités ATR | 0.05 à 0.25 |
-| `RISK_PER_TRADE` | Risque par trade | 0.25% |
-| `MODE` | Daily DD mode | worst |
-| `SPLIT_MODE` | Split temporel | (désactivé) |
-| `SPLIT_TARGET` | is ou oos | is |
-
-## Usage
-
-### CLI
+Créer un fichier `.env` à la racine :
 
 ```bash
-# Backtest complet
-python main.py run
+# Tickers à backtester (générer avec: envolees instruments --format env)
+TICKERS=EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,ETH-USD,GC=F
 
-# Tickers spécifiques (supporte les alias)
-python main.py run -t BTC,ETH,GOLD,SP500
+# Pénalités d'exécution (multiples ATR)
+PENALTIES=0.00,0.10,0.20,0.25
 
-# Split out-of-sample
-python main.py run --split oos -o out_oos
+# Capital et risque
+START_BALANCE=100000
+RISK_PER_TRADE=0.0025
 
-# Un seul ticker
-python main.py single BTC-USD --penalty 0.10
+# Profil de risque: default, challenge, funded, conservative, aggressive
+PROFILE=challenge
 
-# Comparer IS vs OOS (avec shortlist)
-python main.py compare out_is out_oos -o out_compare --alert
+# Cache
+CACHE_ENABLED=true
+CACHE_MAX_AGE_HOURS=24
 
-# Gestion du cache
-python main.py cache           # Stats cache
-python main.py cache-warm      # Pré-charger les données
-python main.py cache-verify    # Vérifier intégrité
-python main.py cache-clear     # Vider le cache
+# Split IS/OOS
+SPLIT_MODE=time
+SPLIT_RATIO=0.70
 
-# Configuration
-python main.py config
+# Alertes Telegram (optionnel)
+TELEGRAM_BOT_TOKEN=xxx
+TELEGRAM_CHAT_ID=xxx
 ```
 
-### Workflow complet (recherche)
+---
+
+## Commandes CLI
+
+### `envolees instruments`
+
+Liste les instruments FTMO avec leur mapping Yahoo Finance.
 
 ```bash
-# 1. Pré-charger le cache
-python main.py cache-warm
+# Afficher tous les instruments recommandés
+envolees instruments
 
-# 2. Vérifier les données
-python main.py cache-verify --fail-on-gaps
+# Format tableau détaillé
+envolees instruments --format table
 
-# 3. In-sample
-SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
+# Générer la variable TICKERS pour .env
+envolees instruments --format env
+envolees instruments --format env > .env.tickers
 
-# 4. Out-of-sample
-SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
+# Exclure les crypto
+envolees instruments --no-crypto
 
-# 5. Comparer et générer shortlist
-python main.py compare out_is out_oos --dd-cap 0.012 --max-tickers 5 --alert
+# Exclure les indices (Yahoo n'a que ~7 mois d'historique)
+envolees instruments --no-indices
+
+# Seulement les instruments priorité 1-2 (core)
+envolees instruments -p 2
+
+# Format JSON
+envolees instruments --format json -o instruments.json
+
+# Uniquement compatibles GFT (Goat Funded Trader)
+envolees instruments --gft-only
 ```
 
-### Workflow validation IS/OOS
+**Options :**
+| Option | Description |
+|--------|-------------|
+| `--crypto/--no-crypto` | Inclure/exclure les crypto |
+| `--indices/--no-indices` | Inclure/exclure les indices |
+| `--stocks/--no-stocks` | Inclure/exclure les actions |
+| `-p, --max-priority` | Priorité max (1=core, 5=marginal) |
+| `--gft-only` | Uniquement instruments GFT |
+| `-f, --format` | `list`, `env`, `json`, `table` |
+| `-o, --output` | Fichier de sortie |
+
+---
+
+### `envolees pipeline`
+
+Exécute le pipeline complet de validation : cache → IS → OOS → compare.
 
 ```bash
-# 1. In-sample (70% des données)
-SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
+# Pipeline standard (gaps bloquants, stale toléré)
+envolees pipeline
 
-# 2. Out-of-sample (30% des données)
-SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
+# Mode strict : gaps ET stale bloquants
+envolees pipeline --strict
 
-# 3. Comparer les résultats
-head out_is/results.csv
-head out_oos/results.csv
+# Strict sur les gaps uniquement
+envolees pipeline --strict-gaps
+
+# Sans alerte Telegram
+envolees pipeline --no-alert
+
+# Sauter l'étape de cache
+envolees pipeline --skip-cache
 ```
 
-### Alias de tickers
+**Options :**
+| Option | Description |
+|--------|-------------|
+| `--skip-cache` | Sauter cache-warm et cache-verify |
+| `--strict` | Échouer si gaps OU données stale |
+| `--strict-gaps` | Échouer si gaps (stale = warning) |
+| `--alert/--no-alert` | Envoyer alerte Telegram après compare |
 
-Plus besoin de retenir les symboles Yahoo. Les alias sont définis dans `envolees/data/aliases.py`.
+---
 
-| Alias | Yahoo Symbol | Classe |
-|-------|-------------|--------|
-| `GOLD`, `XAUUSD` | `GC=F` | Metals |
-| `SILVER`, `XAGUSD` | `SI=F` | Metals |
-| `WTI`, `CRUDE` | `CL=F` | Energy |
-| `BRENT`, `BCO` | `BZ=F` | Energy |
-| `BTC` | `BTC-USD` | Crypto |
-| `ETH` | `ETH-USD` | Crypto |
-| `SOL` | `SOL-USD` | Crypto |
-| `SP500`, `SPX` | `^GSPC` | Index |
-| `NASDAQ`, `NDX` | `^NDX` | Index |
-| `DOW`, `DJI` | `^DJI` | Index |
-| `DAX` | `^GDAXI` | Index |
-| `FTSE` | `^FTSE` | Index |
-| `NIKKEI`, `N225`, `JAP225` | `^N225` | Index |
-| `CAC40` | `^FCHI` | Index |
-| `EURUSD` | `EURUSD=X` | FX |
-| `GBPUSD` | `GBPUSD=X` | FX |
-| `USDJPY` | `USDJPY=X` | FX |
-| `AUDUSD` | `AUDUSD=X` | FX |
-| `NZDUSD` | `NZDUSD=X` | FX |
+### `envolees run`
 
-### Syntaxe WEIGHT_*
-
-Les pondérations utilisent des **alias normalisés** (sans caractères spéciaux) :
+Lance le backtest sur plusieurs tickers et pénalités.
 
 ```bash
-# ✅ Correct
-WEIGHT_BTC=0.8       # pour BTC-USD
-WEIGHT_EURUSD=1.0    # pour EURUSD=X
-WEIGHT_GSPC=0.9      # pour ^GSPC
-WEIGHT_GC=0.75       # pour GC=F
-WEIGHT_USDJPY=0.5    # pour USDJPY=X
+# Utiliser les tickers du .env
+envolees run
 
-# ❌ Incorrect (caractères spéciaux non supportés dans les noms de variables)
-WEIGHT_BTC-USD=0.8
-WEIGHT_^GSPC=0.9
-WEIGHT_GC=F=0.75
+# Spécifier les tickers
+envolees run -t "EURUSD=X,GBPUSD=X,BTC-USD"
+
+# Spécifier les pénalités
+envolees run -p "0.10,0.20,0.25"
+
+# Mode IS (in-sample)
+envolees run --split is -o out_is
+
+# Mode OOS (out-of-sample)
+envolees run --split oos -o out_oos
+
+# Forcer le re-téléchargement
+envolees run --no-cache
+
+# Mode verbeux
+envolees run -v
 ```
 
-## Validation IS/OOS
+**Options :**
+| Option | Description |
+|--------|-------------|
+| `-t, --tickers` | Tickers (séparés par virgule) |
+| `-p, --penalties` | Pénalités ATR (séparées par virgule) |
+| `-o, --output` | Dossier de sortie |
+| `--mode` | `close` ou `worst` (équité journalière) |
+| `--split` | `is`, `oos`, ou `none` |
+| `--no-cache` | Forcer re-téléchargement |
+| `-v, --verbose` | Sortie détaillée |
 
-### Workflow complet
+---
+
+### `envolees single`
+
+Lance le backtest sur un seul ticker.
 
 ```bash
-# 1. In-sample (70% des données)
-SPLIT_TARGET=is OUTPUT_DIR=out_is python main.py run
+# Backtest simple
+envolees single EURUSD=X
 
-# 2. Out-of-sample (30% des données)
-SPLIT_TARGET=oos OUTPUT_DIR=out_oos python main.py run
+# Avec pénalité spécifique
+envolees single EURUSD=X -p 0.25
 
-# 3. Comparer et valider
-python main.py compare out_is out_oos -o out_compare
+# Sortie personnalisée
+envolees single BTC-USD -o results/btc -v
 ```
 
-### Critères d'éligibilité OOS
+**Options :**
+| Option | Description |
+|--------|-------------|
+| `-p, --penalty` | Pénalité d'exécution (défaut: 0.10) |
+| `-o, --output` | Dossier de sortie |
+| `--no-cache` | Forcer re-téléchargement |
+| `-v, --verbose` | Sortie détaillée |
 
-Un ticker est validé si (à la pénalité de référence, défaut 0.25) :
+---
 
-| Critère | Seuil | Description |
-|---------|-------|-------------|
-| `n_trades` | ≥ 15 | Assez de trades pour être significatif |
-| `expectancy_r` | > 0 | Expectancy positive |
-| `profit_factor` | ≥ 1.2 | PF minimum |
-| `max_daily_dd` | < 5% | Drawdown journalier acceptable |
-| `exp_drop` | < 50% | Dégradation IS→OOS limitée |
+### `envolees compare`
 
-### Rapports générés
+Compare les résultats IS et OOS pour validation.
+
+```bash
+# Comparaison standard
+envolees compare out_is out_oos -o out_compare
+
+# Pénalité de référence différente
+envolees compare out_is out_oos -p 0.20
+
+# Critères personnalisés
+envolees compare out_is out_oos --min-trades 20 --dd-cap 0.01
+
+# Sans alerte
+envolees compare out_is out_oos --no-alert
+```
+
+**Options :**
+| Option | Description |
+|--------|-------------|
+| `-o, --output` | Dossier pour le rapport |
+| `-p, --penalty` | Pénalité de référence (défaut: 0.25) |
+| `--min-trades` | Trades minimum OOS (défaut: 15) |
+| `--dd-cap` | DD maximum (défaut: 0.012 = 1.2%) |
+| `--max-tickers` | Max tickers shortlist (défaut: 20) |
+| `--alert/--no-alert` | Envoyer alerte avec résultats |
+
+**Tiers de sortie :**
+- **Tier 1 (Funded)** : ≥15 trades OOS, critères stricts
+- **Tier 2 (Challenge)** : ≥10 trades OOS, critères plus souples
+
+---
+
+### `envolees cache-warm`
+
+Pré-télécharge les données dans le cache.
+
+```bash
+# Réchauffer le cache (respecte CACHE_MAX_AGE_HOURS)
+envolees cache-warm
+
+# Forcer le re-téléchargement de tout
+envolees cache-warm --force
+
+# Tickers spécifiques
+envolees cache-warm -t "EURUSD=X,BTC-USD"
+```
+
+**Options :**
+| Option | Description |
+|--------|-------------|
+| `-t, --tickers` | Tickers spécifiques |
+| `-f, --force` | Ignorer le cache existant |
+
+---
+
+### `envolees cache-verify`
+
+Vérifie l'intégrité du cache et détecte les gaps.
+
+```bash
+# Vérification standard
+envolees cache-verify
+
+# Mode verbeux (détail des gaps)
+envolees cache-verify -v
+
+# Exporter les tickers éligibles
+envolees cache-verify --export-eligible eligible.txt
+
+# Échouer si gaps détectés
+envolees cache-verify --fail-on-gaps
+
+# Échouer si données stale
+envolees cache-verify --fail-on-stale
+```
+
+**Options :**
+| Option | Description |
+|--------|-------------|
+| `-t, --tickers` | Tickers à vérifier |
+| `--fail-on-gaps` | Exit code erreur si gaps |
+| `--fail-on-stale` | Exit code erreur si stale |
+| `--export-eligible` | Exporter tickers valides |
+| `-v, --verbose` | Analyse détaillée des gaps |
+
+---
+
+### `envolees cache`
+
+Affiche les statistiques du cache.
+
+```bash
+envolees cache
+```
+
+---
+
+### `envolees cache-clear`
+
+Vide le cache de données.
+
+```bash
+# Avec confirmation
+envolees cache-clear
+
+# Sans confirmation
+envolees cache-clear --yes
+```
+
+---
+
+### `envolees config`
+
+Affiche la configuration actuelle.
+
+```bash
+envolees config
+```
+
+---
+
+### `envolees status`
+
+Affiche le statut de trading actuel.
+
+```bash
+# Format texte
+envolees status
+
+# Format JSON
+envolees status -o json
+```
+
+---
+
+### `envolees heartbeat`
+
+Envoie un signal de vie (pour monitoring).
+
+```bash
+envolees heartbeat
+```
+
+---
+
+### `envolees alert`
+
+Envoie une alerte manuelle (Telegram).
+
+```bash
+# Alerte warning (défaut)
+envolees alert "Pipeline terminé avec succès"
+
+# Alerte info
+envolees alert "Test de connexion" -l info
+
+# Alerte critique
+envolees alert "Erreur détectée!" -l critical
+```
+
+**Options :**
+| Option | Description |
+|--------|-------------|
+| `-l, --level` | `info`, `warning`, `critical` |
+
+---
+
+## Workflow typique
+
+### 1. Générer la liste d'instruments
+
+```bash
+# Voir les instruments disponibles
+envolees instruments --format table
+
+# Générer pour .env (sans actions ni indices problématiques)
+envolees instruments --no-stocks --no-indices --format env
+```
+
+### 2. Configurer `.env`
+
+```bash
+# Copier la sortie dans .env
+TICKERS=EURUSD=X,GBPUSD=X,...
+```
+
+### 3. Lancer le pipeline
+
+```bash
+# Pipeline complet
+envolees pipeline
+
+# Ou étape par étape:
+envolees cache-warm --force
+envolees cache-verify -v
+envolees run --split is -o out_is
+envolees run --split oos -o out_oos
+envolees compare out_is out_oos -o out_compare
+```
+
+### 4. Analyser les résultats
+
+Les fichiers de sortie sont dans `out_compare/` :
+- `shortlist_tier1.csv` : Instruments pour compte Funded (≥15 trades)
+- `shortlist_tier2.csv` : Instruments pour Challenge (≥10 trades)
+- `shortlist_tradable.csv` : Liste combinée
+- `comparison_ref.csv` : Détails complets
+
+---
+
+## Gestion des gaps
+
+Le système distingue 3 types de gaps :
+
+| Type | Description | Comportement |
+|------|-------------|--------------|
+| **Expected** | Week-end, jours fériés | Ignoré ✅ |
+| **Tolerated** | Gaps ≤ seuil par instrument | Warning ⚠️ |
+| **Unexpected** | Gaps > seuil | Bloquant ❌ |
+
+Seuils par classe d'actif :
+- **Forex** : 0 gaps tolérés (strict)
+- **Crypto** : 3 gaps tolérés (maintenance Yahoo)
+- **Indices US** : 15 gaps tolérés (jours fériés)
+- **Indices EU** : 10 gaps tolérés
+
+---
+
+## Mapping FTMO → Yahoo
+
+Certains instruments FTMO ont des noms différents sur Yahoo Finance :
+
+| FTMO | Yahoo | Notes |
+|------|-------|-------|
+| NERUSD | NEAR-USD | Near Protocol |
+| LNKUSD | LINK-USD | Chainlink |
+| AVAUSD | AVAX-USD | Avalanche |
+| AAVUSD | AAVE-USD | Aave |
+| XAUUSD | GC=F | Gold futures |
+| XAGUSD | SI=F | Silver futures |
+| US500.cash | ^GSPC | S&P 500 |
+| US100.cash | ^NDX | Nasdaq 100 |
+| GER40.cash | ^GDAXI | DAX |
+
+Voir `envolees/data/ftmo_instruments.py` pour la liste complète.
+
+---
+
+## Fichiers de sortie
 
 ```
 out_compare/
-├── comparison_full.csv   # Toutes les pénalités
-├── comparison_ref.csv    # Pénalité de référence uniquement
-└── validated.csv         # Tickers validés OOS
+├── comparison_full.csv     # Toutes pénalités
+├── comparison_ref.csv      # Pénalité de référence (0.25)
+├── shortlist_tier1.csv     # Tier 1 - Funded (≥15 trades)
+├── shortlist_tier2.csv     # Tier 2 - Challenge (≥10 trades)
+└── shortlist_tradable.csv  # Combiné Tier 1 + 2
 ```
 
-## Output
+---
 
-```
-out/
-├── results.csv              # Détails tous backtests
-├── scores.csv               # Score agrégé par ticker
-├── shortlist.csv            # Candidats production
-├── BTC-USD/
-│   ├── PEN_0.05/
-│   │   ├── trades.csv
-│   │   ├── equity_curve.csv
-│   │   ├── daily_stats.csv
-│   │   └── summary.json
-│   └── ...
-└── ...
-```
+## Automatisation (systemd)
 
-### Shortlist automatique
+Des fichiers systemd sont fournis dans `systemd/` pour :
+- `envolees-cache.timer` : Mise à jour quotidienne du cache
+- `envolees-validation.timer` : Pipeline hebdomadaire
+- `envolees-heartbeat.timer` : Signal de vie
 
-Le fichier `shortlist.csv` contient les tickers qui passent les critères :
-- Expectancy > 0.10 à PEN 0.25
-- Profit Factor > 1.2
-- Max Daily DD < 4.5%
-- Minimum 30 trades
+Voir `systemd/README.md` pour l'installation.
 
-## Stratégie
+---
 
-### Règles d'entrée
+## Dépannage
 
-1. **Filtre tendance** : Close > EMA200 (long) ou Close < EMA200 (short)
-2. **Signal** : Breakout Donchian(20) + buffer 0.10×ATR
-3. **Filtre volatilité** : ATR relatif < quantile 90%
-4. **Fenêtre** : Pas de signaux 22:30 - 06:30 Paris
+### "Yahoo Finance: aucune donnée pour X"
 
-### Exécution
+Certaines crypto sont delisted sur Yahoo (UNI-USD, IMX-USD, GRT-USD). 
+Utiliser `envolees instruments` pour voir les instruments disponibles.
 
-- Ordre stop valable 1 bougie 4H
-- Pénalité d'exécution appliquée à l'entrée
-- SL = Entry - 1×ATR
-- TP = Entry + 1×ATR (RR 1:1)
+### Indices avec 0 trades OOS
 
-### Convention conservative
+Yahoo ne fournit que ~7 mois d'historique pour les indices (^GSPC, ^NDX...).
+Avec un split 70/30, l'OOS n'a pas assez de données.
+Solution : exclure les indices (`--no-indices`) ou réduire `SPLIT_RATIO`.
 
-Si SL et TP touchés même bougie → SL prioritaire
+### Gaps inattendus sur crypto
 
-## Simulation Prop Firm
+Yahoo agrège parfois mal les données crypto 24/7.
+Le système tolère maintenant 3 gaps par crypto.
 
-- **Daily DD mode "worst"** : Mark-to-market sur Low (long) / High (short)
-- **Kill-switch** : Trading arrêté si daily DD ≥ 4%
-- **Limite pertes** : Trading arrêté après 2 pertes clôturées/jour
-- **Métriques** : Max daily DD, P99, violations FTMO/GFT
+---
 
-## Alertes
-
-### Configuration
-
-```bash
-# .env
-# ntfy (notifications push légères)
-NTFY_TOPIC=envolees-trading
-NTFY_SERVER=https://ntfy.sh
-
-# Telegram (notifications détaillées)
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-TELEGRAM_CHAT_ID=123456789
-```
-
-### Usage
-
-```bash
-# Envoyer une alerte après compare
-python main.py compare out_is out_oos --alert
-```
-
-### Format des alertes
-
-**ntfy** (une ligne) :
-```
-CHALLENGE │ open:2 │ exp:0.9R │ budget:0.7% │ E1/TP1/SL0
-```
-
-**Telegram** (détaillé) :
-```
-🚀 Envolées — challenge
-📅 2026-01-11 19:00
-
-💰 Budget jour: 1.5% │ consommé: 0.8% │ restant: 0.7%
-📊 Ouverts: 2 │ exposition: 0.9R │ max: 0.5R (NZDUSD)
-📝 Événements: 1 entrée │ 1 TP
-
-🎯 Shortlist: NZDUSD(1.2), GBPUSD(1.1), USDJPY(0.8)
-```
-
-## Services Systemd
-
-Pour automatiser la recherche 2x/jour :
-
-```bash
-# Copier les fichiers
-cp systemd/envolees-research.service ~/.config/systemd/user/
-cp systemd/envolees-research.timer ~/.config/systemd/user/
-
-# Activer
-systemctl --user daemon-reload
-systemctl --user enable --now envolees-research.timer
-
-# Logs
-journalctl --user -u envolees-research.service -f
-```
-
-Voir `systemd/README.md` pour plus de détails.
-
-## Development
-
-```bash
-# Tests
-pytest
-
-# Lint
-ruff check envolees/
-
-# Type check
-mypy envolees/
-```
-
-## License
+## Licence
 
 MIT
