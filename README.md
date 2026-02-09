@@ -36,6 +36,9 @@ RISK_PER_TRADE=0.0025
 # Profil de risque: default, challenge, funded, conservative, aggressive
 PROFILE=challenge
 
+# Timeframe de trading: 4h (défaut) ou 1h
+TIMEFRAME=4h
+
 # Cache
 CACHE_ENABLED=true
 CACHE_MAX_AGE_HOURS=24
@@ -48,6 +51,57 @@ SPLIT_RATIO=0.70
 TELEGRAM_BOT_TOKEN=xxx
 TELEGRAM_CHAT_ID=xxx
 ```
+
+### Configurations prêtes à l'emploi
+
+| Fichier | Usage | Timeframe |
+|---------|-------|-----------|
+| `.env.funded` | Comptes funded (conservateur) | 4H |
+| `.env.challenge.1h` | Challenges (plus de trades) | 1H |
+
+```bash
+# Utiliser une config prête
+cp .env.funded .env
+python main.py pipeline
+```
+
+---
+
+## Timeframe 1H vs 4H
+
+Le système supporte deux timeframes :
+
+| Aspect | 4H (recommandé) | 1H |
+|--------|-----------------|-----|
+| **Usage** | Funded, conservateur | Challenges |
+| **Trades/jour** | 1-6 par instrument | 4-20 par instrument |
+| **Instruments** | Crypto, Forex | Stocks US, Indices |
+| **Risque DD** | Faible | Modéré |
+
+### Changer de timeframe
+
+```bash
+# Option 1: Variable d'environnement
+TIMEFRAME=1h python main.py pipeline
+
+# Option 2: Option CLI
+python main.py run --timeframe 1h
+
+# Option 3: Fichier .env
+cp .env.challenge.1h .env
+python main.py pipeline
+```
+
+### Paramètres recommandés par timeframe
+
+| Paramètre | 4H | 1H |
+|-----------|----|----|
+| DONCHIAN_N | 20 | 80 |
+| EMA_PERIOD | 200 | 800 |
+| SL_ATR | 1.0 | 1.5 |
+| RISK_PER_TRADE | 0.25% | 0.30% |
+
+> ⚠️ En 1H, utiliser `TIMEFRAME=1h` seul (sans ajuster les indicateurs) génère des signaux trop fréquents car Donchian 20 = seulement 20h < 1 jour.
 
 ---
 
@@ -142,6 +196,9 @@ envolees run -t "EURUSD=X,GBPUSD=X,BTC-USD"
 # Spécifier les pénalités
 envolees run -p "0.10,0.20,0.25"
 
+# Changer le timeframe
+envolees run --timeframe 1h
+
 # Mode IS (in-sample)
 envolees run --split is -o out_is
 
@@ -163,6 +220,7 @@ envolees run -v
 | `-o, --output` | Dossier de sortie |
 | `--mode` | `close` ou `worst` (équité journalière) |
 | `--split` | `is`, `oos`, ou `none` |
+| `--timeframe, -tf` | `1h` ou `4h` (défaut: .env ou 4h) |
 | `--no-cache` | Forcer re-téléchargement |
 | `-v, --verbose` | Sortie détaillée |
 
@@ -282,83 +340,16 @@ envolees cache-verify --fail-on-stale
 
 ---
 
-### `envolees cache`
+### Autres commandes
 
-Affiche les statistiques du cache.
-
-```bash
-envolees cache
-```
-
----
-
-### `envolees cache-clear`
-
-Vide le cache de données.
-
-```bash
-# Avec confirmation
-envolees cache-clear
-
-# Sans confirmation
-envolees cache-clear --yes
-```
-
----
-
-### `envolees config`
-
-Affiche la configuration actuelle.
-
-```bash
-envolees config
-```
-
----
-
-### `envolees status`
-
-Affiche le statut de trading actuel.
-
-```bash
-# Format texte
-envolees status
-
-# Format JSON
-envolees status -o json
-```
-
----
-
-### `envolees heartbeat`
-
-Envoie un signal de vie (pour monitoring).
-
-```bash
-envolees heartbeat
-```
-
----
-
-### `envolees alert`
-
-Envoie une alerte manuelle (Telegram).
-
-```bash
-# Alerte warning (défaut)
-envolees alert "Pipeline terminé avec succès"
-
-# Alerte info
-envolees alert "Test de connexion" -l info
-
-# Alerte critique
-envolees alert "Erreur détectée!" -l critical
-```
-
-**Options :**
-| Option | Description |
-|--------|-------------|
-| `-l, --level` | `info`, `warning`, `critical` |
+| Commande | Description |
+|----------|-------------|
+| `envolees cache` | Statistiques du cache |
+| `envolees cache-clear` | Vider le cache |
+| `envolees config` | Afficher la configuration |
+| `envolees status` | Statut de trading actuel |
+| `envolees heartbeat` | Signal de vie (monitoring) |
+| `envolees alert "message"` | Alerte Telegram manuelle |
 
 ---
 
@@ -379,6 +370,7 @@ envolees instruments --no-stocks --no-indices --format env
 ```bash
 # Copier la sortie dans .env
 TICKERS=EURUSD=X,GBPUSD=X,...
+TIMEFRAME=4h
 ```
 
 ### 3. Lancer le pipeline
@@ -402,6 +394,26 @@ Les fichiers de sortie sont dans `out_compare/` :
 - `shortlist_tier2.csv` : Instruments pour Challenge (≥10 trades)
 - `shortlist_tradable.csv` : Liste combinée
 - `comparison_ref.csv` : Détails complets
+
+---
+
+## Stratégie Donchian Breakout
+
+### Logique d'entrée
+
+```
+LONG si:  Close > EMA(200)  ET  Close > Donchian_high(20) + 0.10×ATR
+SHORT si: Close < EMA(200)  ET  Close < Donchian_low(20) - 0.10×ATR
+```
+
+### Calcul Entry / SL / TP
+
+| Direction | Entry | SL | TP |
+|-----------|-------|----|----|
+| LONG | Donchian_high + buffer + pénalité | Entry - 1×ATR | Entry + 1×ATR |
+| SHORT | Donchian_low - buffer - pénalité | Entry + 1×ATR | Entry - 1×ATR |
+
+Risk/Reward = 1:1
 
 ---
 
@@ -458,12 +470,36 @@ out_compare/
 
 ## Automatisation (systemd)
 
-Des fichiers systemd sont fournis dans `systemd/` pour :
-- `envolees-cache.timer` : Mise à jour quotidienne du cache
-- `envolees-validation.timer` : Pipeline hebdomadaire
-- `envolees-heartbeat.timer` : Signal de vie
+### Services recommandés
 
-Voir `systemd/README.md` pour l'installation.
+| Timer | Fréquence | Usage |
+|-------|-----------|-------|
+| `envolees-monthly.timer` | 1er du mois, 19h | Pipeline complet ✅ |
+| `envolees-heartbeat.timer` | Quotidien | Signal de vie ✅ |
+
+### Services optionnels (pour usage intensif)
+
+| Timer | Fréquence | Usage |
+|-------|-----------|-------|
+| `envolees-cache.timer` | Toutes les 6h | Rafraîchir le cache |
+| `envolees-validation.timer` | Quotidien | Vérifier les données |
+| `envolees-research.timer` | 2x/jour | Scanner les signaux |
+
+### Installation
+
+```bash
+# Copier les fichiers
+sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/
+
+# Activer les timers essentiels
+sudo systemctl enable --now envolees-monthly.timer
+sudo systemctl enable --now envolees-heartbeat.timer
+
+# Désactiver les optionnels
+sudo systemctl disable envolees-cache.timer envolees-validation.timer envolees-research.timer
+```
+
+Voir `systemd/README.md` pour plus de détails.
 
 ---
 
@@ -484,6 +520,28 @@ Solution : exclure les indices (`--no-indices`) ou réduire `SPLIT_RATIO`.
 
 Yahoo agrège parfois mal les données crypto 24/7.
 Le système tolère maintenant 3 gaps par crypto.
+
+### "name 'df_4h' is not defined"
+
+Les imports n'ont pas été mis à jour. Vérifier que `envolees/cli.py` utilise :
+```python
+from envolees.data import download_1h, resample_to_timeframe, ...
+```
+
+---
+
+## Changelog
+
+### v0.3.0 (2025-02)
+- **Nouveau** : Support timeframe 1H/4H configurable
+- **Nouveau** : Option `--timeframe` / `-tf` dans CLI
+- **Nouveau** : Fichiers `.env.challenge.1h` et `.env.funded`
+- Remplacement `bars_4h` → `bars` (générique)
+
+### v0.2.0 (2025-01)
+- Ajout système de profils (challenge, funded, conservative)
+- Amélioration détection des gaps (calendar-aware)
+- Support 125 instruments FTMO
 
 ---
 
