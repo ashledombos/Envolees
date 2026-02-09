@@ -345,7 +345,8 @@ class BacktestEngine:
         return {
             "ticker": self.ticker,
             "exec_penalty_atr": self.exec_penalty_atr,
-            "bars_4h": n_bars,
+            "bars": n_bars,
+            "timeframe": self.cfg.timeframe if hasattr(self.cfg, 'timeframe') else "4h",
             "start_balance": self.cfg.start_balance,
             "end_balance": self.balance,
             "risk_per_trade": self.cfg.risk_per_trade,

@@ -87,7 +87,7 @@ def export_batch_summary(
         rows.append({
             "ticker": s["ticker"],
             "penalty_atr": s["exec_penalty_atr"],
-            "bars_4h": s["bars_4h"],
+            "bars": s["bars"],
             "n_trades": s["n_trades"],
             "win_rate": s["win_rate"],
             "profit_factor": s["profit_factor"],

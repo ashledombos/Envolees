@@ -1,5 +1,9 @@
 """
 Configuration du backtest — chargement .env, secrets et profils.
+
+VERSION MODIFIÉE: Ajout du support timeframe (1h/4h)
+- Nouveau champ: timeframe
+- Nouvelle variable .env: TIMEFRAME
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ DailyEquityMode = Literal["close", "worst"]
 SplitMode = Literal["", "none", "time"]
 SplitTarget = Literal["", "is", "oos"]
 ProfileMode = Literal["default", "challenge", "funded", "conservative", "aggressive"]
+Timeframe = Literal["1h", "4h"]  # ← NOUVEAU
 
 
 def _parse_time(s: str) -> time:
@@ -119,7 +124,7 @@ class Config:
     no_trade_start: time = field(default_factory=lambda: time(22, 30))
     no_trade_end: time = field(default_factory=lambda: time(6, 30))
 
-    # Ordre en attente : valable sur N bougies 4H
+    # Ordre en attente : valable sur N bougies
     order_valid_bars: int = 1
 
     # Convention conservative
@@ -143,6 +148,16 @@ class Config:
     # Yahoo Finance
     yf_period: str = "730d"
     yf_interval: str = "1h"
+    
+    # ══════════════════════════════════════════════════════════════════════════
+    # NOUVEAU: Timeframe de trading
+    # ══════════════════════════════════════════════════════════════════════════
+    # Les données sont téléchargées en 1h (yf_interval) puis resampleées vers
+    # ce timeframe. 
+    # - "4h" = mode funded (conservateur, ~1-6 trades/jour par instrument)
+    # - "1h" = mode challenge (plus agressif, ~4-24 trades/jour par instrument)
+    timeframe: Timeframe = "4h"
+    # ══════════════════════════════════════════════════════════════════════════
 
     # Cache
     cache_enabled: bool = True
@@ -206,6 +221,11 @@ class Config:
             split_target=os.getenv("SPLIT_TARGET", "").strip().lower(),  # type: ignore[arg-type]
             yf_period=os.getenv("YF_PERIOD", "730d"),
             yf_interval=os.getenv("YF_INTERVAL", "1h"),
+            # ══════════════════════════════════════════════════════════════════
+            # NOUVEAU: Charger le timeframe depuis .env
+            # ══════════════════════════════════════════════════════════════════
+            timeframe=os.getenv("TIMEFRAME", "4h").lower(),  # type: ignore[arg-type]
+            # ══════════════════════════════════════════════════════════════════
             cache_enabled=_parse_bool(os.getenv("CACHE_ENABLED", "true")),
             cache_dir=os.getenv("CACHE_DIR", ""),
             cache_max_age_hours=_get_profile_value(profile_name, "cache_max_age_hours", "CACHE_MAX_AGE_HOURS", 24.0),

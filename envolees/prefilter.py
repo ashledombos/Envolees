@@ -26,7 +26,7 @@ class PrefilterConfig:
     """Configuration du pré-filtre."""
     
     # Minimum de barres 4H
-    min_bars_4h: int = 1500
+    min_bars: int = 1500
     
     # ATR relatif minimum (éviter les tickers sans volatilité)
     min_atr_ratio: float = 0.001  # 0.1%
@@ -41,7 +41,7 @@ class PrefilterConfig:
     def from_env(cls) -> PrefilterConfig:
         """Charge depuis l'environnement."""
         return cls(
-            min_bars_4h=int(os.getenv("PREFILTER_MIN_BARS", "1500")),
+            min_bars=int(os.getenv("PREFILTER_MIN_BARS", "1500")),
             min_atr_ratio=float(os.getenv("PREFILTER_MIN_ATR", "0.001")),
             min_raw_signals_is=int(os.getenv("PREFILTER_MIN_SIGNALS", "30")),
             max_spread_ratio=float(os.getenv("PREFILTER_MAX_SPREAD", "0.01")),
@@ -57,13 +57,13 @@ class PrefilterResult:
     reason: str
     
     # Métriques
-    bars_4h: int = 0
+    bars: int = 0
     atr_ratio: float = 0.0
     raw_signals: int = 0
     
     def __str__(self) -> str:
         status = "✓" if self.passed else "✗"
-        return f"{status} {self.ticker}: {self.reason} (bars={self.bars_4h}, signals={self.raw_signals})"
+        return f"{status} {self.ticker}: {self.reason} (bars={self.bars}, signals={self.raw_signals})"
 
 
 # Blacklist de tickers problématiques
@@ -228,12 +228,12 @@ def prefilter_ticker(
     bars = len(df_4h)
     
     # 3. Minimum de barres
-    if bars < prefilter_cfg.min_bars_4h:
+    if bars < prefilter_cfg.min_bars:
         return PrefilterResult(
             ticker=ticker,
             passed=False,
-            reason=f"insufficient bars ({bars} < {prefilter_cfg.min_bars_4h})",
-            bars_4h=bars,
+            reason=f"insufficient bars ({bars} < {prefilter_cfg.min_bars})",
+            bars=bars,
         )
     
     # 4. ATR ratio
@@ -244,7 +244,7 @@ def prefilter_ticker(
             ticker=ticker,
             passed=False,
             reason=f"low volatility (ATR {atr_ratio*100:.3f}% < {prefilter_cfg.min_atr_ratio*100:.2f}%)",
-            bars_4h=bars,
+            bars=bars,
             atr_ratio=atr_ratio,
         )
     
@@ -256,7 +256,7 @@ def prefilter_ticker(
             ticker=ticker,
             passed=False,
             reason=f"insufficient signals ({raw_signals} < {prefilter_cfg.min_raw_signals_is})",
-            bars_4h=bars,
+            bars=bars,
             atr_ratio=atr_ratio,
             raw_signals=raw_signals,
         )
@@ -266,7 +266,7 @@ def prefilter_ticker(
         ticker=ticker,
         passed=True,
         reason="OK",
-        bars_4h=bars,
+        bars=bars,
         atr_ratio=atr_ratio,
         raw_signals=raw_signals,
     )
@@ -336,7 +336,7 @@ def export_prefilter_results(
             "ticker": r.ticker,
             "passed": r.passed,
             "reason": r.reason,
-            "bars_4h": r.bars_4h,
+            "bars": r.bars,
             "atr_ratio": r.atr_ratio,
             "raw_signals": r.raw_signals,
         }

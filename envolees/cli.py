@@ -17,7 +17,7 @@ from rich.table import Table
 from envolees import __version__
 from envolees.backtest import BacktestEngine, BacktestResult
 from envolees.config import Config, get_penalties, get_tickers
-from envolees.data import download_1h, resample_to_4h, cache_stats, clear_cache
+from envolees.data import download_1h, resample_to_timeframe, cache_stats, clear_cache
 from envolees.output import export_batch_summary, export_result, format_summary_line, export_scoring
 from envolees.split import apply_split, SplitInfo
 from envolees.strategy import DonchianBreakoutStrategy
@@ -41,10 +41,10 @@ def run_single_backtest(
             cache_max_age_hours=cfg.cache_max_age_hours,
             verbose=verbose,
         )
-        df_4h = resample_to_4h(df_1h)
+        df = resample_to_timeframe(df_1h, cfg.timeframe)
 
         # Split temporel si configuré
-        df_4h, split_info = apply_split(df_4h, cfg)
+        df, split_info = apply_split(df, cfg)
         
         if split_info and verbose:
             console.print(f"[dim]   {split_info}[/dim]")
@@ -52,7 +52,7 @@ def run_single_backtest(
         strategy = DonchianBreakoutStrategy(cfg)
         engine = BacktestEngine(cfg, strategy, ticker, penalty)
 
-        result = engine.run(df_4h)
+        result = engine.run(df)
         return result, split_info
         
     except Exception as e:
@@ -103,6 +103,12 @@ def main() -> None:
     is_flag=True,
     help="Verbose output.",
 )
+@click.option( 
+    "--timeframe", "-tf",
+    type=click.Choice(["1h", "4h"]),
+    default=None,
+    help="Trading timeframe: 1h=challenge, 4h=funded (default: from .env or '4h').",
+)       
 def run(
     tickers: str | None,
     penalties: str | None,
@@ -111,6 +117,7 @@ def run(
     split: str | None,
     no_cache: bool,
     verbose: bool,
+    timeframe: str | None,
 ) -> None:
     """Run backtest on tickers with specified penalties."""
     cfg = Config.from_env()
@@ -129,6 +136,8 @@ def run(
             overrides["split_target"] = split
     if no_cache:
         overrides["cache_enabled"] = False
+    if timeframe:
+        overrides["timeframe"] = timeframe 
     
     if overrides:
         # Recréer la config avec les overrides
@@ -158,6 +167,7 @@ def run(
             "split_target": cfg.split_target,
             "yf_period": cfg.yf_period,
             "yf_interval": cfg.yf_interval,
+            "timeframe": cfg.timeframe,
             "cache_enabled": cfg.cache_enabled,
             "cache_dir": cfg.cache_dir,
             "cache_max_age_hours": cfg.cache_max_age_hours,
@@ -183,7 +193,7 @@ def run(
 
     # Header
     console.print(f"\n[bold cyan]🚀 Envolées v{__version__}[/bold cyan]")
-    console.print(f"   Tickers: {len(ticker_list)} │ Penalties: {len(penalty_list)}")
+    console.print(f"   Tickers: {len(ticker_list)} │ Penalties: {len(penalty_list)} │ TF: {cfg.timeframe.upper()}")
     console.print(f"   Mode: {cfg.daily_equity_mode} │ Output: {cfg.output_dir}")
     
     # Afficher le split de manière très visible
@@ -329,7 +339,7 @@ def single(ticker: str, penalty: float, output: str | None, no_cache: bool, verb
     # Détail
     s = result.summary
     console.print(f"\n[bold]Détails:[/bold]")
-    console.print(f"  Barres 4H: {s['bars_4h']}")
+    console.print(f"  Barres 4H: {s['bars']}")
     console.print(f"  Balance: {s['start_balance']:,.0f} → {s['end_balance']:,.0f}")
     console.print(f"  Trades: {s['n_trades']}")
     console.print(f"  Win Rate: {s['win_rate']:.1%}")
@@ -421,7 +431,7 @@ def cache_warm(tickers: str | None, force: bool) -> None:
     By default, respects CACHE_MAX_AGE_HOURS from .env (skips valid cache).
     Use --force to re-download everything.
     """
-    from envolees.data import download_1h, resample_to_4h
+    from envolees.data import download_1h, resample_to_timeframe
     
     cfg = Config.from_env()
     ticker_list = (
