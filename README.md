@@ -24,8 +24,8 @@ python main.py pipeline
 
 ```env
 # Tickers et pénalités
-TICKERS=EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,GC=F
-PENALTIES=0.05,0.10,0.15,0.20,0.25
+TICKERS=EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,ETH-USD,GC=F,^GSPC,^NDX
+PENALTIES=0.00,0.10,0.20,0.25
 
 # Stratégie
 TIMEFRAME=4h
@@ -37,7 +37,6 @@ SL_ATR=1.00
 TP_R=1.00
 
 # Risque
-PROFILE=funded
 START_BALANCE=100000
 RISK_PER_TRADE=0.0025
 MAX_CONCURRENT_TRADES=3
@@ -49,12 +48,18 @@ DAILY_EQUITY_MODE=worst
 STOP_AFTER_N_LOSSES=2
 
 # Volatilité
-VOL_QUANTILE=0.90
+VOL_QUANTILE=0.95
 VOL_WINDOW_BARS=1000
 
 # Fenêtre sans trading (heure Paris)
-NO_TRADE_START=22:30
-NO_TRADE_END=06:30
+# Mettre un intervalle d'1 min pour désactiver (ex: 23:30 / 23:31)
+NO_TRADE_START=23:30
+NO_TRADE_END=23:31
+
+# Données
+YF_PERIOD=730d
+YF_INTERVAL=1h
+TIMEZONE=Europe/Paris
 
 # Split IS/OOS
 SPLIT_MODE=time
@@ -63,11 +68,11 @@ SPLIT_RATIO=0.70
 # Cache
 CACHE_ENABLED=true
 CACHE_MAX_AGE_HOURS=24
-
-# Pondérations (optionnel)
-WEIGHT_EURUSD=1.0
-WEIGHT_BTC=0.8
+OUTPUT_DIR=out
 ```
+
+> **Note** : `ORDER_VALID_BARS` est obsolète depuis la v2 (recalcul continu).
+> Le champ existe toujours dans Config pour rétrocompatibilité mais n'est plus utilisé.
 
 ---
 
