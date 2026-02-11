@@ -116,6 +116,11 @@ class Config:
     sl_atr: float = 1.00
     tp_r: float = 1.00
 
+    # Proximité canal pour stop proactif (en multiples ATR)
+    # Le signal est généré si le prix est à moins de proximity_atr × ATR
+    # du bord du canal, AVANT le breakout (stop pré-placé)
+    proximity_atr: float = 1.5
+
     # Filtre volatilité
     vol_quantile: float = 0.90
     vol_window_bars: int = 1000
@@ -204,6 +209,7 @@ class Config:
             buffer_atr=float(os.getenv("BUFFER_ATR", "0.10")),
             sl_atr=float(os.getenv("SL_ATR", "1.00")),
             tp_r=float(os.getenv("TP_R", "1.00")),
+            proximity_atr=float(os.getenv("PROXIMITY_ATR", "1.5")),
             vol_quantile=float(os.getenv("VOL_QUANTILE", "0.90")),
             vol_window_bars=int(os.getenv("VOL_WINDOW_BARS", "1000")),
             no_trade_start=_parse_time(os.getenv("NO_TRADE_START", "22:30")),

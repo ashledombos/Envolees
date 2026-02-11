@@ -79,11 +79,17 @@ class DonchianBreakoutStrategy(Strategy):
         current_position: Position | None,
         pending_signal: Signal | None,
     ) -> Signal | None:
-        """Génère un signal de breakout si conditions remplies."""
-        # Pas de nouveau signal si position ouverte ou signal en attente
-        if current_position is not None or pending_signal is not None:
-            return None
+        """Génère un signal de breakout proactif.
 
+        Logique : on place un stop sur le bord du canal AVANT le breakout,
+        à condition que le prix soit du bon côté de l'EMA et suffisamment
+        proche du canal (< proximity_atr × ATR).
+
+        Le moteur appelle cette méthode à chaque barre. Si un signal est
+        retourné, le pending order est placé/remplacé. Si None, le pending
+        order est annulé. Les positions ouvertes n'empêchent pas un nouveau
+        signal (empilage momentum).
+        """
         row = df.iloc[bar_idx]
         ts = df.index[bar_idx]
 
@@ -105,26 +111,37 @@ class DonchianBreakoutStrategy(Strategy):
         buffer = self.cfg.buffer_atr * atr
         d_high = float(row["D_high"])
         d_low = float(row["D_low"])
+        prox = self.cfg.proximity_atr * atr
 
-        # Signal LONG
-        if close > ema and close > (d_high + buffer):
-            return Signal(
-                direction="LONG",
-                entry_level=d_high + buffer,
-                atr_at_signal=atr,
-                timestamp=ts,
-                expiry_bars=self.cfg.order_valid_bars,
-            )
+        # ── Signal LONG (stop proactif) ──────────────────────────────
+        # Conditions :
+        #   1. Tendance haussière (close > EMA)
+        #   2. Pas encore cassé le canal bufférisé (close < breakout_level)
+        #   3. Suffisamment proche du bord (distance < proximity_atr × ATR)
+        breakout_long = d_high + buffer
+        if close > ema and close < breakout_long:
+            distance = breakout_long - close
+            if distance < prox:
+                return Signal(
+                    direction="LONG",
+                    entry_level=breakout_long,
+                    atr_at_signal=atr,
+                    timestamp=ts,
+                    expiry_bars=self.cfg.order_valid_bars,
+                )
 
-        # Signal SHORT
-        if close < ema and close < (d_low - buffer):
-            return Signal(
-                direction="SHORT",
-                entry_level=d_low - buffer,
-                atr_at_signal=atr,
-                timestamp=ts,
-                expiry_bars=self.cfg.order_valid_bars,
-            )
+        # ── Signal SHORT (stop proactif) ─────────────────────────────
+        breakout_short = d_low - buffer
+        if close < ema and close > breakout_short:
+            distance = close - breakout_short
+            if distance < prox:
+                return Signal(
+                    direction="SHORT",
+                    entry_level=breakout_short,
+                    atr_at_signal=atr,
+                    timestamp=ts,
+                    expiry_bars=self.cfg.order_valid_bars,
+                )
 
         return None
 

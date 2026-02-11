@@ -1,550 +1,273 @@
-# 🚀 Envolées
+# Envolées — Backtest Engine
 
-Moteur de backtest pour stratégie Donchian Breakout, optimisé pour les challenges FTMO et Goat Funded Trader.
-
-## Installation
-
-```bash
-# Cloner le repo
-git clone <repo_url>
-cd envolees
-
-# Créer l'environnement virtuel
-python -m venv .venv
-source .venv/bin/activate  # Linux/Mac
-# ou .venv\Scripts\activate  # Windows
-
-# Installer
-pip install -e .
-```
-
-## Configuration
-
-Créer un fichier `.env` à la racine :
-
-```bash
-# Tickers à backtester (générer avec: envolees instruments --format env)
-TICKERS=EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,ETH-USD,GC=F
-
-# Pénalités d'exécution (multiples ATR)
-PENALTIES=0.00,0.10,0.20,0.25
-
-# Capital et risque
-START_BALANCE=100000
-RISK_PER_TRADE=0.0025
-
-# Profil de risque: default, challenge, funded, conservative, aggressive
-PROFILE=challenge
-
-# Timeframe de trading: 4h (défaut) ou 1h
-TIMEFRAME=4h
-
-# Cache
-CACHE_ENABLED=true
-CACHE_MAX_AGE_HOURS=24
-
-# Split IS/OOS
-SPLIT_MODE=time
-SPLIT_RATIO=0.70
-
-# Alertes Telegram (optionnel)
-TELEGRAM_BOT_TOKEN=xxx
-TELEGRAM_CHAT_ID=xxx
-```
-
-### Configurations prêtes à l'emploi
-
-| Fichier | Usage | Timeframe |
-|---------|-------|-----------|
-| `.env.funded` | Comptes funded (conservateur) | 4H |
-| `.env.challenge.1h` | Challenges (plus de trades) | 1H |
-
-```bash
-# Utiliser une config prête
-cp .env.funded .env
-python main.py pipeline
-```
+Moteur de backtest pour stratégie de breakout Donchian avec filtre EMA et volatilité, conçu pour les prop firms (FTMO, Goat Funded Trader).
 
 ---
 
-## Timeframe 1H vs 4H
+## Architecture générale
 
-Le système supporte deux timeframes :
-
-| Aspect | 4H (recommandé) | 1H |
-|--------|-----------------|-----|
-| **Usage** | Funded, conservateur | Challenges |
-| **Trades/jour** | 1-6 par instrument | 4-20 par instrument |
-| **Instruments** | Crypto, Forex | Stocks US, Indices |
-| **Risque DD** | Faible | Modéré |
-
-### Changer de timeframe
-
-```bash
-# Option 1: Variable d'environnement
-TIMEFRAME=1h python main.py pipeline
-
-# Option 2: Option CLI
-python main.py run --timeframe 1h
-
-# Option 3: Fichier .env
-cp .env.challenge.1h .env
-python main.py pipeline
+```
+Données Yahoo (1H) → Resample (4H) → Indicateurs → Stratégie → Moteur de backtest → Résultats
 ```
 
-### Paramètres recommandés par timeframe
+Le système se décompose en trois couches :
 
-| Paramètre | 4H | 1H |
-|-----------|----|----|
-| DONCHIAN_N | 20 | 80 |
-| EMA_PERIOD | 200 | 800 |
-| SL_ATR | 1.0 | 1.5 |
-| RISK_PER_TRADE | 0.25% | 0.30% |
+1. **Stratégie** (`strategy/donchian_breakout.py`) — Décide *quand* et *où* placer un ordre stop.
+2. **Moteur** (`backtest/engine.py`) — Simule l'exécution : déclenchement des stops, ouverture/fermeture des positions, gestion du P&L.
+3. **Positions** (`backtest/position.py`) — Logique de chaque position individuelle : calcul du P&L, vérification des sorties SL/TP.
 
-> ⚠️ En 1H, utiliser `TIMEFRAME=1h` seul (sans ajuster les indicateurs) génère des signaux trop fréquents car Donchian 20 = seulement 20h < 1 jour.
 
 ---
 
-## Commandes CLI
+## Logique de signal : le stop proactif
 
-### `envolees instruments`
+### Le problème de l'ancienne approche
 
-Liste les instruments FTMO avec leur mapping Yahoo Finance.
+L'ancienne version détectait un breakout *après coup* :
 
-```bash
-# Afficher tous les instruments recommandés
-envolees instruments
-
-# Format tableau détaillé
-envolees instruments --format table
-
-# Générer la variable TICKERS pour .env
-envolees instruments --format env
-envolees instruments --format env > .env.tickers
-
-# Exclure les crypto
-envolees instruments --no-crypto
-
-# Exclure les indices (Yahoo n'a que ~7 mois d'historique)
-envolees instruments --no-indices
-
-# Seulement les instruments priorité 1-2 (core)
-envolees instruments -p 2
-
-# Format JSON
-envolees instruments --format json -o instruments.json
-
-# Uniquement compatibles GFT (Goat Funded Trader)
-envolees instruments --gft-only
+```
+Bar N : close = 105, canal haut = 103
+→ Le prix a DÉJÀ traversé le canal
+→ On place un "stop" à 103... mais le prix est à 105
+→ Le backtest simule un fill à 103, ce qui est fictif
 ```
 
-**Options :**
-| Option | Description |
-|--------|-------------|
-| `--crypto/--no-crypto` | Inclure/exclure les crypto |
-| `--indices/--no-indices` | Inclure/exclure les indices |
-| `--stocks/--no-stocks` | Inclure/exclure les actions |
-| `-p, --max-priority` | Priorité max (1=core, 5=marginal) |
-| `--gft-only` | Uniquement instruments GFT |
-| `-f, --format` | `list`, `env`, `json`, `table` |
-| `-o, --output` | Fichier de sortie |
+En live, on aurait obtenu un fill à ~105 (le prix courant), pas à 103.
+
+### La correction : stop pré-placé
+
+Le signal est maintenant émis *avant* le breakout. À chaque barre, on vérifie :
+
+```
+LONG : close > EMA                         (tendance OK)
+       close < D_high + buffer              (PAS encore cassé)
+       (D_high + buffer) - close < 1.5×ATR  (assez proche)
+       → Buy-stop placé à D_high + buffer
+```
+
+Si le prix casse le canal sur la barre suivante, le stop est déclenché au bon prix. Si le prix s'éloigne ou que les conditions changent, l'ordre est annulé et recalculé.
+
+### Recalcul continu
+
+Le canal Donchian bouge à chaque barre (le plus haut des 20 dernières barres change). L'ordre stop doit suivre. À chaque barre, le moteur :
+
+1. Demande à la stratégie un signal (peut être le même niveau, un niveau différent, ou rien)
+2. Si signal → place ou **remplace** le pending order
+3. Si pas de signal → **annule** le pending order existant
+
+Il n'y a plus de notion d'expiration — l'ordre vit tant que les conditions sont remplies.
+
 
 ---
 
-### `envolees pipeline`
+## Positions multiples (empilage momentum)
 
-Exécute le pipeline complet de validation : cache → IS → OOS → compare.
+Le moteur autorise plusieurs positions ouvertes simultanément sur le même instrument. La contrainte est uniquement sur les ordres : **un seul pending order à la fois** (pas d'ordres contradictoires).
 
-```bash
-# Pipeline standard (gaps bloquants, stale toléré)
-envolees pipeline
+Scénario typique lors d'un fort mouvement haussier :
 
-# Mode strict : gaps ET stale bloquants
-envolees pipeline --strict
-
-# Strict sur les gaps uniquement
-envolees pipeline --strict-gaps
-
-# Sans alerte Telegram
-envolees pipeline --no-alert
-
-# Sauter l'étape de cache
-envolees pipeline --skip-cache
+```
+Bar 1 : stop placé à 103.0 → déclenché → Position A ouverte
+Bar 2 : canal monte à 103.5 → nouveau stop à 103.6
+Bar 3 : stop déclenché → Position B ouverte (A toujours active)
+Bar 4 : canal monte encore → nouveau stop → Position C
+...
 ```
 
-**Options :**
-| Option | Description |
-|--------|-------------|
-| `--skip-cache` | Sauter cache-warm et cache-verify |
-| `--strict` | Échouer si gaps OU données stale |
-| `--strict-gaps` | Échouer si gaps (stale = warning) |
-| `--alert/--no-alert` | Envoyer alerte Telegram après compare |
+Cela permet de profiter du momentum avec un risque fractionné (`risk_per_trade` par position).
+
+Le paramètre `MAX_CONCURRENT_TRADES` (défaut 0 = illimité) plafonne le nombre de positions ouvertes. Quand le plafond est atteint, aucun nouvel ordre n'est placé jusqu'à ce qu'une position se ferme.
+
 
 ---
 
-### `envolees run`
+## Heuristique de résolution same-bar (chemin de prix)
 
-Lance le backtest sur plusieurs tickers et pénalités.
+Le moteur applique une heuristique de plausibilité du chemin dans deux situations où une bougie 4H est ambiguë. Le principe est identique : on calcule le parcours minimum d'un scénario, et si ce parcours dépasse 1.5× le range réel de la bougie, on le considère physiquement impossible.
 
-```bash
-# Utiliser les tickers du .env
-envolees run
+### Situation 1 : Entry + SL sur la barre d'entrée
 
-# Spécifier les tickers
-envolees run -t "EURUSD=X,GBPUSD=X,BTC-USD"
+Quand le pending order est déclenché (le prix touche le niveau d'entry), il arrive que le Low de la même bougie soit aussi sous le SL. Question : le SL a-t-il été touché *après* l'entry (= perte immédiate) ou *avant* (= l'entry n'était pas encore active, la position survit) ?
 
-# Spécifier les pénalités
-envolees run -p "0.10,0.20,0.25"
-
-# Changer le timeframe
-envolees run --timeframe 1h
-
-# Mode IS (in-sample)
-envolees run --split is -o out_is
-
-# Mode OOS (out-of-sample)
-envolees run --split oos -o out_oos
-
-# Forcer le re-téléchargement
-envolees run --no-cache
-
-# Mode verbeux
-envolees run -v
-```
-
-**Options :**
-| Option | Description |
-|--------|-------------|
-| `-t, --tickers` | Tickers (séparés par virgule) |
-| `-p, --penalties` | Pénalités ATR (séparées par virgule) |
-| `-o, --output` | Dossier de sortie |
-| `--mode` | `close` ou `worst` (équité journalière) |
-| `--split` | `is`, `oos`, ou `none` |
-| `--timeframe, -tf` | `1h` ou `4h` (défaut: .env ou 4h) |
-| `--no-cache` | Forcer re-téléchargement |
-| `-v, --verbose` | Sortie détaillée |
-
----
-
-### `envolees single`
-
-Lance le backtest sur un seul ticker.
-
-```bash
-# Backtest simple
-envolees single EURUSD=X
-
-# Avec pénalité spécifique
-envolees single EURUSD=X -p 0.25
-
-# Sortie personnalisée
-envolees single BTC-USD -o results/btc -v
-```
-
-**Options :**
-| Option | Description |
-|--------|-------------|
-| `-p, --penalty` | Pénalité d'exécution (défaut: 0.10) |
-| `-o, --output` | Dossier de sortie |
-| `--no-cache` | Forcer re-téléchargement |
-| `-v, --verbose` | Sortie détaillée |
-
----
-
-### `envolees compare`
-
-Compare les résultats IS et OOS pour validation.
-
-```bash
-# Comparaison standard
-envolees compare out_is out_oos -o out_compare
-
-# Pénalité de référence différente
-envolees compare out_is out_oos -p 0.20
-
-# Critères personnalisés
-envolees compare out_is out_oos --min-trades 20 --dd-cap 0.01
-
-# Sans alerte
-envolees compare out_is out_oos --no-alert
-```
-
-**Options :**
-| Option | Description |
-|--------|-------------|
-| `-o, --output` | Dossier pour le rapport |
-| `-p, --penalty` | Pénalité de référence (défaut: 0.25) |
-| `--min-trades` | Trades minimum OOS (défaut: 15) |
-| `--dd-cap` | DD maximum (défaut: 0.012 = 1.2%) |
-| `--max-tickers` | Max tickers shortlist (défaut: 20) |
-| `--alert/--no-alert` | Envoyer alerte avec résultats |
-
-**Tiers de sortie :**
-- **Tier 1 (Funded)** : ≥15 trades OOS, critères stricts
-- **Tier 2 (Challenge)** : ≥10 trades OOS, critères plus souples
-
----
-
-### `envolees cache-warm`
-
-Pré-télécharge les données dans le cache.
-
-```bash
-# Réchauffer le cache (respecte CACHE_MAX_AGE_HOURS)
-envolees cache-warm
-
-# Forcer le re-téléchargement de tout
-envolees cache-warm --force
-
-# Tickers spécifiques
-envolees cache-warm -t "EURUSD=X,BTC-USD"
-```
-
-**Options :**
-| Option | Description |
-|--------|-------------|
-| `-t, --tickers` | Tickers spécifiques |
-| `-f, --force` | Ignorer le cache existant |
-
----
-
-### `envolees cache-verify`
-
-Vérifie l'intégrité du cache et détecte les gaps.
-
-```bash
-# Vérification standard
-envolees cache-verify
-
-# Mode verbeux (détail des gaps)
-envolees cache-verify -v
-
-# Exporter les tickers éligibles
-envolees cache-verify --export-eligible eligible.txt
-
-# Échouer si gaps détectés
-envolees cache-verify --fail-on-gaps
-
-# Échouer si données stale
-envolees cache-verify --fail-on-stale
-```
-
-**Options :**
-| Option | Description |
-|--------|-------------|
-| `-t, --tickers` | Tickers à vérifier |
-| `--fail-on-gaps` | Exit code erreur si gaps |
-| `--fail-on-stale` | Exit code erreur si stale |
-| `--export-eligible` | Exporter tickers valides |
-| `-v, --verbose` | Analyse détaillée des gaps |
-
----
-
-### Autres commandes
-
-| Commande | Description |
-|----------|-------------|
-| `envolees cache` | Statistiques du cache |
-| `envolees cache-clear` | Vider le cache |
-| `envolees config` | Afficher la configuration |
-| `envolees status` | Statut de trading actuel |
-| `envolees heartbeat` | Signal de vie (monitoring) |
-| `envolees alert "message"` | Alerte Telegram manuelle |
-
----
-
-## Workflow typique
-
-### 1. Générer la liste d'instruments
-
-```bash
-# Voir les instruments disponibles
-envolees instruments --format table
-
-# Générer pour .env (sans actions ni indices problématiques)
-envolees instruments --no-stocks --no-indices --format env
-```
-
-### 2. Configurer `.env`
-
-```bash
-# Copier la sortie dans .env
-TICKERS=EURUSD=X,GBPUSD=X,...
-TIMEFRAME=4h
-```
-
-### 3. Lancer le pipeline
-
-```bash
-# Pipeline complet
-envolees pipeline
-
-# Ou étape par étape:
-envolees cache-warm --force
-envolees cache-verify -v
-envolees run --split is -o out_is
-envolees run --split oos -o out_oos
-envolees compare out_is out_oos -o out_compare
-```
-
-### 4. Analyser les résultats
-
-Les fichiers de sortie sont dans `out_compare/` :
-- `shortlist_tier1.csv` : Instruments pour compte Funded (≥15 trades)
-- `shortlist_tier2.csv` : Instruments pour Challenge (≥10 trades)
-- `shortlist_tradable.csv` : Liste combinée
-- `comparison_ref.csv` : Détails complets
-
----
-
-## Stratégie Donchian Breakout
-
-### Logique d'entrée
+**Scénario A — SL après entry (perte)** :
 
 ```
-LONG si:  Close > EMA(200)  ET  Close > Donchian_high(20) + 0.10×ATR
-SHORT si: Close < EMA(200)  ET  Close < Donchian_low(20) - 0.10×ATR
+         entry (103) ← prix monte ici, stop déclenché
+        /            \
+Open (101)            SL (101.5) ← pullback, position perdue
 ```
 
-### Calcul Entry / SL / TP
+Chemin : `|Open → entry| + |entry → SL|` = 2 + 1.5 = **3.5 points**
 
-| Direction | Entry | SL | TP |
-|-----------|-------|----|----|
-| LONG | Donchian_high + buffer + pénalité | Entry - 1×ATR | Entry + 1×ATR |
-| SHORT | Donchian_low - buffer - pénalité | Entry + 1×ATR | Entry - 1×ATR |
-
-Risk/Reward = 1:1
-
----
-
-## Gestion des gaps
-
-Le système distingue 3 types de gaps :
-
-| Type | Description | Comportement |
-|------|-------------|--------------|
-| **Expected** | Week-end, jours fériés | Ignoré ✅ |
-| **Tolerated** | Gaps ≤ seuil par instrument | Warning ⚠️ |
-| **Unexpected** | Gaps > seuil | Bloquant ❌ |
-
-Seuils par classe d'actif :
-- **Forex** : 0 gaps tolérés (strict)
-- **Crypto** : 3 gaps tolérés (maintenance Yahoo)
-- **Indices US** : 15 gaps tolérés (jours fériés)
-- **Indices EU** : 10 gaps tolérés
-
----
-
-## Mapping FTMO → Yahoo
-
-Certains instruments FTMO ont des noms différents sur Yahoo Finance :
-
-| FTMO | Yahoo | Notes |
-|------|-------|-------|
-| NERUSD | NEAR-USD | Near Protocol |
-| LNKUSD | LINK-USD | Chainlink |
-| AVAUSD | AVAX-USD | Avalanche |
-| AAVUSD | AAVE-USD | Aave |
-| XAUUSD | GC=F | Gold futures |
-| XAGUSD | SI=F | Silver futures |
-| US500.cash | ^GSPC | S&P 500 |
-| US100.cash | ^NDX | Nasdaq 100 |
-| GER40.cash | ^GDAXI | DAX |
-
-Voir `envolees/data/ftmo_instruments.py` pour la liste complète.
-
----
-
-## Fichiers de sortie
+**Scénario B — SL avant entry (survit)** :
 
 ```
-out_compare/
-├── comparison_full.csv     # Toutes pénalités
-├── comparison_ref.csv      # Pénalité de référence (0.25)
-├── shortlist_tier1.csv     # Tier 1 - Funded (≥15 trades)
-├── shortlist_tier2.csv     # Tier 2 - Challenge (≥10 trades)
-└── shortlist_tradable.csv  # Combiné Tier 1 + 2
+                      entry (103) ← prix monte ici, stop déclenché
+                     /
+Low (100.5) ← dip AVANT le breakout
+   \       /
+    Open (101)
 ```
 
----
+Le dip à 100.5 se produit quand le stop n'est pas encore actif. Le prix remonte ensuite et déclenche l'entry. La position survit.
 
-## Automatisation (systemd)
+**La règle** :
 
-### Services recommandés
-
-| Timer | Fréquence | Usage |
-|-------|-----------|-------|
-| `envolees-monthly.timer` | 1er du mois, 19h | Pipeline complet ✅ |
-| `envolees-heartbeat.timer` | Quotidien | Signal de vie ✅ |
-
-### Services optionnels (pour usage intensif)
-
-| Timer | Fréquence | Usage |
-|-------|-----------|-------|
-| `envolees-cache.timer` | Toutes les 6h | Rafraîchir le cache |
-| `envolees-validation.timer` | Quotidien | Vérifier les données |
-| `envolees-research.timer` | 2x/jour | Scanner les signaux |
-
-### Installation
-
-```bash
-# Copier les fichiers
-sudo cp systemd/*.service systemd/*.timer /etc/systemd/system/
-
-# Activer les timers essentiels
-sudo systemctl enable --now envolees-monthly.timer
-sudo systemctl enable --now envolees-heartbeat.timer
-
-# Désactiver les optionnels
-sudo systemctl disable envolees-cache.timer envolees-validation.timer envolees-research.timer
-```
-
-Voir `systemd/README.md` pour plus de détails.
-
----
-
-## Dépannage
-
-### "Yahoo Finance: aucune donnée pour X"
-
-Certaines crypto sont delisted sur Yahoo (UNI-USD, IMX-USD, GRT-USD). 
-Utiliser `envolees instruments` pour voir les instruments disponibles.
-
-### Indices avec 0 trades OOS
-
-Yahoo ne fournit que ~7 mois d'historique pour les indices (^GSPC, ^NDX...).
-Avec un split 70/30, l'OOS n'a pas assez de données.
-Solution : exclure les indices (`--no-indices`) ou réduire `SPLIT_RATIO`.
-
-### Gaps inattendus sur crypto
-
-Yahoo agrège parfois mal les données crypto 24/7.
-Le système tolère maintenant 3 gaps par crypto.
-
-### "name 'df_4h' is not defined"
-
-Les imports n'ont pas été mis à jour. Vérifier que `envolees/cli.py` utilise :
 ```python
-from envolees.data import download_1h, resample_to_timeframe, ...
+chemin_entry_puis_sl = |Open → entry| + |entry → SL|
+
+if chemin_entry_puis_sl > 1.5 × range_bar:
+    → Position survit (le SL a été touché AVANT l'entry)
+else:
+    → Perte immédiate (le scénario entry→SL est plausible)
 ```
 
+Si la position survit, les barres suivantes sont sans ambiguïté :
+- TP touché sans SL préalable → clairement un TP
+- SL touché sans TP préalable → clairement un SL
+
+### Situation 2 : SL + TP sur une barre ultérieure
+
+Sur une bougie 4H, on dispose de 4 valeurs : Open, High, Low, Close. Quand le High touche le TP et le Low touche le SL, on ne sait pas lequel a été touché en premier. L'ancienne approche attribuait systématiquement un SL (conservateur).
+
+Mais cette attribution est souvent fausse, surtout sur les bougies de forte amplitude.
+
+### L'intuition
+
+Prenons un LONG avec entry à 100, SL à 98.5, TP à 103.
+
+Pour que le résultat soit un SL *suivi* d'un TP (le scénario où le mode conservateur se trompe), il faudrait que le prix fasse :
+
+```
+Open (102.5) → descend jusqu'au SL (98.5) → remonte jusqu'au TP (103)
+```
+
+Calculons le chemin minimum de ce scénario :
+
+```
+Descente : 102.5 → 98.5 = 4.0 points
+Remontée : 98.5  → 103   = 4.5 points
+Total    :                  8.5 points
+```
+
+Or la bougie a un range de `High - Low = 103.1 - 98.4 = 4.7 points`.
+
+Le prix aurait dû parcourir 8.5 points de chemin dans une bougie qui n'a que 4.7 points d'amplitude. C'est physiquement impossible : le chemin minimum dépasse largement le range réel.
+
+### La règle
+
+```python
+chemin_SL_first = |Open → SL| + |SL → TP|
+
+if chemin_SL_first > 1.5 × range_bar:
+    → TP  (le scénario SL-first ne tient pas dans cette bougie)
+else:
+    → SL  (le scénario est plausible, on reste conservateur)
+```
+
+Le facteur 1.5 (plutôt que 1.0) donne une marge : même si le chemin est légèrement supérieur au range, on ne bascule pas immédiatement en TP. Il faut que l'implausibilité soit franche.
+
+### Exemples visuels
+
+**Cas 1 — TP attribué** (open haut, range serré)
+
+```
+TP  ─────── 103.0   ···· High = 103.1
+            102.5   ← Open
+Entry ───── 100.0
+SL  ─────── 98.5    ···· Low = 98.4
+
+Range = 4.7 | Chemin SL-first = 8.5 | 8.5 > 7.05 (1.5×4.7) → TP ✓
+```
+
+Le prix a probablement ouvert à 102.5, fait une mèche basse à 98.4 (touchant le SL sur le papier) puis monté à 103.1 (TP). Mais pour atteindre le SL en premier il aurait fallu un aller-retour de 8.5 points dans un range de 4.7. Impossible. Le plus probable : la mèche basse s'est produite *avant* ou indépendamment de la montée vers le TP.
+
+**Cas 2 — SL attribué** (open bas, gros range)
+
+```
+TP  ─────── 103.0   ···· High = 104
+            
+Entry ───── 100.0
+            99.5    ← Open
+SL  ─────── 98.5    ···· Low = 98.0
+
+Range = 6.0 | Chemin SL-first = 5.5 | 5.5 < 9.0 (1.5×6.0) → SL (conservateur)
+```
+
+Ici le range est large (6 points) et l'open est près de l'entry. Le scénario open → SL → TP ne demande que 5.5 points de chemin, ce qui tient dans le range. On ne peut pas exclure un SL → on reste conservateur.
+
+
 ---
 
-## Changelog
+## Paramètres clés
 
-### v0.3.0 (2025-02)
-- **Nouveau** : Support timeframe 1H/4H configurable
-- **Nouveau** : Option `--timeframe` / `-tf` dans CLI
-- **Nouveau** : Fichiers `.env.challenge.1h` et `.env.funded`
-- Remplacement `bars_4h` → `bars` (générique)
+| Paramètre | Défaut | Description |
+|-----------|--------|-------------|
+| `PROXIMITY_ATR` | 1.5 | Distance max au canal pour placer un stop (en multiples ATR). Plus haut = plus de signaux mais plus de faux départs. |
+| `BUFFER_ATR` | 0.10 | Buffer ajouté au bord du canal pour éviter le bruit. Entry LONG = D_high + 0.10×ATR. |
+| `SL_ATR` | 1.00 | Distance du SL par rapport à l'entry (en multiples ATR). |
+| `TP_R` | 1.00 | Ratio risque/récompense. TP = entry + TP_R × (entry − SL). |
+| `RISK_PER_TRADE` | 0.0025 | Risque par position (0.25% du capital). |
+| `MAX_CONCURRENT_TRADES` | 0 | Plafond de positions simultanées (0 = illimité). |
+| `EXEC_PENALTY_ATR` | variable | Slippage modélisé sur l'entry (décale l'entry contre nous). |
+| `DONCHIAN_N` | 20 | Période du canal Donchian (plus haut/bas des N dernières barres). |
+| `EMA_PERIOD` | 200 | Période EMA pour le filtre de tendance. |
+| `VOL_QUANTILE` | 0.90 | Filtre volatilité : ATR relatif doit être sous le quantile 90%. |
+| `NO_TRADE_START/END` | 22:30 / 06:30 | Fenêtre sans nouvelles décisions (heure Paris). |
 
-### v0.2.0 (2025-01)
-- Ajout système de profils (challenge, funded, conservative)
-- Amélioration détection des gaps (calendar-aware)
-- Support 125 instruments FTMO
 
 ---
 
-## Licence
+## Flux d'une barre dans le moteur
 
-MIT
+```
+Pour chaque barre (4H) :
+│
+├── 1. Calcul equity mark-to-market (toutes positions)
+├── 2. Gestion changement de jour (reset daily DD)
+├── 3. Mise à jour equity tracking + prop sim
+│
+├── 4. Pour chaque position ouverte :
+│      └── SL ou TP touché ? → clôture, P&L, enregistrement
+│         (avec heuristique de chemin si les deux sont touchés)
+│
+├── 5. Pending order existe ?
+│      └── Stop déclenché (High/Low traverse le niveau) ?
+│          └── Oui → nouvelle position ouverte
+│
+└── 6. Recalcul du signal :
+       ├── Conditions remplies → place/remplace le pending order
+       ├── Conditions non remplies → annule le pending order
+       └── Plafond positions atteint → pas de nouvel ordre
+```
+
+
+---
+
+## Structure des fichiers
+
+```
+envolees/
+├── strategy/
+│   ├── base.py                 # Classes abstraites (Signal, Strategy)
+│   └── donchian_breakout.py    # Stratégie Donchian + EMA + volatilité
+├── backtest/
+│   ├── engine.py               # Moteur principal (boucle bar-by-bar)
+│   ├── position.py             # OpenPosition, PendingOrder, TradeRecord
+│   └── prop_sim.py             # Simulation règles prop firm (DD limits)
+├── indicators/
+│   ├── atr.py, donchian.py, ema.py
+├── data/
+│   ├── yahoo.py                # Téléchargement Yahoo Finance
+│   ├── cache.py                # Cache local des données
+│   └── calendar.py, aliases.py, ftmo_instruments.py
+├── output/
+│   ├── scoring.py              # Métriques de performance
+│   ├── compare.py              # Comparaison multi-ticker/multi-penalty
+│   └── export.py               # Export résultats
+├── config.py                   # Configuration (.env → dataclass)
+├── cli.py                      # Interface ligne de commande
+├── prefilter.py                # Pré-sélection instruments
+├── alerts.py                   # Alertes TradingView / webhook
+└── profiles.py                 # Profils de risque (challenge/funded)
+```

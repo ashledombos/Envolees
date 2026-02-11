@@ -57,14 +57,22 @@ class OpenPosition:
         high: float,
         low: float,
         conservative_same_bar: bool = True,
+        open_price: float | None = None,
     ) -> tuple[ExitReason | None, float | None]:
         """
         Vérifie si SL ou TP est touché.
 
+        Quand les deux sont touchés sur la même bougie :
+        - Si open_price est fourni, utilise une heuristique de plausibilité
+          du chemin (le scénario SL→TP est-il physiquement réaliste dans
+          le range de cette bougie ?).
+        - Sinon, fallback sur le mode conservateur classique (SL prioritaire).
+
         Args:
             high: High de la bougie
             low: Low de la bougie
-            conservative_same_bar: Si True, SL prioritaire si les deux sont touchés
+            conservative_same_bar: Si True et pas d'heuristique, SL prioritaire
+            open_price: Open de la bougie (active l'heuristique de chemin)
 
         Returns:
             Tuple (exit_reason, exit_price) ou (None, None)
@@ -76,9 +84,32 @@ class OpenPosition:
             hit_sl = high >= self.sl
             hit_tp = low <= self.tp
 
-        # Convention conservative
-        if hit_sl and hit_tp and conservative_same_bar:
-            hit_tp = False
+        if hit_sl and hit_tp:
+            if open_price is not None:
+                # Heuristique de plausibilité du chemin
+                # On calcule le parcours minimum pour le scénario "SL touché
+                # en premier, puis rebond jusqu'au TP". Si ce chemin dépasse
+                # 1.5× le range réel de la bougie, c'est physiquement
+                # implausible → on attribue le TP.
+                bar_range = high - low
+                if bar_range > 0:
+                    if self.direction == "LONG":
+                        # Chemin SL-first : open → descente au SL → remontée au TP
+                        path_sl_first = max(0, open_price - self.sl) + (self.tp - self.sl)
+                    else:
+                        # Chemin SL-first : open → montée au SL → descente au TP
+                        path_sl_first = max(0, self.sl - open_price) + (self.sl - self.tp)
+
+                    if path_sl_first > 1.5 * bar_range:
+                        # SL-first implausible → TP
+                        hit_sl = False
+                    else:
+                        # SL-first plausible → conservateur
+                        hit_tp = False
+                else:
+                    hit_tp = False
+            elif conservative_same_bar:
+                hit_tp = False
 
         if hit_sl:
             return "SL", self.sl

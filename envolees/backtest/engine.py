@@ -73,7 +73,8 @@ class BacktestEngine:
     Moteur de backtest générique.
 
     Exécute une stratégie sur des données OHLCV avec :
-    - Gestion des ordres stop en attente
+    - Positions multiples simultanées par instrument (empilage momentum)
+    - Un seul ordre stop en attente à la fois (recalculé chaque barre)
     - Simulation des règles prop firm
     - Tracking de l'equity et du drawdown
     """
@@ -92,7 +93,7 @@ class BacktestEngine:
 
         # État
         self.balance = cfg.start_balance
-        self.open_position: OpenPosition | None = None
+        self.open_positions: list[OpenPosition] = []
         self.pending_order: PendingOrder | None = None
 
         # Prop simulation
@@ -107,21 +108,25 @@ class BacktestEngine:
         self.equity_curve: list[EquityRow] = []
 
     def _compute_equity(self, row: pd.Series) -> float:
-        """Calcule l'equity mark-to-market."""
-        if self.open_position is None:
+        """Calcule l'equity mark-to-market (somme de toutes les positions)."""
+        if not self.open_positions:
             return self.balance
 
-        if self.cfg.daily_equity_mode == "close":
-            ref_price = float(row["Close"])
-        else:
-            # Worst-case intrabar
-            if self.open_position.direction == "LONG":
-                ref_price = float(row["Low"])
+        total_unrealized = 0.0
+        for pos in self.open_positions:
+            if self.cfg.daily_equity_mode == "close":
+                ref_price = float(row["Close"])
             else:
-                ref_price = float(row["High"])
+                # Worst-case intrabar
+                if pos.direction == "LONG":
+                    ref_price = float(row["Low"])
+                else:
+                    ref_price = float(row["High"])
 
-        unreal_r = self.open_position.compute_unrealized_r(ref_price)
-        return self.balance + unreal_r * self.open_position.risk_cash
+            unreal_r = pos.compute_unrealized_r(ref_price)
+            total_unrealized += unreal_r * pos.risk_cash
+
+        return self.balance + total_unrealized
 
     def _handle_day_change(self, day, equity: float) -> None:
         """Gère le changement de jour."""
@@ -140,76 +145,70 @@ class BacktestEngine:
         self.daily_state.reset(day, equity)
         self.prop_sim.on_new_day(day, equity)
 
-    def _process_open_position(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
-        """Gère les sorties SL/TP d'une position ouverte."""
-        if self.open_position is None:
-            return
+    def _process_open_positions(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
+        """Gère les sorties SL/TP de toutes les positions ouvertes."""
+        closed_indices = []
 
-        exit_reason, exit_price = self.open_position.check_exit(
-            float(row["High"]),
-            float(row["Low"]),
-            self.cfg.conservative_same_bar,
-        )
+        for i, pos in enumerate(self.open_positions):
+            exit_reason, exit_price = pos.check_exit(
+                float(row["High"]),
+                float(row["Low"]),
+                self.cfg.conservative_same_bar,
+                open_price=float(row["Open"]),
+            )
 
-        if exit_reason is None:
-            return
+            if exit_reason is None:
+                continue
 
-        # Calcul P&L
-        result_r = self.open_position.compute_pnl_r(exit_price)
-        ## ajouut pànalité supplémentaire, à commmenter si problèmatique
-        SLIP_PENALTY = 0.05  # 5% du R
-        
-        if exit_reason == "SL":
-            result_r = result_r * (1 + SLIP_PENALTY)  # Perte aggravée
-        elif exit_reason == "TP":
-            result_r = result_r * (1 - SLIP_PENALTY)  # Gain réduit
-        ## fin de la pénalité supplémentaire
-        result_cash = result_r * self.open_position.risk_cash
-        self.balance += result_cash
+            # Calcul P&L
+            result_r = pos.compute_pnl_r(exit_price)
+            result_cash = result_r * pos.risk_cash
+            self.balance += result_cash
 
-        # Enregistrement
-        trade = TradeRecord(
-            ticker=self.ticker,
-            penalty_atr=self.exec_penalty_atr,
-            direction=self.open_position.direction,
-            ts_signal=self.open_position.ts_signal,
-            ts_entry=self.open_position.ts_entry,
-            ts_exit=ts,
-            entry=self.open_position.entry,
-            sl=self.open_position.sl,
-            tp=self.open_position.tp,
-            exit_price=exit_price,
-            exit_reason=exit_reason,
-            atr_signal=self.open_position.atr_signal,
-            result_r=result_r,
-            result_cash=result_cash,
-            balance_after=self.balance,
-            duration_bars=bar_idx - self.open_position.entry_bar_idx,
-        )
-        self.trades.append(trade)
+            # Enregistrement
+            trade = TradeRecord(
+                ticker=self.ticker,
+                penalty_atr=self.exec_penalty_atr,
+                direction=pos.direction,
+                ts_signal=pos.ts_signal,
+                ts_entry=pos.ts_entry,
+                ts_exit=ts,
+                entry=pos.entry,
+                sl=pos.sl,
+                tp=pos.tp,
+                exit_price=exit_price,
+                exit_reason=exit_reason,
+                atr_signal=pos.atr_signal,
+                result_r=result_r,
+                result_cash=result_cash,
+                balance_after=self.balance,
+                duration_bars=bar_idx - pos.entry_bar_idx,
+            )
+            self.trades.append(trade)
 
-        # Update prop sim
-        self.prop_sim.on_trade_closed(result_r, self.balance)
+            # Update prop sim
+            self.prop_sim.on_trade_closed(result_r, self.balance)
 
-        # Reset
-        self.open_position = None
-        self.pending_order = None
+            closed_indices.append(i)
 
-        # Update daily min
-        self.daily_state.update_min_equity(self.balance)
+        # Retirer les positions clôturées (en ordre inverse pour préserver les indices)
+        for i in reversed(closed_indices):
+            self.open_positions.pop(i)
+
+        if closed_indices:
+            self.daily_state.update_min_equity(self.balance)
 
     def _process_pending_order(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
         """Gère le déclenchement d'un ordre en attente."""
-        if self.open_position is not None or self.pending_order is None:
+        if self.pending_order is None:
             return
 
-        # Expiration ?
-        if self.pending_order.is_expired(bar_idx):
-            self.pending_order = None
-            return
+        high = float(row["High"])
+        low = float(row["Low"])
+        open_price = float(row["Open"])
 
         # Déclenchement ?
-        if not self.pending_order.is_triggered(float(row["High"]), float(row["Low"])):
+        if not self.pending_order.is_triggered(high, low):
             return
 
         # Halted ?
@@ -227,32 +226,107 @@ class BacktestEngine:
         )
         entry, sl, tp = self.strategy.compute_entry_sl_tp(signal, self.exec_penalty_atr)
 
-        # Ouverture position
-        self.open_position = OpenPosition(
+        # ── Vérification same-bar : entry + SL touchés sur la même bougie ──
+        # Si le SL est aussi dans le range de cette bougie, on applique
+        # l'heuristique de chemin pour déterminer si le SL a été touché
+        # APRÈS l'entry (= perte immédiate) ou AVANT (= entry pas encore
+        # active, position survit).
+        if self.pending_order.direction == "LONG":
+            sl_hit_on_entry_bar = low <= sl
+        else:
+            sl_hit_on_entry_bar = high >= sl
+
+        if sl_hit_on_entry_bar:
+            bar_range = high - low
+            if bar_range > 0:
+                if self.pending_order.direction == "LONG":
+                    # Scénario "entry first, then SL" :
+                    # open → monte à entry → redescend au SL
+                    path_entry_then_sl = max(0, entry - open_price) + (entry - sl)
+                else:
+                    # Scénario "entry first, then SL" :
+                    # open → descend à entry → remonte au SL
+                    path_entry_then_sl = max(0, open_price - entry) + (sl - entry)
+
+                if path_entry_then_sl <= 1.5 * bar_range:
+                    # Scénario plausible : entry touchée PUIS SL touché
+                    # → perte immédiate, on enregistre le trade comme SL
+                    risk_cash = self.balance * self.cfg.risk_per_trade
+                    pos = OpenPosition(
+                        direction=self.pending_order.direction,
+                        entry=entry, sl=sl, tp=tp,
+                        ts_signal=self.pending_order.ts_signal,
+                        ts_entry=ts,
+                        atr_signal=self.pending_order.atr_signal,
+                        entry_bar_idx=bar_idx,
+                        risk_cash=risk_cash,
+                    )
+                    result_r = pos.compute_pnl_r(sl)
+                    result_cash = result_r * risk_cash
+                    self.balance += result_cash
+
+                    self.trades.append(TradeRecord(
+                        ticker=self.ticker,
+                        penalty_atr=self.exec_penalty_atr,
+                        direction=pos.direction,
+                        ts_signal=pos.ts_signal,
+                        ts_entry=ts, ts_exit=ts,
+                        entry=entry, sl=sl, tp=tp,
+                        exit_price=sl, exit_reason="SL",
+                        atr_signal=pos.atr_signal,
+                        result_r=result_r,
+                        result_cash=result_cash,
+                        balance_after=self.balance,
+                        duration_bars=0,
+                    ))
+                    self.prop_sim.on_trade_closed(result_r, self.balance)
+                    self.daily_state.update_min_equity(self.balance)
+                    self.pending_order = None
+                    return
+                # else: implausible → SL touché AVANT entry → position survit
+
+        # Ouverture position (ajout à la liste)
+        new_pos = OpenPosition(
             direction=self.pending_order.direction,
-            entry=entry,
-            sl=sl,
-            tp=tp,
+            entry=entry, sl=sl, tp=tp,
             ts_signal=self.pending_order.ts_signal,
             ts_entry=ts,
             atr_signal=self.pending_order.atr_signal,
             entry_bar_idx=bar_idx,
             risk_cash=self.balance * self.cfg.risk_per_trade,
         )
+        self.open_positions.append(new_pos)
         self.pending_order = None
 
-    def _generate_new_signal(self, df: pd.DataFrame, bar_idx: int) -> None:
-        """Génère un nouveau signal si conditions remplies."""
-        if self.open_position is not None or self.pending_order is not None:
-            return
+    def _update_signal(self, df: pd.DataFrame, bar_idx: int) -> None:
+        """Recalcule le signal à chaque barre.
 
+        - Si conditions remplies → place ou remplace le pending order
+          (le canal bouge, le niveau du stop doit suivre).
+        - Si conditions plus remplies → annule le pending order.
+        - Un seul pending order à la fois (pas d'ordres contradictoires).
+        - Respect du plafond de positions simultanées.
+        """
         if self.prop_sim.is_halted:
+            self.pending_order = None
             return
 
-        # Demande à la stratégie
+        # Plafond de positions atteint → pas de nouvel ordre
+        if (
+            self.cfg.max_concurrent_trades > 0
+            and len(self.open_positions) >= self.cfg.max_concurrent_trades
+        ):
+            self.pending_order = None
+            return
+
+        # Demande à la stratégie (autorise même avec positions ouvertes)
         signal = self.strategy.generate_signal(df, bar_idx, None, None)
+
         if signal is not None:
             self.pending_order = PendingOrder.from_signal(signal, bar_idx)
+        else:
+            # Conditions plus remplies → annuler l'ordre existant
+            self.pending_order = None
 
     def run(self, df: pd.DataFrame) -> BacktestResult:
         """
@@ -294,14 +368,14 @@ class BacktestEngine:
                 halt_today=self.prop_sim.is_halted,
             ))
 
-            # 1. Gestion position ouverte (SL/TP)
-            self._process_open_position(row, bar_idx, ts)
+            # 1. Gestion positions ouvertes (SL/TP)
+            self._process_open_positions(row, bar_idx, ts)
 
-            # 2. Gestion ordre en attente
+            # 2. Gestion ordre en attente (déclenchement)
             self._process_pending_order(row, bar_idx, ts)
 
-            # 3. Génération nouveau signal
-            self._generate_new_signal(df, bar_idx)
+            # 3. Recalcul continu du signal / pending order
+            self._update_signal(df, bar_idx)
 
         # Flush dernière journée
         if self.daily_state.current_day is not None:
@@ -367,11 +441,11 @@ class BacktestEngine:
                 "atr_period": self.cfg.atr_period,
                 "donchian_n": self.cfg.donchian_n,
                 "buffer_atr": self.cfg.buffer_atr,
+                "proximity_atr": self.cfg.proximity_atr,
                 "sl_atr": self.cfg.sl_atr,
                 "tp_r": self.cfg.tp_r,
                 "vol_quantile": self.cfg.vol_quantile,
                 "vol_window_bars": self.cfg.vol_window_bars,
-                "order_valid_bars": self.cfg.order_valid_bars,
                 "conservative_same_bar": self.cfg.conservative_same_bar,
                 "daily_dd_ftmo": self.cfg.daily_dd_ftmo,
                 "daily_dd_gft": self.cfg.daily_dd_gft,
@@ -379,8 +453,11 @@ class BacktestEngine:
                 "stop_after_n_losses": self.cfg.stop_after_n_losses,
             },
             "notes": [
-                "Backtest bar-based 4H ; déclenchement STOP via High/Low.",
-                "Si SL et TP touchés même bougie, SL prioritaire (conservateur).",
+                "Backtest bar-based 4H ; stop proactif pré-placé sur le bord du canal.",
+                "Signal recalculé à chaque barre (le canal bouge, le stop suit).",
+                "Positions multiples autorisées (empilage momentum), 1 seul pending order.",
+                "Heuristique same-bar : si SL+TP touchés, attribution par plausibilité du chemin.",
+                "Vérification entry+SL sur barre d'entrée (même heuristique de chemin).",
                 "Pénalité d'exécution appliquée à l'entrée (k×ATR au signal), SL/TP recalculés.",
                 "Daily DD simulé avec mark-to-market (close ou worst).",
                 "Reset daily à minuit (Europe/Paris).",
