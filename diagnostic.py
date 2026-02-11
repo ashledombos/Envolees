@@ -285,17 +285,17 @@ def main():
          SingleNoHeuristicEngine, DonchianBreakoutStrategy,
          replace(cfg, max_concurrent_trades=1)),
 
-        ("C. Proactif + stacking (3 pos)",
+        ("C. Proactif + heuristique SL+TP (1 pos)",
+         BacktestEngine, DonchianBreakoutStrategy,
+         replace(cfg, max_concurrent_trades=1)),
+
+        ("D. Proactif + stacking 3 pos (pas heuristique)",
          SingleNoHeuristicEngine, DonchianBreakoutStrategy,
          replace(cfg, max_concurrent_trades=3)),
 
-        ("D. Full v2 (3 pos + heuristiques)",
+        ("E. Full v2 corrigé (3 pos + SL+TP heuristique)",
          BacktestEngine, DonchianBreakoutStrategy,
          replace(cfg, max_concurrent_trades=3)),
-
-        ("E. Proactif + heuristiques (1 pos)",
-         BacktestEngine, DonchianBreakoutStrategy,
-         replace(cfg, max_concurrent_trades=1)),
     ]
 
     results = []
@@ -324,34 +324,38 @@ def main():
 
     delta_ab = b["exp_r"] - a["exp_r"]
     delta_bc = c["exp_r"] - b["exp_r"]
-    delta_cd = d["exp_r"] - c["exp_r"]
-    delta_be = e["exp_r"] - b["exp_r"]
+    delta_bd = d["exp_r"] - b["exp_r"]
+    delta_de = e["exp_r"] - d["exp_r"]
 
-    print(f"\n  A→B  Signal proactif vs legacy :    {delta_ab:+.3f} R")
+    print(f"\n  A→B  Signal proactif vs legacy :       {delta_ab:+.3f} R")
     print(f"       (impact du changement de logique de signal)")
-    print(f"\n  B→C  Empilage 3 positions :         {delta_bc:+.3f} R")
+    print(f"\n  B→C  Heuristique SL+TP seule :          {delta_bc:+.3f} R")
+    print(f"       (devrait être neutre ou légèrement positif)")
+    print(f"\n  B→D  Empilage 3 positions :              {delta_bd:+.3f} R")
     print(f"       (impact du multi-position)")
-    print(f"\n  C→D  Heuristiques same-bar :         {delta_cd:+.3f} R")
-    print(f"       (impact entry+SL et SL+TP)")
-    print(f"\n  B→E  Heuristiques sans stacking :    {delta_be:+.3f} R")
-    print(f"       (impact heuristiques isolé)")
+    print(f"\n  D→E  Heuristique SL+TP + stacking :      {delta_de:+.3f} R")
+    print(f"       (heuristique avec stacking)")
 
     # Verdict
     impacts = [
         ("Signal proactif", abs(delta_ab)),
-        ("Empilage", abs(delta_bc)),
-        ("Heuristiques", abs(delta_cd)),
+        ("Heuristique SL+TP", abs(delta_bc)),
+        ("Empilage", abs(delta_bd)),
     ]
     impacts.sort(key=lambda x: x[1], reverse=True)
 
     print(f"\n  → Principal responsable : {impacts[0][0]} (|Δ| = {impacts[0][1]:.3f} R)")
 
-    if a["exp_r"] > 0 and b["exp_r"] < 0:
-        print(f"\n  ⚠️  Le legacy est profitable, le proactif ne l'est pas.")
-        print(f"      L'ancien biais d'exécution GONFLAIT les résultats.")
-        print(f"      Le signal proactif est plus honnête mais attrape des faux breakouts.")
-        print(f"      → Piste : ajouter un filtre momentum (close > prev_close, ou")
-        print(f"        close dans le tiers supérieur du range pour un long).")
+    if b["exp_r"] > a["exp_r"]:
+        print(f"\n  ✓ Le proactif améliore le legacy. Les résultats sont robustes.")
+    elif b["exp_r"] > -0.05:
+        print(f"\n  ~ Le proactif est quasi flat. Le legacy avait un biais d'exécution.")
+        print(f"    → La vraie performance est entre A et B.")
+    else:
+        print(f"\n  ⚠️  Le proactif perd significativement.")
+        print(f"      → Piste : ajouter un filtre momentum au signal proactif")
+        print(f"        (close dans le tiers supérieur du range pour un long,")
+        print(f"        ou close > close précédent).")
 
 
 if __name__ == "__main__":

@@ -155,54 +155,14 @@ Le paramètre `MAX_CONCURRENT_TRADES` (défaut 0 = illimité) plafonne le nombre
 
 ## Heuristique de résolution same-bar (chemin de prix)
 
-Le moteur applique une heuristique de plausibilité du chemin dans deux situations où une bougie 4H est ambiguë. Le principe est identique : on calcule le parcours minimum d'un scénario, et si ce parcours dépasse 1.5× le range réel de la bougie, on le considère physiquement impossible.
+### Le problème
 
-### Situation 1 : Entry + SL sur la barre d'entrée
+Sur une bougie 4H, on dispose de 4 valeurs : Open, High, Low, Close. Quand le High touche le TP et le Low touche le SL, on ne sait pas lequel a été touché en premier. L'approche naïve attribue systématiquement un SL (conservateur), mais c'est souvent faux sur les bougies de forte amplitude.
 
-Quand le pending order est déclenché (le prix touche le niveau d'entry), il arrive que le Low de la même bougie soit aussi sous le SL. Question : le SL a-t-il été touché *après* l'entry (= perte immédiate) ou *avant* (= l'entry n'était pas encore active, la position survit) ?
-
-**Scénario A — SL après entry (perte)** :
-
-```
-         entry (103) ← prix monte ici, stop déclenché
-        /            \
-Open (101)            SL (101.5) ← pullback, position perdue
-```
-
-Chemin : `|Open → entry| + |entry → SL|` = 2 + 1.5 = **3.5 points**
-
-**Scénario B — SL avant entry (survit)** :
-
-```
-                      entry (103) ← prix monte ici, stop déclenché
-                     /
-Low (100.5) ← dip AVANT le breakout
-   \       /
-    Open (101)
-```
-
-Le dip à 100.5 se produit quand le stop n'est pas encore actif. Le prix remonte ensuite et déclenche l'entry. La position survit.
-
-**La règle** :
-
-```python
-chemin_entry_puis_sl = |Open → entry| + |entry → SL|
-
-if chemin_entry_puis_sl > 1.5 × range_bar:
-    → Position survit (le SL a été touché AVANT l'entry)
-else:
-    → Perte immédiate (le scénario entry→SL est plausible)
-```
-
-Si la position survit, les barres suivantes sont sans ambiguïté :
-- TP touché sans SL préalable → clairement un TP
-- SL touché sans TP préalable → clairement un SL
-
-### Situation 2 : SL + TP sur une barre ultérieure
-
-Sur une bougie 4H, on dispose de 4 valeurs : Open, High, Low, Close. Quand le High touche le TP et le Low touche le SL, on ne sait pas lequel a été touché en premier. L'ancienne approche attribuait systématiquement un SL (conservateur).
-
-Mais cette attribution est souvent fausse, surtout sur les bougies de forte amplitude.
+> **Note sur la barre d'entrée** : quand l'entry et le SL sont touchés sur la même bougie,
+> la position **survit**. Sur une barre de breakout, le Low se forme typiquement *avant* la
+> cassure du canal — le dip touche le niveau SL quand la position n'est pas encore active.
+> Le SL sera vérifié normalement dès la barre suivante.
 
 ### L'intuition
 

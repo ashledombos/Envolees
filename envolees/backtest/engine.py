@@ -205,7 +205,6 @@ class BacktestEngine:
 
         high = float(row["High"])
         low = float(row["Low"])
-        open_price = float(row["Open"])
 
         # Déclenchement ?
         if not self.pending_order.is_triggered(high, low):
@@ -226,66 +225,12 @@ class BacktestEngine:
         )
         entry, sl, tp = self.strategy.compute_entry_sl_tp(signal, self.exec_penalty_atr)
 
-        # ── Vérification same-bar : entry + SL touchés sur la même bougie ──
-        # Si le SL est aussi dans le range de cette bougie, on applique
-        # l'heuristique de chemin pour déterminer si le SL a été touché
-        # APRÈS l'entry (= perte immédiate) ou AVANT (= entry pas encore
-        # active, position survit).
-        if self.pending_order.direction == "LONG":
-            sl_hit_on_entry_bar = low <= sl
-        else:
-            sl_hit_on_entry_bar = high >= sl
-
-        if sl_hit_on_entry_bar:
-            bar_range = high - low
-            if bar_range > 0:
-                if self.pending_order.direction == "LONG":
-                    # Scénario "entry first, then SL" :
-                    # open → monte à entry → redescend au SL
-                    path_entry_then_sl = max(0, entry - open_price) + (entry - sl)
-                else:
-                    # Scénario "entry first, then SL" :
-                    # open → descend à entry → remonte au SL
-                    path_entry_then_sl = max(0, open_price - entry) + (sl - entry)
-
-                if path_entry_then_sl <= 1.5 * bar_range:
-                    # Scénario plausible : entry touchée PUIS SL touché
-                    # → perte immédiate, on enregistre le trade comme SL
-                    risk_cash = self.balance * self.cfg.risk_per_trade
-                    pos = OpenPosition(
-                        direction=self.pending_order.direction,
-                        entry=entry, sl=sl, tp=tp,
-                        ts_signal=self.pending_order.ts_signal,
-                        ts_entry=ts,
-                        atr_signal=self.pending_order.atr_signal,
-                        entry_bar_idx=bar_idx,
-                        risk_cash=risk_cash,
-                    )
-                    result_r = pos.compute_pnl_r(sl)
-                    result_cash = result_r * risk_cash
-                    self.balance += result_cash
-
-                    self.trades.append(TradeRecord(
-                        ticker=self.ticker,
-                        penalty_atr=self.exec_penalty_atr,
-                        direction=pos.direction,
-                        ts_signal=pos.ts_signal,
-                        ts_entry=ts, ts_exit=ts,
-                        entry=entry, sl=sl, tp=tp,
-                        exit_price=sl, exit_reason="SL",
-                        atr_signal=pos.atr_signal,
-                        result_r=result_r,
-                        result_cash=result_cash,
-                        balance_after=self.balance,
-                        duration_bars=0,
-                    ))
-                    self.prop_sim.on_trade_closed(result_r, self.balance)
-                    self.daily_state.update_min_equity(self.balance)
-                    self.pending_order = None
-                    return
-                # else: implausible → SL touché AVANT entry → position survit
-
         # Ouverture position (ajout à la liste)
+        # Note : pas de vérification same-bar entry+SL ici.
+        # Sur une barre de breakout, le Low (qui touche le niveau SL)
+        # se forme typiquement AVANT la cassure du canal. La position
+        # n'est pas encore active quand le dip se produit → elle survit.
+        # Le SL sera correctement vérifié dès la barre suivante.
         new_pos = OpenPosition(
             direction=self.pending_order.direction,
             entry=entry, sl=sl, tp=tp,
@@ -456,8 +401,8 @@ class BacktestEngine:
                 "Backtest bar-based 4H ; stop proactif pré-placé sur le bord du canal.",
                 "Signal recalculé à chaque barre (le canal bouge, le stop suit).",
                 "Positions multiples autorisées (empilage momentum), 1 seul pending order.",
-                "Heuristique same-bar : si SL+TP touchés, attribution par plausibilité du chemin.",
-                "Vérification entry+SL sur barre d'entrée (même heuristique de chemin).",
+                "Heuristique same-bar SL+TP : attribution par plausibilité du chemin.",
+                "Barre d'entrée : position survit (le dip précède typiquement le breakout).",
                 "Pénalité d'exécution appliquée à l'entrée (k×ATR au signal), SL/TP recalculés.",
                 "Daily DD simulé avec mark-to-market (close ou worst).",
                 "Reset daily à minuit (Europe/Paris).",
