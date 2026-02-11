@@ -4,6 +4,73 @@ Moteur de backtest pour stratégie de breakout Donchian avec filtre EMA et volat
 
 ---
 
+## Quickstart
+
+```bash
+# 1. Copier et adapter la config
+cp .env.example .env
+
+# 2. Lancer un backtest rapide sur un ticker
+python main.py single "EURUSD=X" -v
+
+# 3. Lancer le backtest complet
+python main.py run
+
+# 4. Pipeline complet (IS → OOS → compare)
+python main.py pipeline
+```
+
+### Exemple `.env`
+
+```env
+# Tickers et pénalités
+TICKERS=EURUSD=X,GBPUSD=X,USDJPY=X,BTC-USD,GC=F
+PENALTIES=0.05,0.10,0.15,0.20,0.25
+
+# Stratégie
+TIMEFRAME=4h
+EMA_PERIOD=200
+DONCHIAN_N=20
+BUFFER_ATR=0.10
+PROXIMITY_ATR=1.5
+SL_ATR=1.00
+TP_R=1.00
+
+# Risque
+PROFILE=funded
+START_BALANCE=100000
+RISK_PER_TRADE=0.0025
+MAX_CONCURRENT_TRADES=3
+
+# Prop firm
+DAILY_DD_FTMO=0.05
+DAILY_DD_GFT=0.04
+DAILY_EQUITY_MODE=worst
+STOP_AFTER_N_LOSSES=2
+
+# Volatilité
+VOL_QUANTILE=0.90
+VOL_WINDOW_BARS=1000
+
+# Fenêtre sans trading (heure Paris)
+NO_TRADE_START=22:30
+NO_TRADE_END=06:30
+
+# Split IS/OOS
+SPLIT_MODE=time
+SPLIT_RATIO=0.70
+
+# Cache
+CACHE_ENABLED=true
+CACHE_MAX_AGE_HOURS=24
+
+# Pondérations (optionnel)
+WEIGHT_EURUSD=1.0
+WEIGHT_BTC=0.8
+```
+
+---
+
 ## Architecture générale
 
 ```
@@ -195,6 +262,133 @@ Range = 6.0 | Chemin SL-first = 5.5 | 5.5 < 9.0 (1.5×6.0) → SL (conservateur)
 ```
 
 Ici le range est large (6 points) et l'open est près de l'entry. Le scénario open → SL → TP ne demande que 5.5 points de chemin, ce qui tient dans le range. On ne peut pas exclure un SL → on reste conservateur.
+
+
+---
+
+---
+
+## Commandes CLI
+
+Le point d'entrée est `python main.py <commande>`.
+
+### `run` — Backtest multi-ticker
+
+Lance le backtest sur tous les tickers et toutes les pénalités configurés.
+
+```bash
+# Utilise les tickers et pénalités du .env
+python main.py run
+
+# Override depuis la CLI
+python main.py run -t "EURUSD=X,BTC-USD" -p "0.05,0.10,0.15"
+
+# Mode in-sample ou out-of-sample
+python main.py run --split is
+python main.py run --split oos
+
+# Timeframe 1H (mode challenge)
+python main.py run --timeframe 1h
+
+# Equity mode close (moins conservateur que worst)
+python main.py run --mode close
+```
+
+Options principales :
+
+| Option | Court | Description |
+|--------|-------|-------------|
+| `--tickers` | `-t` | Tickers séparés par virgule (défaut : `.env`) |
+| `--penalties` | `-p` | Pénalités ATR séparées par virgule (défaut : `.env`) |
+| `--output` | `-o` | Répertoire de sortie (défaut : `out`) |
+| `--mode` | | `close` ou `worst` (equity daily DD) |
+| `--split` | | `is` / `oos` / `none` (split temporel) |
+| `--timeframe` | `-tf` | `1h` ou `4h` |
+| `--no-cache` | | Force le re-téléchargement des données |
+| `--verbose` | `-v` | Sortie détaillée |
+
+
+### `single` — Backtest mono-ticker
+
+Backtest rapide sur un seul instrument, utile pour le debug.
+
+```bash
+python main.py single "EURUSD=X"
+python main.py single "BTC-USD" -p 0.15 -v
+```
+
+
+### `pipeline` — Pipeline complet de validation
+
+Enchaîne automatiquement : cache-warm → cache-verify → IS run → OOS run → compare.
+
+```bash
+# Mode par défaut (tolérant : gaps exclus, stale tolérés)
+python main.py pipeline
+
+# Mode strict (bloque si gaps OU données périmées)
+python main.py pipeline --strict
+
+# Mode strict-gaps (bloque si gaps, tolère le stale)
+python main.py pipeline --strict-gaps
+
+# Sans étape cache (données déjà prêtes)
+python main.py pipeline --skip-cache
+```
+
+
+### `compare` — Comparaison IS / OOS
+
+Compare les résultats in-sample et out-of-sample pour valider les instruments.
+
+```bash
+python main.py compare out_is/ out_oos/
+python main.py compare out_is/ out_oos/ --min-trades 10 --dd-cap 0.015 --alert
+```
+
+Options : `--output`, `--ref-penalty`, `--min-trades`, `--dd-cap`, `--max-tickers`, `--alert`.
+
+
+### Commandes cache
+
+```bash
+# Voir les stats du cache
+python main.py cache
+
+# Préchauffer le cache (télécharge les données)
+python main.py cache-warm
+python main.py cache-warm --tickers "EURUSD=X,GBPUSD=X" --force
+
+# Vérifier l'intégrité (gaps, données périmées)
+python main.py cache-verify
+python main.py cache-verify --fail-on-gaps --detailed
+
+# Vider le cache
+python main.py cache-clear
+```
+
+
+### Commandes utilitaires
+
+```bash
+# Afficher la configuration active
+python main.py config
+
+# Voir le statut courant (positions, signaux)
+python main.py status
+python main.py status --output telegram
+
+# Envoyer un heartbeat
+python main.py heartbeat
+
+# Envoyer une alerte manuelle
+python main.py alert "Test message" --level warning
+
+# Lister les instruments FTMO disponibles
+python main.py instruments
+python main.py instruments --gft-only --format env
+python main.py instruments --no-crypto --max-priority 2
+```
 
 
 ---
