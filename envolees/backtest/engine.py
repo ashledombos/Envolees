@@ -1,5 +1,10 @@
 """
 Moteur de backtest principal.
+
+Supporte deux modes d'exécution :
+- Mode 4H seul (df_1h=None) : exécution sur OHLC 4H avec heuristique SL+TP
+- Mode intrabar (df_1h fourni) : exécution sur bougies 1H chronologiques,
+  élimine toute ambiguïté d'ordre des extrêmes
 """
 
 from __future__ import annotations
@@ -77,6 +82,7 @@ class BacktestEngine:
     - Un seul ordre stop en attente à la fois (recalculé chaque barre)
     - Simulation des règles prop firm
     - Tracking de l'equity et du drawdown
+    - Exécution intrabar 1H optionnelle (élimine les ambiguïtés OHLC)
     """
 
     def __init__(
@@ -107,6 +113,8 @@ class BacktestEngine:
         self.trades: list[TradeRecord] = []
         self.equity_curve: list[EquityRow] = []
 
+    # ── Helpers ───────────────────────────────────────────────────────
+
     def _compute_equity(self, row: pd.Series) -> float:
         """Calcule l'equity mark-to-market (somme de toutes les positions)."""
         if not self.open_positions:
@@ -130,7 +138,6 @@ class BacktestEngine:
 
     def _handle_day_change(self, day, equity: float) -> None:
         """Gère le changement de jour."""
-        # Flush stats du jour précédent
         if self.daily_state.current_day is not None:
             self.daily_stats.append({
                 "date": str(self.daily_state.current_day),
@@ -141,12 +148,78 @@ class BacktestEngine:
                 "halted": self.daily_state.halted,
             })
 
-        # Reset pour nouveau jour
         self.daily_state.reset(day, equity)
         self.prop_sim.on_new_day(day, equity)
 
-    def _process_open_positions(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
-        """Gère les sorties SL/TP de toutes les positions ouvertes."""
+    def _close_position(
+        self, pos: OpenPosition, exit_price: float, exit_reason: str,
+        bar_idx: int, ts: pd.Timestamp,
+    ) -> None:
+        """Ferme une position et enregistre le trade."""
+        result_r = pos.compute_pnl_r(exit_price)
+        result_cash = result_r * pos.risk_cash
+        self.balance += result_cash
+
+        self.trades.append(TradeRecord(
+            ticker=self.ticker,
+            penalty_atr=self.exec_penalty_atr,
+            direction=pos.direction,
+            ts_signal=pos.ts_signal,
+            ts_entry=pos.ts_entry,
+            ts_exit=ts,
+            entry=pos.entry,
+            sl=pos.sl,
+            tp=pos.tp,
+            exit_price=exit_price,
+            exit_reason=exit_reason,
+            atr_signal=pos.atr_signal,
+            result_r=result_r,
+            result_cash=result_cash,
+            balance_after=self.balance,
+            duration_bars=bar_idx - pos.entry_bar_idx,
+        ))
+
+        self.prop_sim.on_trade_closed(result_r, self.balance)
+        self.daily_state.update_min_equity(self.balance)
+
+    def _try_trigger_pending(
+        self, high: float, low: float, bar_idx: int, ts: pd.Timestamp,
+    ) -> OpenPosition | None:
+        """Tente de déclencher le pending order. Retourne la position créée ou None."""
+        if self.pending_order is None:
+            return None
+        if not self.pending_order.is_triggered(high, low):
+            return None
+        if self.prop_sim.is_halted:
+            return None
+
+        from envolees.strategy.base import Signal
+
+        signal = Signal(
+            direction=self.pending_order.direction,
+            entry_level=self.pending_order.entry_level,
+            atr_at_signal=self.pending_order.atr_signal,
+            timestamp=self.pending_order.ts_signal,
+        )
+        entry, sl, tp = self.strategy.compute_entry_sl_tp(signal, self.exec_penalty_atr)
+
+        new_pos = OpenPosition(
+            direction=self.pending_order.direction,
+            entry=entry, sl=sl, tp=tp,
+            ts_signal=self.pending_order.ts_signal,
+            ts_entry=ts,
+            atr_signal=self.pending_order.atr_signal,
+            entry_bar_idx=bar_idx,
+            risk_cash=self.balance * self.cfg.risk_per_trade,
+        )
+        self.open_positions.append(new_pos)
+        self.pending_order = None
+        return new_pos
+
+    # ── Mode 4H (fallback, avec heuristique SL+TP) ──────────────────
+
+    def _process_open_positions_4h(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
+        """Gère les sorties SL/TP sur OHLC 4H (avec heuristique same-bar)."""
         closed_indices = []
 
         for i, pos in enumerate(self.open_positions):
@@ -160,103 +233,100 @@ class BacktestEngine:
             if exit_reason is None:
                 continue
 
-            # Calcul P&L
-            result_r = pos.compute_pnl_r(exit_price)
-            result_cash = result_r * pos.risk_cash
-            self.balance += result_cash
-
-            # Enregistrement
-            trade = TradeRecord(
-                ticker=self.ticker,
-                penalty_atr=self.exec_penalty_atr,
-                direction=pos.direction,
-                ts_signal=pos.ts_signal,
-                ts_entry=pos.ts_entry,
-                ts_exit=ts,
-                entry=pos.entry,
-                sl=pos.sl,
-                tp=pos.tp,
-                exit_price=exit_price,
-                exit_reason=exit_reason,
-                atr_signal=pos.atr_signal,
-                result_r=result_r,
-                result_cash=result_cash,
-                balance_after=self.balance,
-                duration_bars=bar_idx - pos.entry_bar_idx,
-            )
-            self.trades.append(trade)
-
-            # Update prop sim
-            self.prop_sim.on_trade_closed(result_r, self.balance)
-
+            self._close_position(pos, exit_price, exit_reason, bar_idx, ts)
             closed_indices.append(i)
 
-        # Retirer les positions clôturées (en ordre inverse pour préserver les indices)
         for i in reversed(closed_indices):
             self.open_positions.pop(i)
 
-        if closed_indices:
-            self.daily_state.update_min_equity(self.balance)
+    def _process_pending_order_4h(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
+        """Déclenchement pending order sur OHLC 4H (position survit la barre d'entrée)."""
+        self._try_trigger_pending(float(row["High"]), float(row["Low"]), bar_idx, ts)
 
-    def _process_pending_order(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
-        """Gère le déclenchement d'un ordre en attente."""
-        if self.pending_order is None:
-            return
+    # ── Mode intrabar 1H ─────────────────────────────────────────────
 
-        high = float(row["High"])
-        low = float(row["Low"])
+    @staticmethod
+    def _build_sub_bar_map(
+        df_4h: pd.DataFrame, df_1h: pd.DataFrame,
+    ) -> dict[pd.Timestamp, pd.DataFrame]:
+        """Associe chaque barre 4H à ses sous-barres 1H.
 
-        # Déclenchement ?
-        if not self.pending_order.is_triggered(high, low):
-            return
+        La barre 4H à timestamp T contient les 1H dans [T, T+4h).
+        """
+        freq = pd.Timedelta("4h")
+        result = {}
+        df_1h_sorted = df_1h.sort_index()
+        for ts_4h in df_4h.index:
+            mask = (df_1h_sorted.index >= ts_4h) & (df_1h_sorted.index < ts_4h + freq)
+            sub = df_1h_sorted.loc[mask]
+            if not sub.empty:
+                result[ts_4h] = sub
+        return result
 
-        # Halted ?
-        if self.prop_sim.is_halted:
-            return
+    def _execute_intrabar(
+        self, sub_bars: pd.DataFrame, bar_idx_4h: int, ts_4h: pd.Timestamp,
+    ) -> None:
+        """Exécute l'entry et les sorties sur les sous-barres 1H.
 
-        # Calcul entry/SL/TP avec pénalité
-        from envolees.strategy.base import Signal
+        Pour chaque bougie 1H chronologique :
+        1. Vérifie SL/TP des positions ouvertes (conservateur : SL gagne si ambigu)
+        2. Vérifie déclenchement pending order
+        3. Si pending déclenché, vérifie immédiatement SL/TP sur cette même 1H
 
-        signal = Signal(
-            direction=self.pending_order.direction,
-            entry_level=self.pending_order.entry_level,
-            atr_at_signal=self.pending_order.atr_signal,
-            timestamp=self.pending_order.ts_signal,
-        )
-        entry, sl, tp = self.strategy.compute_entry_sl_tp(signal, self.exec_penalty_atr)
+        Pas d'heuristique : l'ordre chronologique 1H résout les ambiguïtés.
+        """
+        for ts_1h, row_1h in sub_bars.iterrows():
+            high = float(row_1h["High"])
+            low = float(row_1h["Low"])
 
-        # Ouverture position (ajout à la liste)
-        # Note : pas de vérification same-bar entry+SL ici.
-        # Sur une barre de breakout, le Low (qui touche le niveau SL)
-        # se forme typiquement AVANT la cassure du canal. La position
-        # n'est pas encore active quand le dip se produit → elle survit.
-        # Le SL sera correctement vérifié dès la barre suivante.
-        new_pos = OpenPosition(
-            direction=self.pending_order.direction,
-            entry=entry, sl=sl, tp=tp,
-            ts_signal=self.pending_order.ts_signal,
-            ts_entry=ts,
-            atr_signal=self.pending_order.atr_signal,
-            entry_bar_idx=bar_idx,
-            risk_cash=self.balance * self.cfg.risk_per_trade,
-        )
-        self.open_positions.append(new_pos)
-        self.pending_order = None
+            # ── 1. Sorties des positions ouvertes ──
+            closed_indices = []
+            for i, pos in enumerate(self.open_positions):
+                # Pas d'heuristique (open_price=None), conservateur (SL gagne)
+                exit_reason, exit_price = pos.check_exit(
+                    high, low,
+                    conservative_same_bar=True,
+                    open_price=None,
+                )
+                if exit_reason is None:
+                    continue
+                self._close_position(pos, exit_price, exit_reason, bar_idx_4h, ts_1h)
+                closed_indices.append(i)
+
+            for i in reversed(closed_indices):
+                self.open_positions.pop(i)
+
+            # ── 2. Déclenchement pending order ──
+            new_pos = self._try_trigger_pending(high, low, bar_idx_4h, ts_1h)
+
+            # ── 3. Si position vient d'ouvrir, vérifier SL/TP immédiatement ──
+            # Sur cette même bougie 1H, le prix a pu toucher l'entry ET le SL.
+            # À 1H de granularité, conservateur = SL gagne.
+            if new_pos is not None:
+                exit_reason, exit_price = new_pos.check_exit(
+                    high, low,
+                    conservative_same_bar=True,
+                    open_price=None,
+                )
+                if exit_reason is not None:
+                    self._close_position(
+                        new_pos, exit_price, exit_reason, bar_idx_4h, ts_1h,
+                    )
+                    self.open_positions.remove(new_pos)
+
+    # ── Recalcul signal (toujours sur 4H) ────────────────────────────
 
     def _update_signal(self, df: pd.DataFrame, bar_idx: int) -> None:
-        """Recalcule le signal à chaque barre.
+        """Recalcule le signal à chaque barre 4H.
 
         - Si conditions remplies → place ou remplace le pending order
-          (le canal bouge, le niveau du stop doit suivre).
-        - Si conditions plus remplies → annule le pending order.
-        - Un seul pending order à la fois (pas d'ordres contradictoires).
-        - Respect du plafond de positions simultanées.
+        - Si conditions plus remplies → annule le pending order
+        - Respect du plafond de positions simultanées
         """
         if self.prop_sim.is_halted:
             self.pending_order = None
             return
 
-        # Plafond de positions atteint → pas de nouvel ordre
         if (
             self.cfg.max_concurrent_trades > 0
             and len(self.open_positions) >= self.cfg.max_concurrent_trades
@@ -264,35 +334,47 @@ class BacktestEngine:
             self.pending_order = None
             return
 
-        # Demande à la stratégie (autorise même avec positions ouvertes)
         signal = self.strategy.generate_signal(df, bar_idx, None, None)
 
         if signal is not None:
             self.pending_order = PendingOrder.from_signal(signal, bar_idx)
         else:
-            # Conditions plus remplies → annuler l'ordre existant
             self.pending_order = None
 
-    def run(self, df: pd.DataFrame) -> BacktestResult:
+    # ── Boucle principale ────────────────────────────────────────────
+
+    def run(
+        self,
+        df: pd.DataFrame,
+        df_1h: pd.DataFrame | None = None,
+    ) -> BacktestResult:
         """
         Exécute le backtest.
 
         Args:
-            df: DataFrame OHLCV (sera enrichi avec les indicateurs)
+            df: DataFrame OHLCV 4H (sera enrichi avec les indicateurs)
+            df_1h: DataFrame OHLCV 1H optionnel. Si fourni, l'exécution
+                   (entry, SL, TP) utilise les bougies 1H chronologiques
+                   au lieu des OHLC 4H. Élimine les ambiguïtés intrabar.
 
         Returns:
             BacktestResult avec trades, equity, stats
         """
-        # Préparation indicateurs
+        intrabar = df_1h is not None and len(df_1h) > 0
+
+        # Préparation indicateurs (sur 4H)
         df = self.strategy.prepare_indicators(df)
         idx = df.index.to_list()
+
+        # Mapping 4H → 1H
+        sub_bar_map = self._build_sub_bar_map(df, df_1h) if intrabar else {}
 
         for bar_idx in range(len(df)):
             ts = idx[bar_idx]
             row = df.iloc[bar_idx]
             day = ts.date()
 
-            # Equity mark-to-market
+            # Equity mark-to-market (sur la barre 4H pour le tracking)
             equity = self._compute_equity(row)
 
             # Changement de jour ?
@@ -303,7 +385,7 @@ class BacktestEngine:
             self.daily_state.update_min_equity(equity)
             self.prop_sim.update_equity(equity, day)
 
-            # Enregistrement equity
+            # Enregistrement equity (1 point par barre 4H)
             self.equity_curve.append(EquityRow(
                 time=ts,
                 balance=self.balance,
@@ -313,13 +395,14 @@ class BacktestEngine:
                 halt_today=self.prop_sim.is_halted,
             ))
 
-            # 1. Gestion positions ouvertes (SL/TP)
-            self._process_open_positions(row, bar_idx, ts)
+            # ── Exécution ──
+            if intrabar and ts in sub_bar_map:
+                self._execute_intrabar(sub_bar_map[ts], bar_idx, ts)
+            else:
+                self._process_open_positions_4h(row, bar_idx, ts)
+                self._process_pending_order_4h(row, bar_idx, ts)
 
-            # 2. Gestion ordre en attente (déclenchement)
-            self._process_pending_order(row, bar_idx, ts)
-
-            # 3. Recalcul continu du signal / pending order
+            # Recalcul signal (toujours sur 4H)
             self._update_signal(df, bar_idx)
 
         # Flush dernière journée
@@ -333,8 +416,7 @@ class BacktestEngine:
                 "halted": self.daily_state.halted,
             })
 
-        # Construction summary
-        summary = self._build_summary(len(df))
+        summary = self._build_summary(len(df), intrabar)
 
         return BacktestResult(
             ticker=self.ticker,
@@ -345,7 +427,7 @@ class BacktestEngine:
             summary=summary,
         )
 
-    def _build_summary(self, n_bars: int) -> dict:
+    def _build_summary(self, n_bars: int, intrabar: bool = False) -> dict:
         """Construit le dictionnaire de résumé."""
         trades_df = pd.DataFrame([t.to_dict() for t in self.trades]) if self.trades else pd.DataFrame()
         daily_df = pd.DataFrame(self.daily_stats) if self.daily_stats else pd.DataFrame()
@@ -361,11 +443,14 @@ class BacktestEngine:
 
         prop_stats = self.prop_sim.get_stats()
 
+        exec_mode = "intrabar_1h" if intrabar else "ohlc_4h"
+
         return {
             "ticker": self.ticker,
             "exec_penalty_atr": self.exec_penalty_atr,
             "bars": n_bars,
             "timeframe": self.cfg.timeframe if hasattr(self.cfg, 'timeframe') else "4h",
+            "execution_mode": exec_mode,
             "start_balance": self.cfg.start_balance,
             "end_balance": self.balance,
             "risk_per_trade": self.cfg.risk_per_trade,
@@ -398,11 +483,13 @@ class BacktestEngine:
                 "stop_after_n_losses": self.cfg.stop_after_n_losses,
             },
             "notes": [
-                "Backtest bar-based 4H ; stop proactif pré-placé sur le bord du canal.",
-                "Signal recalculé à chaque barre (le canal bouge, le stop suit).",
+                f"Exécution : {exec_mode}.",
+                "Signaux calculés sur 4H ; stop proactif pré-placé sur le bord du canal.",
+                "Signal recalculé à chaque barre 4H (le canal bouge, le stop suit).",
                 "Positions multiples autorisées (empilage momentum), 1 seul pending order.",
-                "Heuristique same-bar SL+TP : attribution par plausibilité du chemin.",
-                "Barre d'entrée : position survit (le dip précède typiquement le breakout).",
+                "Intrabar 1H : ordre chronologique élimine les ambiguïtés OHLC."
+                if intrabar else
+                "4H fallback : heuristique SL+TP par plausibilité du chemin.",
                 "Pénalité d'exécution appliquée à l'entrée (k×ATR au signal), SL/TP recalculés.",
                 "Daily DD simulé avec mark-to-market (close ou worst).",
                 "Reset daily à minuit (Europe/Paris).",

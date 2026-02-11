@@ -45,6 +45,15 @@ def run_single_backtest(
 
         # Split temporel si configuré
         df, split_info = apply_split(df, cfg)
+
+        # Filtrer df_1h pour correspondre à la fenêtre du split
+        if split_info and len(df) > 0:
+            df_1h_filtered = df_1h.loc[
+                (df_1h.index >= df.index.min())
+                & (df_1h.index < df.index.max() + pd.Timedelta("4h"))
+            ].copy()
+        else:
+            df_1h_filtered = df_1h
         
         if split_info and verbose:
             console.print(f"[dim]   {split_info}[/dim]")
@@ -52,7 +61,7 @@ def run_single_backtest(
         strategy = DonchianBreakoutStrategy(cfg)
         engine = BacktestEngine(cfg, strategy, ticker, penalty)
 
-        result = engine.run(df)
+        result = engine.run(df, df_1h=df_1h_filtered)
         return result, split_info
         
     except Exception as e:

@@ -153,16 +153,39 @@ Le paramètre `MAX_CONCURRENT_TRADES` (défaut 0 = illimité) plafonne le nombre
 
 ---
 
-## Heuristique de résolution same-bar (chemin de prix)
+## Exécution intrabar 1H (mode par défaut)
 
-### Le problème
+Le moteur supporte deux modes d'exécution. Le mode **intrabar 1H** (par défaut quand les données 1H sont disponibles) élimine toutes les ambiguïtés OHLC en parcourant les bougies 1H chronologiquement.
 
-Sur une bougie 4H, on dispose de 4 valeurs : Open, High, Low, Close. Quand le High touche le TP et le Low touche le SL, on ne sait pas lequel a été touché en premier. L'approche naïve attribue systématiquement un SL (conservateur), mais c'est souvent faux sur les bougies de forte amplitude.
+### Le problème des OHLC 4H
 
-> **Note sur la barre d'entrée** : quand l'entry et le SL sont touchés sur la même bougie,
-> la position **survit**. Sur une barre de breakout, le Low se forme typiquement *avant* la
-> cassure du canal — le dip touche le niveau SL quand la position n'est pas encore active.
-> Le SL sera vérifié normalement dès la barre suivante.
+Sur une bougie 4H, on dispose de 4 valeurs : Open, High, Low, Close. Quand le High touche le TP et le Low touche le SL, on ne sait pas lequel a été touché en premier. De même, quand l'entry et le SL sont touchés sur la même barre, l'ordre des événements est inconnu.
+
+Toute résolution basée sur des heuristiques (chemin de prix, conservatisme, etc.) est un **choix de modélisation** non vérifiable — pas une vérité.
+
+### La solution : parcourir les bougies 1H
+
+Les données 1H sont déjà disponibles (c'est la source avant resampling). Au lieu de deviner l'ordre des événements sur 4H, le moteur parcourt les 4 bougies 1H de chaque fenêtre 4H dans l'ordre chronologique :
+
+```
+Barre 4H : 08:00-12:00 (OHLC ambigu)
+  ├── 1H 08:00 : check SL/TP → pending trigger ?
+  ├── 1H 09:00 : check SL/TP → pending trigger ?
+  ├── 1H 10:00 : check SL/TP → pending trigger → entry ! check SL immédiat
+  └── 1H 11:00 : check SL/TP sur la position ouverte
+```
+
+Règles simples à 1H :
+- **SL et TP touchés sur même 1H** : conservateur (SL gagne). Très rare à 1H.
+- **Entry et SL sur même 1H** : SL gagne (conservateur). Le "dip avant breakout" de 4H ne s'applique pas à 1H.
+- **Pas d'heuristique** : l'ordre chronologique résout tout.
+
+### Mode 4H fallback
+
+Si `df_1h=None` est passé au moteur (ou pour les barres sans données 1H), le moteur utilise l'heuristique SL+TP par plausibilité du chemin (identique à la version précédente). Ceci permet de garder la compatibilité avec le diagnostic et les tests.
+
+<details>
+<summary>Détail de l'heuristique 4H (mode fallback)</summary>
 
 ### L'intuition
 
@@ -228,8 +251,8 @@ Range = 6.0 | Chemin SL-first = 5.5 | 5.5 < 9.0 (1.5×6.0) → SL (conservateur)
 
 Ici le range est large (6 points) et l'open est près de l'entry. Le scénario open → SL → TP ne demande que 5.5 points de chemin, ce qui tient dans le range. On ne peut pas exclure un SL → on reste conservateur.
 
+</details>
 
----
 
 ---
 
@@ -386,15 +409,22 @@ Pour chaque barre (4H) :
 ├── 2. Gestion changement de jour (reset daily DD)
 ├── 3. Mise à jour equity tracking + prop sim
 │
-├── 4. Pour chaque position ouverte :
-│      └── SL ou TP touché ? → clôture, P&L, enregistrement
-│         (avec heuristique de chemin si les deux sont touchés)
+├── 4. EXÉCUTION (mode intrabar 1H ou fallback 4H) :
 │
-├── 5. Pending order existe ?
-│      └── Stop déclenché (High/Low traverse le niveau) ?
-│          └── Oui → nouvelle position ouverte
+│      Mode intrabar 1H (par défaut) :
+│      ├── Pour chaque sous-barre 1H chronologique :
+│      │   ├── Check SL/TP des positions ouvertes
+│      │   │   (conservateur : SL gagne si les deux touchés)
+│      │   ├── Pending order déclenché ?
+│      │   │   └── Oui → position ouverte
+│      │   │       └── Check SL/TP immédiat sur cette même 1H
+│      │   └── (pas d'heuristique : l'ordre chrono résout tout)
+│      │
+│      Mode 4H fallback (si pas de données 1H) :
+│      ├── Check SL/TP (heuristique chemin si ambigu)
+│      └── Pending order déclenché ? → position ouverte
 │
-└── 6. Recalcul du signal :
+└── 5. Recalcul du signal (sur indicateurs 4H) :
        ├── Conditions remplies → place/remplace le pending order
        ├── Conditions non remplies → annule le pending order
        └── Plafond positions atteint → pas de nouvel ordre
