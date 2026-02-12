@@ -230,6 +230,49 @@ class BacktestEngine:
         self.pending_order = None
         return new_pos
 
+    # ── Filtre d'entrée ──────────────────────────────────────────────
+
+    def _entry_filter_passes(
+        self, pending: PendingOrder, high: float, low: float, close: float,
+    ) -> bool:
+        """Vérifie le filtre d'entrée sur la bougie 1H qui a déclenché le pending.
+
+        Modes :
+        - "none" : pas de filtre (toujours True)
+        - "close_confirms_1h" : le close 1H doit confirmer le breakout
+        - "body_ratio" : le close doit être dans le top/bottom X% du range
+
+        Returns:
+            True si le filtre passe, False si on rejette l'entrée.
+        """
+        filt = self.cfg.entry_filter
+
+        if filt == "none":
+            return True
+
+        if filt == "close_confirms_1h":
+            # La bougie 1H doit CLORE au-dessus (LONG) ou en-dessous (SHORT)
+            if pending.direction == "LONG":
+                return close >= pending.entry_level
+            else:
+                return close <= pending.entry_level
+
+        if filt == "body_ratio":
+            # Le close doit être dans le top (LONG) ou bottom (SHORT) X% du range
+            bar_range = high - low
+            if bar_range <= 0:
+                return False
+            pct = self.cfg.entry_body_pct
+            if pending.direction == "LONG":
+                # Close dans le top pct% → close >= high - pct * range
+                return close >= high - pct * bar_range
+            else:
+                # Close dans le bottom pct% → close <= low + pct * range
+                return close <= low + pct * bar_range
+
+        # Filtre inconnu → pas de filtre
+        return True
+
     # ── Mode 4H (fallback, avec heuristique SL+TP) ──────────────────
 
     def _process_open_positions_4h(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
@@ -284,7 +327,7 @@ class BacktestEngine:
 
         Pour chaque bougie 1H chronologique :
         1. Vérifie SL/TP des positions ouvertes (conservateur : SL gagne si ambigu)
-        2. Vérifie déclenchement pending order
+        2. Vérifie déclenchement pending order (avec filtre d'entrée optionnel)
         3. Si pending déclenché, vérifie immédiatement SL/TP sur cette même 1H
 
         Pas d'heuristique : l'ordre chronologique 1H résout les ambiguïtés.
@@ -292,6 +335,7 @@ class BacktestEngine:
         for ts_1h, row_1h in sub_bars.iterrows():
             high = float(row_1h["High"])
             low = float(row_1h["Low"])
+            close = float(row_1h["Close"])
 
             # ── 1. Sorties des positions ouvertes ──
             closed_indices = []
@@ -310,8 +354,13 @@ class BacktestEngine:
             for i in reversed(closed_indices):
                 self.open_positions.pop(i)
 
-            # ── 2. Déclenchement pending order ──
-            new_pos = self._try_trigger_pending(high, low, bar_idx_4h, ts_1h)
+            # ── 2. Déclenchement pending order (avec filtre d'entrée) ──
+            new_pos = None
+            if self.pending_order is not None and self.pending_order.is_triggered(high, low):
+                if self._entry_filter_passes(self.pending_order, high, low, close):
+                    new_pos = self._try_trigger_pending(high, low, bar_idx_4h, ts_1h)
+                # Si filtre échoue : le pending reste actif, peut trigger sur
+                # une 1H suivante avec un close plus convaincant
 
             # ── 3. Si position vient d'ouvrir, vérifier SL/TP immédiatement ──
             # Sur cette même bougie 1H, le prix a pu toucher l'entry ET le SL.

@@ -130,6 +130,16 @@ class Config:
     # du bord du canal, AVANT le breakout (stop pré-placé)
     proximity_atr: float = 1.5
 
+    # Filtre d'entrée (mode proactif uniquement)
+    # "none"              : pas de filtre, entry dès que le prix touche le niveau
+    # "close_confirms_1h" : la bougie 1H qui déclenche doit CLORE au-dessus (LONG)
+    #                       ou en-dessous (SHORT) du niveau d'entry.
+    #                       Filtre les mèches de faux breakout.
+    # "body_ratio"        : le close de la bougie 1H doit être dans le top/bottom
+    #                       entry_body_pct% du range. Ex: 0.3 = close dans top 30%.
+    entry_filter: str = "none"
+    entry_body_pct: float = 0.3  # Pour body_ratio : fraction du range
+
     # Filtre volatilité
     vol_quantile: float = 0.90
     vol_window_bars: int = 1000
@@ -222,6 +232,8 @@ class Config:
             trailing_atr=float(os.getenv("TRAILING_ATR", "3.0")),
             trailing_activation_r=float(os.getenv("TRAILING_ACTIVATION_R", "0.0")),
             proximity_atr=float(os.getenv("PROXIMITY_ATR", "1.5")),
+            entry_filter=os.getenv("ENTRY_FILTER", "none").strip().lower(),
+            entry_body_pct=float(os.getenv("ENTRY_BODY_PCT", "0.3")),
             vol_quantile=float(os.getenv("VOL_QUANTILE", "0.90")),
             vol_window_bars=int(os.getenv("VOL_WINDOW_BARS", "1000")),
             no_trade_start=_parse_time(os.getenv("NO_TRADE_START", "22:30")),
