@@ -1,21 +1,30 @@
 """
-Diagnostic v4 : filtres d'entrée × modes de sortie.
+Diagnostic v5 : grille complète filtres d'entrée × modes de sortie.
 
 Usage:
     python diagnostic.py EURUSD=X
     python diagnostic.py GBPUSD=X --penalty 0.10
 
-Le legacy signal ne peut pas exister en live (il faut le close 4H). On
-teste des filtres sur le signal proactif qui reproduisent l'effet du
-close-confirms, mais à résolution 1H (vérifiable en live).
+Grille testée (12 configs) :
 
-Configs :
-  A. Legacy,   TP=1R                   (référence non-live)
-  B. Proactif, pas de filtre, TP=1R    (le problème actuel)
-  C. Proactif, close_1h, TP=1R         (filtre : close 1H > entry)
-  D. Proactif, body_ratio 30%, TP=1R   (filtre : close dans top 30%)
-  E. Proactif, close_1h, trail 3ATR    (best filter + best exit ?)
-  F. Legacy,   trail 3ATR              (max théorique)
+  Signal       Filtre d'entrée              Sortie       Code
+  ──────────── ──────────────────────────── ──────────── ────
+  Legacy       aucun                        TP=1R         A
+  Proactif     aucun                        TP=1R         B
+  Proactif     close_1h (marge 0)           TP=1R         C1
+  Proactif     close_1h (marge 0.05 ATR)    TP=1R         C2
+  Proactif     close_1h (marge 0.10 ATR)    TP=1R         C3
+  Proactif     close_1h (marge 0.20 ATR)    TP=1R         C4
+  Proactif     body_ratio 30%               TP=1R         D1
+  Proactif     body_ratio 20%               TP=1R         D2
+  Proactif     close_1h (marge 0)           trail 3ATR    E1
+  Proactif     close_1h (marge 0.10 ATR)    trail 3ATR    E2
+  Proactif     body_ratio 30%               trail 3ATR    E3
+  Legacy       aucun                        trail 3ATR    F
+
+Biais corrigés dans cette version :
+- sizing_mode="fixed" (position sizing sur start_balance, pas sur balance courant)
+- Positions ouvertes fermées au close de la dernière barre (CLOSE_END)
 """
 
 import sys
@@ -37,7 +46,7 @@ from envolees.backtest.position import PendingOrder
 # ── Stratégie legacy ─────────────────────────────────────────────────
 
 class LegacyDonchianStrategy(DonchianBreakoutStrategy):
-    """Signal quand close > canal (post-breakout, l'ancien mode)."""
+    """Signal quand close > canal (post-breakout)."""
 
     def generate_signal(self, df, bar_idx, current_position, pending_signal):
         row = df.iloc[bar_idx]
@@ -142,7 +151,7 @@ def run_config(label, engine_cls, strategy_cls, cfg, df_4h, df_1h, ticker, penal
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Diagnostic v4 — entry filters")
+    parser = argparse.ArgumentParser(description="Diagnostic v5 — grille complète")
     parser.add_argument("ticker", help="Ticker Yahoo (ex: EURUSD=X)")
     parser.add_argument("--penalty", "-p", type=float, default=0.10)
     args = parser.parse_args()
@@ -151,50 +160,78 @@ def main():
     ticker = args.ticker
     penalty = args.penalty
 
-    print(f"\n{'═'*82}")
-    print(f"  DIAGNOSTIC v4 — {ticker} @ penalty {penalty}")
-    print(f"{'═'*82}\n")
+    print(f"\n{'═'*90}")
+    print(f"  DIAGNOSTIC v5 — {ticker} @ penalty {penalty}")
+    print(f"  sizing_mode=fixed (prop firm), positions fermées en fin de backtest")
+    print(f"{'═'*90}\n")
 
     print("Téléchargement données...")
     df_1h = download_1h(ticker, cfg)
     df_4h = resample_to_timeframe(df_1h, cfg.timeframe)
     print(f"  {len(df_4h)} barres 4H, {len(df_1h)} barres 1H\n")
 
-    cfg1 = replace(cfg, max_concurrent_trades=1)
+    # Base config : 1 position, sizing fixe
+    cfg1 = replace(cfg, max_concurrent_trades=1, sizing_mode="fixed")
+
+    # Helper pour créer les configs
+    def fixed_tp(entry_filter="none", entry_body_pct=0.0):
+        return replace(cfg1, exit_mode="fixed", tp_r=1.0,
+                       entry_filter=entry_filter, entry_body_pct=entry_body_pct)
+
+    def trail_3atr(entry_filter="none", entry_body_pct=0.0):
+        return replace(cfg1, exit_mode="trailing_atr", trailing_atr=3.0, tp_r=0,
+                       entry_filter=entry_filter, entry_body_pct=entry_body_pct)
 
     configs = [
-        # A. Legacy + TP fixe (référence non-live)
-        ("A. Legacy, TP=1R",
-         SingleShotEngine, LegacyDonchianStrategy,
-         replace(cfg1, exit_mode="fixed", tp_r=1.0, entry_filter="none")),
+        # ── Références ──
+        ("A.  Legacy, TP=1R",
+         SingleShotEngine, LegacyDonchianStrategy, fixed_tp()),
 
-        # B. Proactif sans filtre, TP=1R (le problème)
-        ("B. Proactif, no filter, TP=1R",
+        ("B.  Proactif, no filter, TP=1R",
+         SinglePositionEngine, DonchianBreakoutStrategy, fixed_tp()),
+
+        # ── Grille close_1h avec marge croissante ──
+        ("C1. close_1h, marge=0",
          SinglePositionEngine, DonchianBreakoutStrategy,
-         replace(cfg1, exit_mode="fixed", tp_r=1.0, entry_filter="none")),
+         fixed_tp("close_confirms_1h", 0.0)),
 
-        # C. Proactif + close_confirms_1h, TP=1R
-        ("C. Proactif, close_1h, TP=1R",
+        ("C2. close_1h, marge=0.05ATR",
          SinglePositionEngine, DonchianBreakoutStrategy,
-         replace(cfg1, exit_mode="fixed", tp_r=1.0, entry_filter="close_confirms_1h")),
+         fixed_tp("close_confirms_1h", 0.05)),
 
-        # D. Proactif + body_ratio 30%, TP=1R
-        ("D. Proactif, body_30%, TP=1R",
+        ("C3. close_1h, marge=0.10ATR",
          SinglePositionEngine, DonchianBreakoutStrategy,
-         replace(cfg1, exit_mode="fixed", tp_r=1.0, entry_filter="body_ratio",
-                 entry_body_pct=0.3)),
+         fixed_tp("close_confirms_1h", 0.10)),
 
-        # E. Proactif + close_1h + trailing 3ATR (le combo)
-        ("E. Proactif, close_1h, trail 3ATR",
+        ("C4. close_1h, marge=0.20ATR",
          SinglePositionEngine, DonchianBreakoutStrategy,
-         replace(cfg1, exit_mode="trailing_atr", trailing_atr=3.0, tp_r=0,
-                 entry_filter="close_confirms_1h")),
+         fixed_tp("close_confirms_1h", 0.20)),
 
-        # F. Legacy + trailing 3ATR (max théorique)
-        ("F. Legacy, trail 3ATR",
-         SingleShotEngine, LegacyDonchianStrategy,
-         replace(cfg1, exit_mode="trailing_atr", trailing_atr=3.0, tp_r=0,
-                 entry_filter="none")),
+        # ── Grille body_ratio ──
+        ("D1. body_ratio 30%",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         fixed_tp("body_ratio", 0.30)),
+
+        ("D2. body_ratio 20%",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         fixed_tp("body_ratio", 0.20)),
+
+        # ── Combos filtre + trailing ──
+        ("E1. close_1h+trail 3ATR",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         trail_3atr("close_confirms_1h", 0.0)),
+
+        ("E2. close_1h m=0.10+trail",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         trail_3atr("close_confirms_1h", 0.10)),
+
+        ("E3. body_30%+trail 3ATR",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         trail_3atr("body_ratio", 0.30)),
+
+        # ── Max théorique ──
+        ("F.  Legacy, trail 3ATR",
+         SingleShotEngine, LegacyDonchianStrategy, trail_3atr()),
     ]
 
     results = []
@@ -204,10 +241,10 @@ def main():
         results.append(r)
 
     # ── Tableau principal ──
-    print(f"\n{'─'*82}")
-    print(f"  {'Config':<34} {'Trades':>6} {'WR':>7} {'PF':>6} {'ExpR':>7} "
+    print(f"\n{'─'*90}")
+    print(f"  {'Config':<30} {'Trades':>6} {'WR':>7} {'PF':>6} {'ExpR':>7} "
           f"{'AvgWin':>7} {'MaxWin':>7} {'Balance':>10}")
-    print(f"{'─'*82}")
+    print(f"{'─'*90}")
     for r in results:
         wr = f"{r['win_rate']:.1%}"
         pf = f"{r['pf']:.2f}"
@@ -215,89 +252,78 @@ def main():
         aw = f"{r['avg_win_r']:.1f}R"
         mw = f"{r['max_win_r']:.1f}R"
         bal = f"{r['balance']:,.0f}"
-        print(f"  {r['label']:<34} {r['trades']:>6} {wr:>7} {pf:>6} {exp:>7} "
+        print(f"  {r['label']:<30} {r['trades']:>6} {wr:>7} {pf:>6} {exp:>7} "
               f"{aw:>7} {mw:>7} {bal:>10}")
 
-    # ── Tableau des exits ──
-    print(f"\n{'─'*82}")
-    print(f"  {'Config':<34} {'SL':>5} {'TP':>5} {'TRAIL':>5} {'AvgDur':>8}")
-    print(f"{'─'*82}")
+    # ── Tableau exits ──
+    print(f"\n{'─'*90}")
+    print(f"  {'Config':<30} {'SL':>5} {'TP':>5} {'TRAIL':>5} {'END':>5} {'AvgDur':>8}")
+    print(f"{'─'*90}")
     for r in results:
         sl = r["exits"].get("SL", 0)
         tp = r["exits"].get("TP", 0)
         tr = r["exits"].get("TRAIL", 0)
+        end = r["exits"].get("CLOSE_END", 0)
         dur = f"{r['avg_dur']:.1f}"
-        print(f"  {r['label']:<34} {sl:>5} {tp:>5} {tr:>5} {dur:>8}")
+        print(f"  {r['label']:<30} {sl:>5} {tp:>5} {tr:>5} {end:>5} {dur:>8}")
 
     # ── Analyse ──
-    a, b, c, d, e, f = results
+    a = results[0]   # Legacy TP=1R
+    b = results[1]   # Proactif no filter
+    f = results[-1]  # Legacy trail
 
-    print(f"\n{'─'*82}")
-    print("  ANALYSE")
-    print(f"{'─'*82}\n")
+    print(f"\n{'─'*90}")
+    print("  ANALYSE COMPARATIVE")
+    print(f"{'─'*90}\n")
 
-    print(f"  Le problème : signal proactif sans filtre")
-    print(f"  A→B (legacy→proactif, TP=1R) :         {b['exp_r']-a['exp_r']:+.3f} R\n")
+    print(f"  Références :")
+    print(f"    A. Legacy TP=1R :     ExpR={a['exp_r']:+.3f}  (non-live)")
+    print(f"    B. Proactif brut :    ExpR={b['exp_r']:+.3f}  (le problème)")
+    print(f"    F. Legacy trail :     ExpR={f['exp_r']:+.3f}  (max théorique)")
+    print(f"    Gap A→B :             {b['exp_r']-a['exp_r']:+.3f} R\n")
 
-    print(f"  Impact du filtre close_1h (même TP=1R) :")
-    print(f"  B→C (no filter→close_1h) :             {c['exp_r']-b['exp_r']:+.3f} R")
-    trades_filtered = b["trades"] - c["trades"]
-    print(f"       ({trades_filtered} trades filtrés, {c['trades']} restants)\n")
+    # Classement des configs live (exclure A et F)
+    live_results = results[1:-1]  # B through E3
+    live_sorted = sorted(live_results, key=lambda r: r["exp_r"], reverse=True)
 
-    print(f"  Impact du filtre body_ratio 30% :")
-    print(f"  B→D (no filter→body_30%) :             {d['exp_r']-b['exp_r']:+.3f} R")
-    trades_filtered_d = b["trades"] - d["trades"]
-    print(f"       ({trades_filtered_d} trades filtrés, {d['trades']} restants)\n")
+    print(f"  CLASSEMENT DES CONFIGS LIVE (par ExpR) :")
+    print(f"  {'Rank':>4} {'Config':<30} {'ExpR':>7} {'WR':>7} {'PF':>6} {'Trades':>6}  vs Legacy")
+    for i, r in enumerate(live_sorted):
+        gap = r["exp_r"] - a["exp_r"]
+        marker = "★" if gap > -0.05 else "↑" if gap > -0.15 else " "
+        print(f"  {i+1:>4} {r['label']:<30} {r['exp_r']:+.3f} {r['win_rate']:.1%} "
+              f"{r['pf']:.2f}  {r['trades']:>5}  {gap:+.3f} {marker}")
 
-    print(f"  Combo close_1h + trailing 3ATR :")
-    print(f"  B→E (proactif brut → filtered+trailing): {e['exp_r']-b['exp_r']:+.3f} R")
-    print(f"  C→E (close_1h TP=1R → close_1h+trail) : {e['exp_r']-c['exp_r']:+.3f} R\n")
+    # ── Meilleures configs ──
+    best_tp1r = max([r for r in live_results if r["exits"].get("TRAIL", 0) == 0],
+                    key=lambda r: r["exp_r"])
+    best_trail = max([r for r in live_results if r["exits"].get("TRAIL", 0) > 0],
+                     key=lambda r: r["exp_r"], default=None)
+    best_overall = live_sorted[0]
 
-    print(f"  Référence maximale :")
-    print(f"  A (Legacy TP=1R) :                     {a['exp_r']:+.3f} R")
-    print(f"  F (Legacy trail 3ATR) :                {f['exp_r']:+.3f} R\n")
+    print(f"\n{'─'*90}")
+    print("  RECOMMANDATIONS")
+    print(f"{'─'*90}\n")
 
-    # ── Verdicts ──
-    print(f"{'─'*82}")
-    print("  VERDICTS")
-    print(f"{'─'*82}\n")
+    print(f"  Meilleur filtre TP=1R :  {best_tp1r['label']}")
+    print(f"    ExpR={best_tp1r['exp_r']:+.3f}  WR={best_tp1r['win_rate']:.1%}  "
+          f"PF={best_tp1r['pf']:.2f}  {best_tp1r['trades']} trades")
 
-    # Qualité du filtre close_1h
-    gap_to_legacy = abs(c["exp_r"] - a["exp_r"])
-    gap_original = abs(b["exp_r"] - a["exp_r"])
-    recovery_pct = (1 - gap_to_legacy / gap_original) * 100 if gap_original > 0 else 0
+    if best_trail:
+        print(f"\n  Meilleur filtre+trail :  {best_trail['label']}")
+        print(f"    ExpR={best_trail['exp_r']:+.3f}  WR={best_trail['win_rate']:.1%}  "
+              f"PF={best_trail['pf']:.2f}  {best_trail['trades']} trades")
 
-    if c["exp_r"] > b["exp_r"] + 0.05:
-        print(f"  ★ Le filtre close_1h récupère {recovery_pct:.0f}% du gap legacy→proactif.")
-        print(f"    WR passe de {b['win_rate']:.1%} à {c['win_rate']:.1%} "
-              f"(legacy: {a['win_rate']:.1%}).")
-    elif c["exp_r"] > b["exp_r"]:
-        print(f"  ↑ Le filtre close_1h améliore modestement ({c['exp_r']-b['exp_r']:+.3f} R).")
-    else:
-        print(f"  ~ Le filtre close_1h n'aide pas sur cet instrument.")
+    print(f"\n  Meilleur global :        {best_overall['label']}")
+    gap = best_overall["exp_r"] - a["exp_r"]
+    print(f"    ExpR={best_overall['exp_r']:+.3f}  Gap vs legacy={gap:+.3f} R")
 
-    # Combo filter + trailing
-    if e["exp_r"] > c["exp_r"] + 0.05:
-        print(f"\n  ★ Le trailing ajoute {e['exp_r']-c['exp_r']:+.3f} R au-dessus du filtre seul.")
-    elif e["exp_r"] > c["exp_r"]:
-        print(f"\n  ↑ Le trailing ajoute modestement ({e['exp_r']-c['exp_r']:+.3f} R).")
-    else:
-        print(f"\n  ~ Le trailing n'ajoute rien au filtre sur cet instrument.")
-
-    # Best live-able config
-    live_configs = [b, c, d, e]  # Exclure A et F (non-live)
-    best_live = max(live_configs, key=lambda r: r["exp_r"])
-    print(f"\n  MEILLEURE CONFIG LIVE : {best_live['label']}")
-    print(f"  ExpR={best_live['exp_r']:+.3f}  WR={best_live['win_rate']:.1%}  "
-          f"PF={best_live['pf']:.2f}  Balance={best_live['balance']:,.0f}")
-
-    # vs legacy
-    gap = best_live["exp_r"] - a["exp_r"]
-    print(f"  Gap vs legacy : {gap:+.3f} R")
     if gap > -0.05:
-        print(f"  → Comble le gap ! Viable en live.")
+        print(f"    ✓ Gap quasi comblé ! Config viable en live.")
+    elif gap > -0.15:
+        print(f"    ~ Gap réduit mais significatif. Acceptable pour un challenge.")
     else:
-        print(f"  → Reste un écart de {-gap:.3f} R vs legacy.")
+        print(f"    ⚠ Gap important. Le signal proactif reste sous-optimal sur cet instrument.")
     print()
 
 

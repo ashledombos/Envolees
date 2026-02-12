@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from envolees.strategy.base import Direction, Signal
 
 
-ExitReason = Literal["SL", "TP", "TRAIL"]
+ExitReason = Literal["SL", "TP", "TRAIL", "CLOSE_END"]
 
 
 @dataclass

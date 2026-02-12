@@ -198,6 +198,11 @@ class Config:
     risk_mode: str = ""  # Alias pour profile (rétro-compatibilité)
     max_concurrent_trades: int = 0  # 0 = illimité
     daily_risk_budget: float = 0.0  # 0 = pas de limite
+
+    # Mode de sizing
+    # "fixed"    : risk_cash = start_balance × risk_per_trade (mode prop firm)
+    # "compound" : risk_cash = balance_courant × risk_per_trade (mode perso)
+    sizing_mode: str = "fixed"
     
     # Shortlist
     shortlist_min_score: float = 0.0
@@ -264,6 +269,7 @@ class Config:
             risk_mode=profile_name,
             max_concurrent_trades=int(_get_profile_value(profile_name, "max_concurrent_trades", "MAX_CONCURRENT_TRADES", 0)),
             daily_risk_budget=_get_profile_value(profile_name, "daily_risk_budget", "DAILY_RISK_BUDGET", 0.0),
+            sizing_mode=os.getenv("SIZING_MODE", "fixed").strip().lower(),
             shortlist_min_score=_get_profile_value(profile_name, "shortlist_min_score", "SHORTLIST_MIN_SCORE", 0.0),
             shortlist_max_tickers=int(_get_profile_value(profile_name, "shortlist_max_tickers", "SHORTLIST_MAX_TICKERS", 10)),
             min_trades_oos=int(_get_profile_value(profile_name, "min_trades_oos", "MIN_TRADES_OOS", 15)),

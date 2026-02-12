@@ -203,6 +203,12 @@ class BacktestEngine:
         )
         entry, sl, tp = self.strategy.compute_entry_sl_tp(signal, self.exec_penalty_atr)
 
+        # Sizing : prop firm = fixe sur start_balance, perso = compound
+        if self.cfg.sizing_mode == "compound":
+            risk_cash = self.balance * self.cfg.risk_per_trade
+        else:  # "fixed" (défaut prop firm)
+            risk_cash = self.cfg.start_balance * self.cfg.risk_per_trade
+
         new_pos = OpenPosition(
             direction=self.pending_order.direction,
             entry=entry, sl=sl, tp=tp,
@@ -210,7 +216,7 @@ class BacktestEngine:
             ts_entry=ts,
             atr_signal=self.pending_order.atr_signal,
             entry_bar_idx=bar_idx,
-            risk_cash=self.balance * self.cfg.risk_per_trade,
+            risk_cash=risk_cash,
         )
 
         # Configurer le trailing stop si activé
@@ -240,6 +246,7 @@ class BacktestEngine:
         Modes :
         - "none" : pas de filtre (toujours True)
         - "close_confirms_1h" : le close 1H doit confirmer le breakout
+          avec une marge optionnelle : close >= entry + entry_body_pct × ATR
         - "body_ratio" : le close doit être dans le top/bottom X% du range
 
         Returns:
@@ -251,26 +258,24 @@ class BacktestEngine:
             return True
 
         if filt == "close_confirms_1h":
-            # La bougie 1H doit CLORE au-dessus (LONG) ou en-dessous (SHORT)
+            # Close 1H doit être au-dessus/en-dessous de entry + marge
+            margin = self.cfg.entry_body_pct * pending.atr_signal
             if pending.direction == "LONG":
-                return close >= pending.entry_level
+                return close >= pending.entry_level + margin
             else:
-                return close <= pending.entry_level
+                return close <= pending.entry_level - margin
 
         if filt == "body_ratio":
-            # Le close doit être dans le top (LONG) ou bottom (SHORT) X% du range
+            # Close dans le top (LONG) ou bottom (SHORT) X% du range
             bar_range = high - low
             if bar_range <= 0:
                 return False
             pct = self.cfg.entry_body_pct
             if pending.direction == "LONG":
-                # Close dans le top pct% → close >= high - pct * range
                 return close >= high - pct * bar_range
             else:
-                # Close dans le bottom pct% → close <= low + pct * range
                 return close <= low + pct * bar_range
 
-        # Filtre inconnu → pas de filtre
         return True
 
     # ── Mode 4H (fallback, avec heuristique SL+TP) ──────────────────
@@ -478,6 +483,17 @@ class BacktestEngine:
                 "losses_closed": self.daily_state.losses_closed,
                 "halted": self.daily_state.halted,
             })
+
+        # Fermer les positions ouvertes au close de la dernière barre
+        if self.open_positions and len(df) > 0:
+            last_row = df.iloc[-1]
+            last_ts = idx[-1]
+            last_close = float(last_row["Close"])
+            for pos in list(self.open_positions):
+                self._close_position(
+                    pos, last_close, "CLOSE_END", len(df) - 1, last_ts,
+                )
+            self.open_positions.clear()
 
         summary = self._build_summary(len(df), intrabar)
 
