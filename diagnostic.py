@@ -1,16 +1,17 @@
 """
-Diagnostic : isole l'impact de chaque changement v2 sur un ticker.
+Diagnostic v3 : compare signal × exit × exécution.
 
 Usage:
     python diagnostic.py EURUSD=X
     python diagnostic.py GBPUSD=X --penalty 0.10
 
-Compare 5 configurations :
-  A. Legacy   : signal confirmé (close > canal), 1 pos, OHLC 4H
-  B. Proactif : signal proactif, 1 pos, OHLC 4H
-  C. Proactif : signal proactif, 1 pos, intrabar 1H  <- la correction
-  D. Proactif : signal proactif, 3 pos, intrabar 1H
-  E. Legacy   : signal confirmé, 1 pos, intrabar 1H  <- référence honnête
+Configs testées :
+  A. Legacy,   TP=1R fixe,        intrabar 1H   (référence rentable)
+  B. Proactif, TP=1R fixe,        intrabar 1H   (problème actuel)
+  C. Proactif, trailing 2ATR,     intrabar 1H   (trailing serré)
+  D. Proactif, trailing 3ATR,     intrabar 1H   (trailing standard)
+  E. Proactif, trailing 3ATR+0.5R act, intra 1H (trailing avec activation)
+  F. Legacy,   trailing 3ATR,     intrabar 1H   (legacy + trailing)
 """
 
 import sys
@@ -20,7 +21,6 @@ from dataclasses import replace
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import pandas as pd
-import numpy as np
 
 from envolees.config import Config
 from envolees.data import download_1h, resample_to_timeframe
@@ -30,14 +30,15 @@ from envolees.backtest.engine import BacktestEngine
 from envolees.backtest.position import PendingOrder
 
 
+# ── Stratégie legacy ─────────────────────────────────────────────────
+
 class LegacyDonchianStrategy(DonchianBreakoutStrategy):
-    """Version originale : signal quand close > canal (post-breakout)."""
+    """Signal quand close > canal (post-breakout, l'ancien mode)."""
 
     def generate_signal(self, df, bar_idx, current_position, pending_signal):
-        if current_position is not None or pending_signal is not None:
-            return None
         row = df.iloc[bar_idx]
         ts = df.index[bar_idx]
+
         if not self._indicators_ready(row):
             return None
         if self._in_no_trade_window(ts):
@@ -53,18 +54,24 @@ class LegacyDonchianStrategy(DonchianBreakoutStrategy):
         d_low = float(row["D_low"])
 
         if close > ema and close > (d_high + buffer):
-            return Signal(direction="LONG", entry_level=d_high + buffer,
-                          atr_at_signal=atr, timestamp=ts,
-                          expiry_bars=self.cfg.order_valid_bars)
+            return Signal(
+                direction="LONG", entry_level=d_high + buffer,
+                atr_at_signal=atr, timestamp=ts,
+                expiry_bars=self.cfg.order_valid_bars,
+            )
         if close < ema and close < (d_low - buffer):
-            return Signal(direction="SHORT", entry_level=d_low - buffer,
-                          atr_at_signal=atr, timestamp=ts,
-                          expiry_bars=self.cfg.order_valid_bars)
+            return Signal(
+                direction="SHORT", entry_level=d_low - buffer,
+                atr_at_signal=atr, timestamp=ts,
+                expiry_bars=self.cfg.order_valid_bars,
+            )
         return None
 
 
-class LegacyEngine(BacktestEngine):
-    """1 position, pas de recalcul continu."""
+# ── Moteurs ──────────────────────────────────────────────────────────
+
+class SingleShotEngine(BacktestEngine):
+    """Legacy : bloque signaux si position OU pending actif."""
 
     def _update_signal(self, df, bar_idx):
         if self.prop_sim.is_halted:
@@ -79,8 +86,8 @@ class LegacyEngine(BacktestEngine):
             self.pending_order = None
 
 
-class SingleEngine(BacktestEngine):
-    """Proactif + recalcul continu, 1 position max."""
+class SinglePositionEngine(BacktestEngine):
+    """Proactif : recalcul continu, 1 position max."""
 
     def _update_signal(self, df, bar_idx):
         if self.prop_sim.is_halted:
@@ -96,11 +103,25 @@ class SingleEngine(BacktestEngine):
             self.pending_order = None
 
 
+# ── Runner ───────────────────────────────────────────────────────────
+
 def run_config(label, engine_cls, strategy_cls, cfg, df_4h, df_1h, ticker, penalty):
     strategy = strategy_cls(cfg)
     engine = engine_cls(cfg, strategy, ticker, penalty)
     result = engine.run(df_4h.copy(), df_1h=df_1h)
     s = result.summary
+    tdf = result.trades_df()
+    exits = tdf["exit_reason"].value_counts().to_dict() if len(tdf) else {}
+
+    # Stats supplémentaires pour trailing
+    if len(tdf) and (tdf["result_r"] > 0).any():
+        winners = tdf.loc[tdf["result_r"] > 0, "result_r"]
+        avg_win_r = float(winners.mean())
+        max_win_r = float(winners.max())
+        avg_dur = float(tdf["duration_bars"].mean())
+    else:
+        avg_win_r, max_win_r, avg_dur = 0.0, 0.0, 0.0
+
     return {
         "label": label,
         "trades": s["n_trades"],
@@ -109,13 +130,16 @@ def run_config(label, engine_cls, strategy_cls, cfg, df_4h, df_1h, ticker, penal
         "exp_r": s["expectancy_r"],
         "balance": s["end_balance"],
         "dd_max": s["prop"]["max_daily_dd_pct"],
-        "exec": s.get("execution_mode", "?"),
+        "exits": exits,
+        "avg_win_r": avg_win_r,
+        "max_win_r": max_win_r,
+        "avg_dur": avg_dur,
     }
 
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Diagnostic v2 performance")
+    parser = argparse.ArgumentParser(description="Diagnostic v3 — trailing stop")
     parser.add_argument("ticker", help="Ticker Yahoo (ex: EURUSD=X)")
     parser.add_argument("--penalty", "-p", type=float, default=0.10)
     args = parser.parse_args()
@@ -124,94 +148,136 @@ def main():
     ticker = args.ticker
     penalty = args.penalty
 
-    print(f"\n{'='*78}")
-    print(f"  DIAGNOSTIC — {ticker} @ penalty {penalty}")
-    print(f"{'='*78}\n")
+    print(f"\n{'═'*80}")
+    print(f"  DIAGNOSTIC v3 — {ticker} @ penalty {penalty}")
+    print(f"{'═'*80}\n")
 
     print("Téléchargement données...")
     df_1h = download_1h(ticker, cfg)
     df_4h = resample_to_timeframe(df_1h, cfg.timeframe)
     print(f"  {len(df_4h)} barres 4H, {len(df_1h)} barres 1H\n")
 
+    cfg1 = replace(cfg, max_concurrent_trades=1)
+
     configs = [
-        ("A. Legacy, 1 pos, OHLC 4H",
-         LegacyEngine, LegacyDonchianStrategy,
-         replace(cfg, max_concurrent_trades=1), None),
+        # A. Legacy + TP fixe (référence)
+        ("A. Legacy, TP=1R",
+         SingleShotEngine, LegacyDonchianStrategy,
+         replace(cfg1, exit_mode="fixed", tp_r=1.0)),
 
-        ("B. Proactif, 1 pos, OHLC 4H",
-         SingleEngine, DonchianBreakoutStrategy,
-         replace(cfg, max_concurrent_trades=1), None),
+        # B. Proactif + TP fixe (le problème)
+        ("B. Proactif, TP=1R",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         replace(cfg1, exit_mode="fixed", tp_r=1.0)),
 
-        ("C. Proactif, 1 pos, intrabar 1H",
-         SingleEngine, DonchianBreakoutStrategy,
-         replace(cfg, max_concurrent_trades=1), df_1h),
+        # C. Proactif + trailing 2ATR (serré)
+        ("C. Proactif, trail 2ATR",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         replace(cfg1, exit_mode="trailing_atr", trailing_atr=2.0, tp_r=0)),
 
-        ("D. Proactif, 3 pos, intrabar 1H",
-         BacktestEngine, DonchianBreakoutStrategy,
-         replace(cfg, max_concurrent_trades=3), df_1h),
+        # D. Proactif + trailing 3ATR (standard)
+        ("D. Proactif, trail 3ATR",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         replace(cfg1, exit_mode="trailing_atr", trailing_atr=3.0, tp_r=0)),
 
-        ("E. Legacy, 1 pos, intrabar 1H",
-         LegacyEngine, LegacyDonchianStrategy,
-         replace(cfg, max_concurrent_trades=1), df_1h),
+        # E. Proactif + trailing 3ATR + activation à 0.5R
+        ("E. Proactif, trail 3ATR, act=0.5R",
+         SinglePositionEngine, DonchianBreakoutStrategy,
+         replace(cfg1, exit_mode="trailing_atr", trailing_atr=3.0, tp_r=0,
+                 trailing_activation_r=0.5)),
+
+        # F. Legacy + trailing 3ATR (best signal + best exit ?)
+        ("F. Legacy, trail 3ATR",
+         SingleShotEngine, LegacyDonchianStrategy,
+         replace(cfg1, exit_mode="trailing_atr", trailing_atr=3.0, tp_r=0)),
     ]
 
     results = []
-    for label, eng_cls, strat_cls, c, df1h in configs:
+    for label, eng_cls, strat_cls, c in configs:
         print(f"  Running {label}...")
-        r = run_config(label, eng_cls, strat_cls, c, df_4h, df1h, ticker, penalty)
+        r = run_config(label, eng_cls, strat_cls, c, df_4h, df_1h, ticker, penalty)
         results.append(r)
 
-    print(f"\n{'─'*78}")
-    print(f"  {'Config':<40} {'Trades':>6} {'WR':>7} {'PF':>6} {'ExpR':>7} {'Balance':>10} {'Exec':>12}")
-    print(f"{'─'*78}")
+    # ── Tableau principal ──
+    print(f"\n{'─'*80}")
+    print(f"  {'Config':<30} {'Trades':>6} {'WR':>7} {'PF':>6} {'ExpR':>7} "
+          f"{'AvgWin':>7} {'MaxWin':>7} {'Balance':>10}")
+    print(f"{'─'*80}")
     for r in results:
         wr = f"{r['win_rate']:.1%}"
         pf = f"{r['pf']:.2f}"
-        exp = f"{r['exp_r']:.3f}"
+        exp = f"{r['exp_r']:+.3f}"
+        aw = f"{r['avg_win_r']:.1f}R"
+        mw = f"{r['max_win_r']:.1f}R"
         bal = f"{r['balance']:,.0f}"
-        print(f"  {r['label']:<40} {r['trades']:>6} {wr:>7} {pf:>6} {exp:>7} {bal:>10} {r['exec']:>12}")
+        print(f"  {r['label']:<30} {r['trades']:>6} {wr:>7} {pf:>6} {exp:>7} "
+              f"{aw:>7} {mw:>7} {bal:>10}")
 
-    print(f"\n{'─'*78}")
-    print("  ANALYSE DES ÉCARTS")
-    print(f"{'─'*78}")
+    # ── Tableau des exits ──
+    print(f"\n{'─'*80}")
+    print(f"  {'Config':<30} {'SL':>5} {'TP':>5} {'TRAIL':>5} {'AvgDur':>8}")
+    print(f"{'─'*80}")
+    for r in results:
+        sl = r["exits"].get("SL", 0)
+        tp = r["exits"].get("TP", 0)
+        tr = r["exits"].get("TRAIL", 0)
+        dur = f"{r['avg_dur']:.1f}"
+        print(f"  {r['label']:<30} {sl:>5} {tp:>5} {tr:>5} {dur:>8}")
 
-    a, b, c, d, e = results
+    # ── Analyse ──
+    a, b, c, d, e, f = results
 
+    print(f"\n{'─'*80}")
+    print("  ANALYSE")
+    print(f"{'─'*80}\n")
+
+    # Signal proactif vs legacy (même exit)
     delta_ab = b["exp_r"] - a["exp_r"]
-    delta_bc = c["exp_r"] - b["exp_r"]
+    print(f"  Signal proactif vs legacy (TP=1R) :  {delta_ab:+.3f} R")
+
+    # Trailing vs TP fixe (même signal proactif)
+    delta_bd = d["exp_r"] - b["exp_r"]
+    print(f"  Trailing 3ATR vs TP=1R (proactif) :  {delta_bd:+.3f} R")
+
+    # Trailing 2ATR vs 3ATR
     delta_cd = d["exp_r"] - c["exp_r"]
-    delta_ae = e["exp_r"] - a["exp_r"]
+    print(f"  Trail 3ATR vs 2ATR :                 {delta_cd:+.3f} R")
 
-    print(f"\n  A→B  Signal proactif (même exec 4H) :       {delta_ab:+.3f} R")
-    print(f"       (impact du changement de signal)")
-    print(f"\n  B→C  Intrabar 1H (même signal proactif) :   {delta_bc:+.3f} R")
-    print(f"       (impact de l'exécution 1H vs heuristiques 4H)")
-    print(f"\n  C→D  Empilage 3 positions :                  {delta_cd:+.3f} R")
-    print(f"       (impact du multi-position)")
-    print(f"\n  A→E  Legacy + intrabar 1H :                  {delta_ae:+.3f} R")
-    print(f"       (combien le legacy profitait du biais 4H)")
+    # Activation trailing
+    delta_de = e["exp_r"] - d["exp_r"]
+    print(f"  Activation 0.5R vs immédiat :        {delta_de:+.3f} R")
 
-    print(f"\n{'─'*78}")
-    print("  INTERPRÉTATION")
-    print(f"{'─'*78}")
+    # Legacy + trailing
+    delta_af = f["exp_r"] - a["exp_r"]
+    print(f"  Legacy trail 3ATR vs Legacy TP=1R :  {delta_af:+.3f} R")
 
-    if c["exp_r"] > b["exp_r"]:
-        print(f"\n  ✓ L'intrabar 1H AMÉLIORE le proactif 4H ({delta_bc:+.3f} R)")
-        print(f"    → Les heuristiques 4H étaient trop pessimistes.")
-    elif c["exp_r"] > b["exp_r"] - 0.02:
-        print(f"\n  ~ L'intrabar 1H est neutre vs 4H ({delta_bc:+.3f} R)")
-        print(f"    → Les heuristiques 4H étaient raisonnables.")
+    # ── Verdicts ──
+    print(f"\n{'─'*80}")
+    print("  VERDICTS")
+    print(f"{'─'*80}\n")
+
+    if delta_bd > 0.05:
+        print(f"  ★ Le trailing améliore le proactif de {delta_bd:+.3f} R")
+        print(f"    Le TP à 1R coupait les gros gains. Le profil trend-following")
+        print(f"    est restauré : avg win {d['avg_win_r']:.1f}R vs {b['avg_win_r']:.1f}R.")
+    elif delta_bd > 0:
+        print(f"  ↑ Légère amélioration avec trailing ({delta_bd:+.3f} R).")
     else:
-        print(f"\n  ⚠  L'intrabar 1H DÉGRADE vs 4H ({delta_bc:+.3f} R)")
-        print(f"    → Le mode 4H laissait survivre des positions qui perdent.")
+        print(f"  ~ Le trailing n'améliore pas le proactif ({delta_bd:+.3f} R).")
 
-    if e["exp_r"] < a["exp_r"]:
-        gap = a["exp_r"] - e["exp_r"]
-        print(f"\n  Le legacy perdait {gap:.3f} R de son edge apparent (biais OHLC 4H)")
-        if e["exp_r"] > 0:
-            print(f"  Mais E reste profitable ({e['exp_r']:+.3f} R) → l'edge est réel.")
-        else:
-            print(f"  Et E n'est plus profitable ({e['exp_r']:+.3f} R) → edge = artefact.")
+    if delta_af > 0.05:
+        print(f"\n  ★ Le trailing améliore aussi le legacy de {delta_af:+.3f} R !")
+        print(f"    → Le trailing est bénéfique indépendamment du signal.")
+    elif delta_af > 0:
+        print(f"\n  ↑ Légère amélioration legacy + trailing ({delta_af:+.3f} R).")
+    else:
+        print(f"\n  ~ Le trailing n'améliore pas le legacy ({delta_af:+.3f} R).")
+
+    best = max(results, key=lambda r: r["exp_r"])
+    print(f"\n  MEILLEURE CONFIG : {best['label']}")
+    print(f"  ExpR={best['exp_r']:+.3f}  WR={best['win_rate']:.1%}  PF={best['pf']:.2f}"
+          f"  MaxWin={best['max_win_r']:.1f}R  Balance={best['balance']:,.0f}")
+    print()
 
 
 if __name__ == "__main__":

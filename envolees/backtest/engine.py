@@ -212,6 +212,20 @@ class BacktestEngine:
             entry_bar_idx=bar_idx,
             risk_cash=self.balance * self.cfg.risk_per_trade,
         )
+
+        # Configurer le trailing stop si activé
+        if self.cfg.exit_mode == "trailing_atr":
+            new_pos.trailing_atr_dist = self.cfg.trailing_atr * signal.atr_at_signal
+            # TP à 0 si tp_r=0 (laisser courir, seul le trailing ferme)
+            if self.cfg.tp_r == 0:
+                new_pos.tp = 0.0
+            # Activation : prix doit atteindre entry + activation_r × risk
+            if self.cfg.trailing_activation_r > 0:
+                risk = abs(entry - sl)
+                if self.pending_order.direction == "LONG":
+                    new_pos.trailing_activation_price = entry + self.cfg.trailing_activation_r * risk
+                else:
+                    new_pos.trailing_activation_price = entry - self.cfg.trailing_activation_r * risk
         self.open_positions.append(new_pos)
         self.pending_order = None
         return new_pos
@@ -474,6 +488,9 @@ class BacktestEngine:
                 "proximity_atr": self.cfg.proximity_atr,
                 "sl_atr": self.cfg.sl_atr,
                 "tp_r": self.cfg.tp_r,
+                "exit_mode": self.cfg.exit_mode,
+                "trailing_atr": self.cfg.trailing_atr if self.cfg.exit_mode == "trailing_atr" else None,
+                "trailing_activation_r": self.cfg.trailing_activation_r if self.cfg.exit_mode == "trailing_atr" else None,
                 "vol_quantile": self.cfg.vol_quantile,
                 "vol_window_bars": self.cfg.vol_window_bars,
                 "conservative_same_bar": self.cfg.conservative_same_bar,

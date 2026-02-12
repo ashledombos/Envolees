@@ -116,6 +116,15 @@ class Config:
     sl_atr: float = 1.00
     tp_r: float = 1.00
 
+    # Trailing stop (exit_mode)
+    # "fixed"        : SL/TP classiques (mode actuel)
+    # "trailing_atr" : trailing stop à trailing_atr × ATR du meilleur prix
+    #                  Le SL initial reste comme filet de sécurité.
+    #                  tp_r=0 désactive le TP fixe (laisser courir).
+    exit_mode: str = "fixed"
+    trailing_atr: float = 3.0    # Distance du trailing en multiples ATR
+    trailing_activation_r: float = 0.0  # Activer le trailing après N×R de profit (0=immédiat)
+
     # Proximité canal pour stop proactif (en multiples ATR)
     # Le signal est généré si le prix est à moins de proximity_atr × ATR
     # du bord du canal, AVANT le breakout (stop pré-placé)
@@ -209,6 +218,9 @@ class Config:
             buffer_atr=float(os.getenv("BUFFER_ATR", "0.10")),
             sl_atr=float(os.getenv("SL_ATR", "1.00")),
             tp_r=float(os.getenv("TP_R", "1.00")),
+            exit_mode=os.getenv("EXIT_MODE", "fixed").strip().lower(),
+            trailing_atr=float(os.getenv("TRAILING_ATR", "3.0")),
+            trailing_activation_r=float(os.getenv("TRAILING_ACTIVATION_R", "0.0")),
             proximity_atr=float(os.getenv("PROXIMITY_ATR", "1.5")),
             vol_quantile=float(os.getenv("VOL_QUANTILE", "0.90")),
             vol_window_bars=int(os.getenv("VOL_WINDOW_BARS", "1000")),
