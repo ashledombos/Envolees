@@ -184,17 +184,22 @@ class BacktestEngine:
 
     def _try_trigger_pending(
         self, high: float, low: float, bar_idx: int, ts: pd.Timestamp,
+        open_price: float | None = None,
         market_entry_price: float | None = None,
     ) -> OpenPosition | None:
         """Tente de déclencher le pending order. Retourne la position créée ou None.
         
-        Args:
-            high, low: Extrêmes de la bougie
-            bar_idx: Index de la barre
-            ts: Timestamp
-            market_entry_price: Si fourni, l'entry est basée sur ce prix
-                (typiquement le close 1H quand un filtre d'entrée est actif).
-                Si None, l'entry est au niveau du canal (stop order classique).
+        Modèle de fill réaliste :
+        
+        1. Stop order (market_entry_price=None) :
+           - Si open_price dépasse entry_level → GAP FILL au prix d'open
+             (le stop order ne peut pas obtenir un prix meilleur que l'open)
+           - Sinon → fill au entry_level (le prix a traversé le niveau intrabar)
+        
+        2. Market order après filtre (market_entry_price=close_1h) :
+           - Entry au close 1H (on entre au marché après confirmation)
+        
+        Dans tous les cas, la pénalité d'exécution (spread) s'ajoute.
         """
         if self.pending_order is None:
             return None
@@ -205,14 +210,17 @@ class BacktestEngine:
 
         from envolees.strategy.base import Signal
 
-        # Si market_entry_price fourni, on entre au marché → base = close 1H
-        # Si None, stop order classique → base = canal (entry_level)
         if market_entry_price is not None:
-            # Entry at market après close 1H confirmant
-            # Pour un LONG : close est >= entry_level (filtre l'a vérifié)
-            # L'entry réaliste est le close + spread/slippage (penalty)
+            # Mode filtre : entry au marché (close 1H)
             effective_entry_level = market_entry_price
+        elif open_price is not None:
+            # Mode stop order : gap fill si l'open dépasse le niveau
+            if self.pending_order.direction == "LONG":
+                effective_entry_level = max(self.pending_order.entry_level, open_price)
+            else:
+                effective_entry_level = min(self.pending_order.entry_level, open_price)
         else:
+            # Fallback (pas d'open disponible, mode 4H)
             effective_entry_level = self.pending_order.entry_level
 
         signal = Signal(
@@ -323,7 +331,10 @@ class BacktestEngine:
 
     def _process_pending_order_4h(self, row: pd.Series, bar_idx: int, ts: pd.Timestamp) -> None:
         """Déclenchement pending order sur OHLC 4H (position survit la barre d'entrée)."""
-        self._try_trigger_pending(float(row["High"]), float(row["Low"]), bar_idx, ts)
+        self._try_trigger_pending(
+            float(row["High"]), float(row["Low"]), bar_idx, ts,
+            open_price=float(row["Open"]),
+        )
 
     # ── Mode intrabar 1H ─────────────────────────────────────────────
 
@@ -361,6 +372,7 @@ class BacktestEngine:
             high = float(row_1h["High"])
             low = float(row_1h["Low"])
             close = float(row_1h["Close"])
+            open_1h = float(row_1h["Open"])
 
             # ── 1. Sorties des positions ouvertes ──
             closed_indices = []
@@ -383,17 +395,17 @@ class BacktestEngine:
             new_pos = None
             if self.pending_order is not None and self.pending_order.is_triggered(high, low):
                 if self._entry_filter_passes(self.pending_order, high, low, close):
-                    # Filtre actif → on entre AU MARCHÉ après le close 1H.
-                    # L'entry réaliste = close 1H (+ penalty pour le spread).
-                    # Sans filtre → stop order classique → fill au niveau du canal.
                     if self.cfg.entry_filter != "none":
+                        # Filtre actif → market order au close 1H
                         new_pos = self._try_trigger_pending(
                             high, low, bar_idx_4h, ts_1h,
                             market_entry_price=close,
                         )
                     else:
+                        # Stop order → fill au max(entry_level, open) pour LONG
                         new_pos = self._try_trigger_pending(
                             high, low, bar_idx_4h, ts_1h,
+                            open_price=open_1h,
                         )
                 # Si filtre échoue : le pending reste actif, peut trigger sur
                 # une 1H suivante avec un close plus convaincant

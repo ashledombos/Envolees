@@ -147,6 +147,14 @@ def run_one(label, engine_cls, strategy_cls, cfg, df_4h, df_1h, ticker, penalty)
     if len(tdf) and (tdf["result_r"] > 0).any():
         max_win = float(tdf.loc[tdf["result_r"] > 0, "result_r"].max())
 
+    # Slippage moyen : écart entry réel vs entry_level (en fraction d'ATR)
+    avg_slip_atr = 0.0
+    if len(tdf) and "entry" in tdf.columns and "atr_signal" in tdf.columns:
+        # On n'a pas directement entry_level dans trades_df, mais on peut estimer
+        # le slippage via le penalty : entry_expected = entry_level + penalty*atr
+        # Pour l'instant, on note juste les stats de base
+        pass
+
     return {
         "trades": s["n_trades"],
         "win_rate": s["win_rate"],

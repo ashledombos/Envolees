@@ -29,7 +29,37 @@
   → Cohérent.
 
 
-## ⚠️ BIAIS IDENTIFIÉ #1 : COMPOUNDING DU POSITION SIZING
+## ⚠️ BIAIS IDENTIFIÉ #1 : COMPOUNDING DU POSITION SIZING — CORRIGÉ
+
+**Fix :** `sizing_mode="fixed"` (défaut) → risk_cash = start_balance × risk_per_trade.
+
+
+## ⚠️ BIAIS CRITIQUE #6 : PRIX D'ENTRY IRRÉALISTE (GAP FILL) — CORRIGÉ
+
+C'était le biais le plus impactant du backtester.
+
+**Le problème :** Pour un stop buy order au niveau X, si la bougie 1H ouvre
+au-dessus de X (gap), le fill réel est au prix d'OUVERTURE, pas au niveau X.
+Le backtester utilisait systématiquement X comme prix de fill.
+
+**Où ça impactait :**
+- Legacy signal : close bar N > canal → bar N+1 ouvre quasi-toujours au-dessus
+  du canal → le stop order fill devrait être à l'open, pas au canal
+- Proactif sans filtre : même problème lors de gaps de breakout
+- Proactif avec filtre : corrigé séparément (entry = close 1H)
+
+**Impact estimé :** Le legacy signal avait un fill fictif d'environ 0.1-0.3 ATR
+meilleur que la réalité sur CHAQUE trade. Sur un SL de 1.5 ATR, ça représente
+~0.07-0.20 R de biais par trade, soit potentiellement la totalité de l'edge
+apparent.
+
+**Fix :** `effective_entry = max(entry_level, open_1h)` pour LONG,
+`min(entry_level, open_1h)` pour SHORT. Appliqué uniformément à TOUS
+les stop orders (legacy et proactif).
+
+**Implication :** Les résultats pré-fix (legacy à +0.3/+0.5 ExpR) étaient
+probablement sur-estimés. Le gap fill nivelle le terrain entre legacy et
+proactif, car les deux souffrent du même problème.
 
 **Ligne 213 :** `risk_cash = self.balance * self.cfg.risk_per_trade`
 
@@ -115,15 +145,16 @@ stratégie 4H. L'académique (Moskowitz 2012) teste sur 25 ans.
 
 ## RÉSUMÉ DES PRIORITÉS
 
-| # | Biais | Impact sur ExpR | Fixable ? | Priorité |
-|---|-------|----------------|-----------|----------|
-| 1 | Compounding sizing | Balance gonflée, ExpR neutre | Oui (flag) | HAUTE |
-| 2 | Gap risk sur SL | Sous-estime pertes | Moyen (heuristique) | MOYENNE |
-| 3 | Positions non fermées | Marginal | Oui (trivial) | BASSE |
-| 4 | Données Yahoo | Inconnu | Cross-validation | BASSE |
-| 5 | Fenêtre 2 ans | Inconnu | Plus de données | FUTURE |
+| # | Biais | Impact sur ExpR | Fixable ? | Statut |
+|---|-------|----------------|-----------|--------|
+| 6 | Gap fill entry price | **~0.1-0.3 R/trade** | Oui | **CORRIGÉ** |
+| 1 | Compounding sizing | Balance gonflée, ExpR neutre | Oui | CORRIGÉ |
+| 3 | Positions non fermées | Marginal | Oui | CORRIGÉ |
+| 2 | Gap risk sur SL | Sous-estime pertes | Moyen | Non fixé |
+| 4 | Données Yahoo | Inconnu | Cross-validation | Non fixé |
+| 5 | Fenêtre 2 ans | Inconnu | Plus de données | Non fixé |
 
-**Bonne nouvelle :** Aucun de ces biais n'invalide la COMPARAISON entre configs
-(A vs B vs C...) car ils affectent toutes les configs de la même manière.
-Les écarts relatifs restent fiables. Seule la valeur absolue de ExpR et du
-balance final sont potentiellement gonflés.
+**ATTENTION :** Le biais #6 (gap fill) remet en question les résultats
+antérieurs. Les configs legacy qui semblaient profitables (+0.3 à +0.5 ExpR)
+bénéficiaient d'un fill systématiquement meilleur que la réalité. Les nouveaux
+résultats avec gap fill réaliste sont la VRAIE mesure de l'edge.
